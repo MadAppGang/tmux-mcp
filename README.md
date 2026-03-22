@@ -1,115 +1,153 @@
 # tmux-mcp
 
-MCP server giving AI agents intelligent control over tmux terminal sessions. Single Go binary, no runtime dependencies.
+Agent-oriented MCP server for tmux — native process detection, smart triggers, zero-lookup chaining.
 
 ## Quick start
 
+**Prerequisites**: tmux installed, Go 1.21+ or a pre-built binary.
+
 ```bash
-# Build
+# Install via Go
+go install github.com/MadAppGang/tmux-mcp@latest
+
+# Or build from source
 git clone https://github.com/MadAppGang/tmux-mcp
-cd tmux-mcp
-go build -o tmux-mcp .
+cd tmux-mcp && go build -o tmux-mcp .
 ```
 
-Configure in Claude Code (`~/.claude/settings.json`) or any MCP client:
+Add to your MCP client config (`~/.claude/settings.json` for Claude Code):
 
 ```json
 {
   "mcpServers": {
     "tmux": {
-      "command": "/path/to/tmux-mcp",
-      "args": ["--shell-type=zsh"]
+      "command": "tmux-mcp",
+      "args": ["--shell-type", "zsh"]
     }
   }
 }
 ```
 
-Restart your MCP client. The server exposes 20 tools immediately.
+Create a session and run a command in two calls:
 
-## Features
+```json
+// Returns sessionId, windowId, and paneId — no lookup needed
+{"tool": "create-session", "params": {"name": "dev"}}
+// → {"sessionId": "$3", "sessionName": "dev", "windowId": "@5", "paneId": "%6"}
 
-- **Single binary** — no Node.js, no npm, no runtime. One file to deploy.
-- **Two-layer tool design** — Layer 1 wraps tmux primitives; Layer 2 adds agent-oriented workflows.
-- **Native process state detection** — reads `/proc/wchan` on Linux and `sysctl kern.proc.pid` on macOS to detect when a process is blocked waiting for terminal input. No regex heuristics.
-- **Smart trigger system** — six notification presets plus named triggers (`exit`, `shell`, `idle:N`, `user_input`, `error`, `bell`, `pattern:REGEX`).
-- **MCP Tasks API** — `start-and-watch` and `watch-pane` run as async tasks with streaming progress notifications.
-- **Structured JSON output** — every tool returns IDs (`sessionId`, `windowId`, `paneId`) so you can chain calls without lookups.
+// Synchronous: blocks until done, returns output + exit code
+{"tool": "execute-command", "params": {"paneId": "%6", "command": "go build ./..."}}
+// → {"paneId": "%6", "output": "", "exitCode": 0}
+```
 
-## Tools reference
+## Why this exists
+
+AI coding agents (Claude Code, Codex CLI, Gemini CLI, opencode) need terminal control. Existing MCP servers treat tmux as a dumb pipe: send a command, poll for output, repeat.
+
+That model breaks down in four ways:
+
+- An agent starts `npm run dev` and needs to know when the server is **ready** — not when it produced any output.
+- An agent runs a database migration and needs to detect when psql is **waiting for a password** — not guess from screen text.
+- An agent chains five operations and cannot afford a lookup round-trip between each step.
+- An agent watches a build in a background pane while doing other work.
+
+This project solves those four problems directly.
+
+## Comparison
+
+| | nickgnd/tmux-mcp | ht-mcp | mcp-interactive-terminal | **tmux-mcp (this)** |
+|---|---|---|---|---|
+| Language | TypeScript | Rust | Node.js | **Go** |
+| Tools | 13 | 6 | 7 | **20** |
+| Dependencies | Node.js / npx | None | Node.js + node-pty | **None (single binary)** |
+| Binary size | ~node_modules | ~4MB | ~node_modules | **~7MB** |
+| Async monitoring | No | No | No | **Yes (MCP Tasks API)** |
+| Process input detection | No | No | Heuristic | **Native OS (kernel-level)** |
+| Structured JSON output | Partial | No | No | **Yes (all tools)** |
+| Zero-lookup chaining | No | No | No | **Yes (IDs in every response)** |
+| Split-screen / pane layout | Yes | No | No | **Yes** |
+| Tmux integration | Yes | No | No | **Yes** |
+| execute-command | Polling | N/A | Heuristic | **Synchronous (tmux wait-for)** |
+
+**ht-mcp** is fast and dependency-free but works only with headless terminals it creates itself. It cannot attach to existing sessions or manage pane layouts.
+
+**mcp-interactive-terminal** detects prompt readiness via output-settling heuristics, which fail when prompts vary or output is slow.
+
+**nickgnd/tmux-mcp** pioneered the concept but has known limitations: [#31](https://github.com/nickgnd/tmux-mcp/issues/31) (C-c sent as literal text), [#28](https://github.com/nickgnd/tmux-mcp/issues/28) (no consecutive command support), [#36](https://github.com/nickgnd/tmux-mcp/issues/36) (capture-pane returns too many lines). `execute-command` returns a task ID; the agent must call `get-command-result` in a polling loop.
+
+## Architecture: two layers
+
+```
+Layer 2: Agent Workflows
+  start-and-watch   watch-pane    run-in-repl
+  pane-state        write-to-display   display-message
+
+Layer 1: Tmux Primitives
+  create-session  create-window  split-pane
+  list-sessions   list-windows   list-panes
+  execute-command send-keys      capture-pane
+  resize-pane     rename-session
+  kill-session    kill-window    kill-pane
+```
+
+**Layer 1** gives you full tmux control. Every response includes structured JSON with IDs so you never need a separate lookup call to chain operations.
+
+**Layer 2** provides tools designed around agent workflows: starting a process and waiting for readiness, monitoring a pane for errors asynchronously, interacting with a running REPL, writing coaching text to a display pane.
+
+## Tool reference
 
 ### Layer 1: primitives
 
-| Tool | Description |
-|---|---|
-| `list-sessions` | List all active tmux sessions |
-| `list-windows` | List windows in a session |
-| `list-panes` | List panes with dimensions, current command, and path |
-| `capture-pane` | Read terminal content from a pane (raw or ANSI-colored) |
-| `create-session` | Create a detached session; returns `sessionId`, `windowId`, `paneId` |
-| `create-window` | Create a window in a session; returns `windowId`, `paneId` |
-| `split-pane` | Split a pane horizontally or vertically; returns new `paneId` |
-| `send-keys` | Send literal text or tmux key names (`C-c`, `Enter`, `Escape`) to a pane |
-| `execute-command` | Run a command synchronously; returns full output and exit code |
-| `resize-pane` | Resize by absolute dimensions or relative direction/amount |
-| `rename-session` | Rename a session |
-| `kill-session` | Kill a session and all its windows |
-| `kill-window` | Kill a window and all its panes |
-| `kill-pane` | Kill a single pane |
+| Tool | Purpose | Key params | Returns |
+|---|---|---|---|
+| `list-sessions` | List all tmux sessions | — | `[{id, name, windows, attached}]` |
+| `list-windows` | List windows in a session | `sessionId` | `[{id, name, active, panes}]` |
+| `list-panes` | List panes with dimensions and current path | `windowId` | `[{id, title, active, width, height, currentCommand, currentPath}]` |
+| `capture-pane` | Read terminal content | `paneId`, `lines`, `colors` | raw text |
+| `create-session` | Create a detached session | `name` (optional) | `{sessionId, sessionName, windowId, paneId}` |
+| `create-window` | Add a window to a session | `sessionId`, `name` | `{windowId, windowName, paneId}` |
+| `split-pane` | Split a pane horizontally or vertically | `paneId`, `direction`, `size` | `{paneId, windowId}` |
+| `send-keys` | Send keystrokes or text to a pane | `paneId`, `keys`, `literal`, `enter` | `{paneId}` |
+| `execute-command` | Run a command and wait for completion | `paneId`, `command` | `{paneId, output, exitCode}` |
+| `resize-pane` | Resize absolutely or relatively | `paneId`, `width`+`height` or `direction`+`amount` | `{paneId}` |
+| `rename-session` | Rename a session | `sessionId`, `newName` | `{sessionId, name}` |
+| `kill-session` | Kill a session and all its windows | `sessionId` | `{killed}` |
+| `kill-window` | Kill a window and all its panes | `windowId` | `{killed}` |
+| `kill-pane` | Kill a single pane | `paneId` | `{killed}` |
+
+**execute-command** wraps your command with `tee` and `tmux wait-for` so it blocks synchronously until the command finishes. Output and exit code come back in one response — no polling, no separate result-fetch call.
+
+**send-keys** separates literal text (`literal=true`, the default) from tmux key names (`literal=false`). This fixes the original project's issue where `C-c` was sent as five literal characters instead of an interrupt signal. To cancel a running process:
+
+```json
+{"tool": "send-keys", "params": {"paneId": "%6", "keys": "C-c", "literal": false}}
+```
 
 ### Layer 2: agent workflows
 
-| Tool | Description |
-|---|---|
-| `start-and-watch` | Start a command and monitor until a readiness pattern matches or a trigger fires (async task) |
-| `watch-pane` | Monitor an existing pane until a trigger fires (async task) |
-| `pane-state` | Get OS-level process state: `isAlive`, `waitingForInput`, `foregroundCmd`, `foregroundPid` |
-| `run-in-repl` | Send input to a running REPL and wait for the prompt to reappear |
-| `write-to-display` | Write text to a pane as a side-channel display; returns only `paneId` so the text stays out of model context |
-| `display-message` | Show a transient notification in the tmux status bar |
-
-## Trigger system
-
-`start-and-watch` and `watch-pane` fire when a named trigger matches. Pass triggers as a comma-separated string.
-
-### Notification modes
-
-Controls how often the monitor polls and when it sends progress notifications:
-
-| Mode | Poll interval | Time threshold | Line threshold |
+| Tool | Purpose | Key params | Returns |
 |---|---|---|---|
-| `quick` | 500ms | 1s | 10 lines |
-| `medium` | 1s | 5s | 40 lines |
-| `slow` | 2s | 30s | 100 lines |
-| `line` | 200ms | — | 1 line |
-| `bunch` | 500ms | — | 10 lines |
-| `screen` | 1s | — | 40 lines |
+| `start-and-watch` | Start a command and monitor until a readiness pattern matches | `paneId`, `command`, `pattern`, `mode`, `triggers`, `timeout` | `WatchResult` (async task) |
+| `watch-pane` | Monitor an existing pane until a trigger fires | `paneId`, `mode`, `triggers`, `timeout` | `WatchResult` (async task) |
+| `pane-state` | Get OS-level process state | `paneId` | `{panePid, foregroundPid, foregroundCmd, isAlive, waitingForInput, exitCode}` |
+| `run-in-repl` | Send input to a running REPL and wait for the prompt | `paneId`, `input`, `promptPattern`, `timeout` | `{paneId, output}` |
+| `write-to-display` | Write coaching text to a side pane without entering agent context | `paneId`, `text`, `clear` | `{paneId}` |
+| `display-message` | Show a transient notification in the tmux status bar | `message`, `duration` | text |
 
-### Named triggers
+`start-and-watch` and `watch-pane` are **MCP Tasks** — they return immediately with a task ID, send progress notifications while running, and complete when a trigger fires. The agent can do other work while waiting.
 
-| Trigger | Fires when |
-|---|---|
-| `exit` | The pane's process group exits (detected via `pane_dead` flag) |
-| `shell` | The foreground command returns to a shell (`bash`, `zsh`, `fish`, etc.) |
-| `idle:N` | No new output for N seconds |
-| `user_input` | OS-level detection: foreground process is blocked reading from the terminal |
-| `error` | New output matches `error:|fatal|panic|exception|failed|FAIL` |
-| `bell` | tmux window bell flag is set |
-| `pattern:REGEX` | New output line matches a custom regular expression |
-
-`start-and-watch` defaults to `exit,error`. `watch-pane` defaults to `exit,user_input,error`.
-
-The `WatchResult` returned by both tools contains:
+`WatchResult` structure:
 
 ```json
 {
-  "paneId": "%3",
+  "paneId": "%6",
   "event": "pattern:Serving HTTP",
-  "detail": "Ready — matched: Serving HTTP on 0.0.0.0 port 8765",
-  "elapsed": 1.24,
-  "output": "Serving HTTP on 0.0.0.0 port 8765 ...",
+  "detail": "Ready — matched: Serving HTTP on port 8765",
+  "elapsed": 2.14,
+  "output": "Serving HTTP on port 8765 ...",
   "paneState": {
     "panePid": 12345,
-    "foregroundPid": 12346,
+    "foregroundPid": 12347,
     "foregroundCmd": "python3",
     "isAlive": true,
     "waitingForInput": false
@@ -117,163 +155,283 @@ The `WatchResult` returned by both tools contains:
 }
 ```
 
+## Smart trigger system
+
+Triggers control when `start-and-watch` and `watch-pane` stop monitoring. Pass them as a comma-separated string in the `triggers` parameter.
+
+### Notification modes
+
+| Mode | Poll interval | Notify after |
+|---|---|---|
+| `quick` | 500ms | 1s elapsed or 10 new lines |
+| `medium` | 1s | 5s elapsed or 40 new lines |
+| `slow` | 2s | 30s elapsed or 100 new lines |
+| `line` | 200ms | every new line |
+| `bunch` | 500ms | every 10 new lines |
+| `screen` | 1s | every 40 new lines |
+
+### Named triggers
+
+| Trigger | Fires when |
+|---|---|
+| `exit` | Foreground process exits |
+| `shell` | Terminal foreground command returns to an interactive shell |
+| `user_input` | OS kernel reports the foreground process is blocked reading from the tty |
+| `error` | New output matches `error:|fatal|panic|exception|failed|FAIL` |
+| `bell` | tmux window bell flag is set |
+| `idle:N` | No new output for N seconds |
+| `pattern:REGEX` | A new output line matches the regex |
+
+`start-and-watch` defaults to `exit,error`. `watch-pane` defaults to `exit,user_input,error`.
+
+Watch a build, stop on error or after 10 seconds of silence:
+
+```json
+{
+  "tool": "watch-pane",
+  "params": {
+    "paneId": "%6",
+    "mode": "medium",
+    "triggers": "exit,error,idle:10",
+    "timeout": 120
+  }
+}
+```
+
+Start a dev server, stop when it prints a ready message:
+
+```json
+{
+  "tool": "start-and-watch",
+  "params": {
+    "paneId": "%6",
+    "command": "npm run dev",
+    "pattern": "Local:.*http|ready in|listening on",
+    "mode": "quick",
+    "triggers": "exit,error",
+    "timeout": 60
+  }
+}
+```
+
 ## Native process detection
 
-`pane-state` and the `user_input` trigger detect whether a process is blocked waiting for terminal input at the OS level, without parsing output.
+`pane-state` and the `user_input` trigger use OS-level process inspection — not regex pattern matching on screen output.
 
-**Linux** reads `/proc/<pid>/wchan` for `n_tty_read` or `wait_woken`, and `/proc/<pid>/syscall` for `SYS_READ` (`0`) with `fd=0`. Uses `github.com/prometheus/procfs` for process enumeration.
+**Linux** reads `/proc/<pid>/wchan`. When a process blocks in `n_tty_read`, the kernel writes that function name to wchan. The server also checks `/proc/<pid>/syscall`: syscall number `0` (read) with file descriptor `0x0` (stdin) confirms the process is waiting for terminal input.
 
-**macOS** calls `sysctl kern.proc.pid` to get `kinfo_proc`, then checks `Wmesg == "ttyin"` (the kernel wait channel set when a process is blocked in `n_tty_read`). Falls back to a structural heuristic: if the terminal foreground process group matches the shell's own process group and the shell is in interruptible sleep, it is waiting at a prompt.
+**macOS** uses `sysctl kern.proc.pid` to fetch `kinfo_proc`. Two signals are combined: the kernel wait message field (`Wmesg == "ttyin"`) and a structural check — when the terminal foreground process group ID equals the shell's own process group and the shell is in interruptible sleep, no child has seized the terminal.
 
-Both platforms identify the foreground process by scanning the terminal foreground process group (`TPGID`), not just the pane's shell PID.
+Both platforms identify the **foreground process** by scanning the terminal foreground process group (`TPGID`), not just the pane's shell PID.
+
+Why this matters:
+
+```
+# Regex-based approach guesses from screen text:
+"Enter password:"                    → maybe waiting for input?
+"[sudo] password for jack:"          → probably?
+"Password:"                          → could be a log line
+
+# Native detection is definitive:
+pane-state → {"waitingForInput": true, "foregroundCmd": "sudo"}
+```
+
+No false positives from log messages. No missed prompts from non-standard prompt formats.
+
+`pane-state` response:
+
+```json
+{
+  "panePid": 8421,
+  "foregroundPid": 8456,
+  "foregroundCmd": "sudo",
+  "isAlive": true,
+  "waitingForInput": true
+}
+```
 
 ## Agent scenarios
 
-### Dev server: start-and-watch → execute-command
+### 1. Dev server with split-pane error monitoring
 
-```
-create-session
-  → sessionId: "$3", windowId: "@2", paneId: "%5"
+```json
+// Create session — one call returns session, window, and pane IDs
+{"tool": "create-session", "params": {"name": "webapp"}}
+// → {"sessionId": "$4", "windowId": "@6", "paneId": "%8"}
 
-split-pane paneId="%5" direction="horizontal"
-  → paneId: "%6"
+// Split for log monitoring (30% width on the right)
+{"tool": "split-pane", "params": {"paneId": "%8", "direction": "horizontal", "size": 30}}
+// → {"paneId": "%9", "windowId": "@6"}
 
-start-and-watch paneId="%5" command="npm run dev"
-  pattern="ready in|listening on|Local:"
-  mode="quick" timeout=60
-  → event: "pattern:ready in", elapsed: 3.1
+// Start server and wait for readiness (async MCP task)
+{"tool": "start-and-watch", "params": {
+  "paneId": "%8",
+  "command": "npm run dev",
+  "pattern": "Local:.*http|ready in",
+  "timeout": 60
+}}
+// → {"event": "pattern:ready in", "elapsed": 1.8, "output": "ready in 843ms"}
 
-execute-command paneId="%6" command="curl -s http://localhost:5173/api/health"
-  → output: '{"status":"ok"}', exitCode: 0
-```
-
-### REPL session: run-in-repl
-
-```
-send-keys paneId="%5" keys="python3 -q" enter=true
-
-run-in-repl paneId="%5" input="import math"
-  promptPattern="^>>> " timeout=10
-  → output: ""
-
-run-in-repl paneId="%5" input="math.sqrt(144)"
-  promptPattern="^>>> " timeout=10
-  → output: "12.0"
+// Watch side pane for errors while agent does other work
+{"tool": "watch-pane", "params": {
+  "paneId": "%9",
+  "mode": "medium",
+  "triggers": "error,pattern:UnhandledPromiseRejection",
+  "timeout": 300
+}}
 ```
 
-### Build monitoring: execute-command with exit code
+### 2. REPL session with multiple queries
 
-```
-execute-command paneId="%5" command="go build ./..."
-  → output: "", exitCode: 0
+```json
+// Start psql — execute-command blocks until the shell prompt returns
+{"tool": "execute-command", "params": {"paneId": "%5", "command": "psql -U app mydb"}}
 
-execute-command paneId="%5" command="go test ./..."
-  → output: "FAIL\tgithub.com/example/pkg\t0.142s", exitCode: 1
-```
+// First query — returns output between input and next prompt
+{"tool": "run-in-repl", "params": {
+  "paneId": "%5",
+  "input": "SELECT count(*) FROM users;",
+  "promptPattern": "mydb=#",
+  "timeout": 10
+}}
+// → {"paneId": "%5", "output": " count \n-------\n  1247"}
 
-`execute-command` blocks until the command completes. It tees stdout+stderr to a temp file and signals completion via `tmux wait-for`, so the exit code is always accurate regardless of pipelines.
-
-### Coaching display: split-pane → write-to-display
-
-```
-split-pane paneId="%5" direction="horizontal" size=30
-  → paneId: "%6"  (narrow display pane on the right)
-
-write-to-display paneId="%6" text="Running migrations..."
-
-execute-command paneId="%5" command="./migrate up"
-  → exitCode: 0
-
-write-to-display paneId="%6" text="Migrations complete." clear=true
+// Second query, same session
+{"tool": "run-in-repl", "params": {
+  "paneId": "%5",
+  "input": "SELECT id, email FROM users LIMIT 5;",
+  "promptPattern": "mydb=#"
+}}
 ```
 
-`write-to-display` writes literal text to the pane without capturing it back into the model's context window. The user sees it in their terminal; the tool returns only `{"paneId": "%6"}`.
+### 3. Build with exit code check
+
+```json
+{"tool": "execute-command", "params": {"paneId": "%5", "command": "go build ./..."}}
+// success → {"paneId": "%5", "output": "", "exitCode": 0}
+// failure → {"paneId": "%5", "output": "./main.go:12: syntax error", "exitCode": 1}
+```
+
+No polling. No parsing return values from a separate call. The exit code is in the response.
+
+`execute-command` tees stdout+stderr to a temp file and signals completion via `tmux wait-for`, so the exit code accurately reflects the original command even through pipelines.
+
+### 4. Coaching display pane
+
+```json
+// Split off a narrow display pane
+{"tool": "split-pane", "params": {"paneId": "%5", "direction": "horizontal", "size": 25}}
+// → {"paneId": "%6", "windowId": "@3"}
+
+// Write text the user sees — returns only paneId, text stays out of model context
+{"tool": "write-to-display", "params": {
+  "paneId": "%6",
+  "text": "Running database migration — do not interrupt",
+  "clear": true
+}}
+// → {"paneId": "%6"}
+
+// Run the migration in the main pane
+{"tool": "execute-command", "params": {
+  "paneId": "%5",
+  "command": "migrate -path ./migrations -database $DATABASE_URL up"
+}}
+```
+
+## Comparison with the original TypeScript implementation
+
+This project started as a port of [nickgnd/tmux-mcp](https://github.com/nickgnd/tmux-mcp) (TypeScript, 239 stars) and became a different design.
+
+| Area | nickgnd/tmux-mcp | This project |
+|---|---|---|
+| execute-command | Returns task ID; agent polls `get-command-result` | Synchronous via `tmux wait-for`; output + exit code in one response |
+| Input detection | None; agent regexes screen text | Native OS: `/proc/wchan` (Linux), `sysctl kern.proc.pid` (macOS) |
+| send-keys vs execute | Overloaded `execute-command` with `rawMode`+`noEnter` flags | Separate `send-keys` (text or key names) and `execute-command` |
+| C-c handling | Issue #31: sends literal "C-c" instead of SIGINT | `send-keys` with `literal=false` interprets `C-c` as interrupt |
+| Consecutive commands | Issue #28: unreliable | Each call gets a unique UUID wait channel |
+| Response IDs | Inconsistent | All tools return structured JSON with IDs; zero lookup calls needed |
+| Async monitoring | None | MCP Tasks API with streaming progress notifications |
+| Runtime | Node.js / npx | Single 7MB Go binary |
+| Tool count | 13 | 20 (14 primitives + 6 agent tools) |
+
+The polling model requires an agent to call `get-command-result` in a loop, wasting round trips and complicating timeout handling. `tmux wait-for` blocks inside the server process instead, so the agent gets the result in a single call.
 
 ## Configuration
 
 ```
-tmux-mcp [--shell-type=SHELL]
+tmux-mcp [--shell-type bash|zsh|fish]
 ```
 
-| Flag | Values | Default | Description |
-|---|---|---|---|
-| `--shell-type` | `bash`, `zsh`, `fish` | `bash` | Shell used in the pane where `execute-command` runs. Controls how the exit code is captured from a pipeline (`PIPESTATUS[0]`, `pipestatus[1]`, `$pipestatus[1]`). |
+`--shell-type` controls how `execute-command` captures exit codes from a pipeline:
 
-Set `--shell-type` to match the shell running in your tmux panes. A mismatch causes `execute-command` to report exit code 0 for all commands.
+| Shell | Exit code expression |
+|---|---|
+| `bash` (default) | `${PIPESTATUS[0]}` |
+| `zsh` | `${pipestatus[1]}` |
+| `fish` | `$status` captured before the pipe |
+
+Match this to the shell running inside your tmux panes. A mismatch causes `execute-command` to report exit code `0` for every command.
+
+**MCP resources** are also exposed:
+
+- `tmux://sessions` — JSON list of all active sessions
+- `tmux://pane/{paneId}` — current terminal content of a pane
 
 ## Development
 
 **Prerequisites:** Go 1.21+, tmux 3.2+
 
 ```bash
-# Build
 go build -o tmux-mcp .
-
-# Unit tests (no tmux required)
-go test -short ./...
-
-# Integration and scenario tests (tmux must be running)
-go test ./...
+go test -short ./...   # skip tests requiring tmux
+go test ./...          # full suite (tmux must be running)
 ```
 
 **Project structure:**
 
-```
-main.go            — MCP server setup, Layer 1 tool registration, resource registration
-tmux.go            — tmuxClient: all tmux CLI wrappers, data types
-agent_tools.go     — Layer 2 tool registration (start-and-watch, watch-pane, pane-state, run-in-repl, write-to-display, display-message)
-triggers.go        — Trigger definitions, notification modes, monitorPane loop, WatchResult
-process.go         — GetPaneState: tmux query + OS dispatch
-process_darwin.go  — macOS implementation via sysctl/kinfo_proc
-process_linux.go   — Linux implementation via /proc filesystem
-process_other.go   — Stub for unsupported platforms
-e2e_test.go        — MCP client harness for integration tests
-scenarios_test.go  — End-to-end scenario tests
-```
-
-**Resources exposed:**
-
-- `tmux://sessions` — static resource listing all sessions as JSON
-- `tmux://pane/{paneId}` — template resource returning pane terminal content
+| File | Lines | Purpose |
+|---|---|---|
+| `main.go` | 465 | MCP server setup, Layer 1 tool and resource registration |
+| `tmux.go` | 411 | `tmuxClient`: tmux CLI wrappers, data types, `ExecuteCommand` with wait-for |
+| `agent_tools.go` | 369 | Layer 2 tool registration: `start-and-watch`, `watch-pane`, `pane-state`, `run-in-repl`, `write-to-display`, `display-message` |
+| `triggers.go` | 443 | `NotificationMode`, `Trigger`, `monitorPane` loop, `parseTriggers`, `WatchResult` |
+| `process.go` | 72 | `PaneState` struct, `GetPaneState` (tmux query + OS dispatch) |
+| `process_darwin.go` | 113 | macOS: `sysctl kern.proc.pid`, `wmesg ttyin` detection |
+| `process_linux.go` | 107 | Linux: `/proc/wchan`, `/proc/syscall` detection |
+| `process_other.go` | 12 | Stub for other platforms (`WaitingForInput` always false) |
+| `e2e_test.go` | 1124 | MCP client harness, JSON-RPC transport, tool test helpers |
+| `scenarios_test.go` | 372 | End-to-end scenario tests: dev server, REPL, build |
 
 ## Troubleshooting
 
 ### execute-command always returns exit code 0
 
-**Cause:** `--shell-type` does not match the shell in the pane.
+`--shell-type` does not match the shell in the pane.
 
-**Fix:** Pass the correct shell:
 ```bash
-tmux-mcp --shell-type=zsh   # for zsh panes
-tmux-mcp --shell-type=fish  # for fish panes
+tmux-mcp --shell-type=zsh    # for zsh panes
+tmux-mcp --shell-type=fish   # for fish panes
 ```
 
-### start-and-watch times out immediately
+### start-and-watch times out without firing
 
-**Cause:** The pane ID does not exist, or the pattern never appears in output.
-
-**Fix:** Verify the pane ID with `list-panes`. Test the pattern against actual command output with `capture-pane` before using `start-and-watch`.
+The pane ID does not exist, or the readiness pattern never appears in output. Verify the pane ID with `list-panes`. Test the regex against real output with `capture-pane` before adding it to `start-and-watch`.
 
 ### pane-state reports waitingForInput=false when a prompt is visible
 
-**Cause:** On Linux, some shells use `select()` or `poll()` instead of blocking `read()`, so `wchan` may show `ep_poll` rather than `n_tty_read`.
+On Linux, some shells use `select()` or `poll()` rather than blocking `read()`, so `/proc/wchan` shows `ep_poll` instead of `n_tty_read`. The tool falls back to `isAlive=true, waitingForInput=false`. Use `idle:N` as a complement when precise input detection is required.
 
-**Behavior:** The tool falls back to returning `isAlive=true` with `waitingForInput=false`. Use the `idle:N` trigger as a complement when precise input detection is required.
+### list-sessions returns an empty array
 
-### No sessions returned from list-sessions
-
-**Cause:** No tmux server is running, or the server has no sessions.
-
-**Behavior:** `list-sessions` returns an empty array rather than an error when tmux reports "no server running" or "no sessions". Start a session with `create-session` to proceed.
+No tmux server is running, or the server has no sessions. `list-sessions` returns `[]` rather than an error when tmux reports "no server running". Call `create-session` to start one.
 
 ### MCP client does not see the tools
 
-**Cause:** Binary path in the MCP config is wrong, or the binary is not executable.
+The binary path in the MCP config is wrong or the binary is not executable.
 
-**Fix:**
 ```bash
 chmod +x /path/to/tmux-mcp
-/path/to/tmux-mcp --help   # verify it runs
+/path/to/tmux-mcp --help    # verify it starts
 ```
 
 ## License
