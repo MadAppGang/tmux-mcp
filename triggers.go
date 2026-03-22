@@ -216,7 +216,8 @@ func buildTrigger(name string, client *tmuxClient) *Trigger {
 		return &Trigger{
 			Name: "bell",
 			Check: func(ctx context.Context, s *MonitorState) (bool, string) {
-				out, err := client.run(ctx, "display-message", "-p", "-t", s.PaneID, "#{window_bell_flag}")
+				socket, bareID := parseTarget(s.PaneID)
+				out, err := client.runWithSocket(ctx, socket, "display-message", "-p", "-t", bareID, "#{window_bell_flag}")
 				if err != nil {
 					return false, ""
 				}

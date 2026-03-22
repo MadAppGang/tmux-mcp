@@ -1122,3 +1122,148 @@ func TestWatchPaneExitTrigger(t *testing.T) {
 		t.Fatalf("expected event='exit', got %q", event)
 	}
 }
+
+// TestCreateHeadless verifies that headless sessions are fully isolated from the
+// user's default tmux server and that all operations work through the
+// "headless:" prefix routing.
+func TestCreateHeadless(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	c := newMCPClient(t)
+
+	// Ensure the headless server is clean before and after the test.
+	c.callToolJSON(t, "kill-headless-server", map[string]any{}, &map[string]any{})
+	t.Cleanup(func() {
+		_ = callToolIgnoreError(c, "kill-headless-server", map[string]any{})
+	})
+
+	// Create a headless session.
+	var created map[string]any
+	c.callToolJSON(t, "create-headless", map[string]any{
+		"name": "test-headless",
+	}, &created)
+
+	sessionID, _ := created["sessionId"].(string)
+	windowID, _ := created["windowId"].(string)
+	paneID, _ := created["paneId"].(string)
+
+	if !strings.HasPrefix(sessionID, "headless:") {
+		t.Fatalf("expected sessionId to start with 'headless:', got %q", sessionID)
+	}
+	if !strings.HasPrefix(windowID, "headless:") {
+		t.Fatalf("expected windowId to start with 'headless:', got %q", windowID)
+	}
+	if !strings.HasPrefix(paneID, "headless:") {
+		t.Fatalf("expected paneId to start with 'headless:', got %q", paneID)
+	}
+
+	// Execute a command in the headless pane and verify output.
+	var execResult map[string]any
+	c.callToolJSON(t, "execute-command", map[string]any{
+		"paneId":  paneID,
+		"command": "echo headless-works",
+	}, &execResult)
+
+	output, _ := execResult["output"].(string)
+	if !strings.Contains(output, "headless-works") {
+		t.Fatalf("expected 'headless-works' in output, got: %q", output)
+	}
+	exitCode, _ := execResult["exitCode"].(float64)
+	if exitCode != 0 {
+		t.Fatalf("expected exitCode 0, got %v", exitCode)
+	}
+
+	// The headless session must NOT appear in default list-sessions.
+	var defaultSessions []map[string]any
+	c.callToolJSON(t, "list-sessions", map[string]any{}, &defaultSessions)
+	for _, s := range defaultSessions {
+		id, _ := s["id"].(string)
+		if strings.HasPrefix(id, "headless:") {
+			t.Fatalf("headless session %q should not appear in default list-sessions", id)
+		}
+		name, _ := s["name"].(string)
+		if name == "test-headless" {
+			t.Fatalf("headless session name 'test-headless' should not appear in default list-sessions")
+		}
+	}
+
+	// The headless session must appear in list-sessions(headless: true).
+	var headlessSessions []map[string]any
+	c.callToolJSON(t, "list-sessions", map[string]any{"headless": true}, &headlessSessions)
+	found := false
+	for _, s := range headlessSessions {
+		id, _ := s["id"].(string)
+		if id == sessionID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("headless session %q not found in list-sessions(headless=true)", sessionID)
+	}
+
+	// Verify list-sessions(all: true) contains both prefixed and plain sessions.
+	var allSessions []map[string]any
+	c.callToolJSON(t, "list-sessions", map[string]any{"all": true}, &allSessions)
+	foundInAll := false
+	for _, s := range allSessions {
+		id, _ := s["id"].(string)
+		if id == sessionID {
+			foundInAll = true
+			break
+		}
+	}
+	if !foundInAll {
+		t.Fatalf("headless session %q not found in list-sessions(all=true)", sessionID)
+	}
+
+	// Capture pane works through the prefix.
+	captureText := c.callToolText(t, "capture-pane", map[string]any{"paneId": paneID})
+	if !strings.Contains(captureText, "headless-works") {
+		t.Fatalf("capture-pane on headless pane did not contain 'headless-works', got:\n%s", captureText)
+	}
+
+	// list-windows and list-panes work through the prefix.
+	var windows []map[string]any
+	c.callToolJSON(t, "list-windows", map[string]any{"sessionId": sessionID}, &windows)
+	if len(windows) == 0 {
+		t.Fatal("list-windows returned no windows for headless session")
+	}
+	for _, w := range windows {
+		wid, _ := w["id"].(string)
+		if !strings.HasPrefix(wid, "headless:") {
+			t.Fatalf("window id %q should have 'headless:' prefix", wid)
+		}
+	}
+
+	var panes []map[string]any
+	c.callToolJSON(t, "list-panes", map[string]any{"windowId": windowID}, &panes)
+	if len(panes) == 0 {
+		t.Fatal("list-panes returned no panes for headless window")
+	}
+	for _, p := range panes {
+		pid, _ := p["id"].(string)
+		if !strings.HasPrefix(pid, "headless:") {
+			t.Fatalf("pane id %q should have 'headless:' prefix", pid)
+		}
+	}
+
+	// kill-headless-server shuts down cleanly.
+	var killed map[string]any
+	c.callToolJSON(t, "kill-headless-server", map[string]any{}, &killed)
+	if killed["killed"] != true {
+		t.Fatalf("kill-headless-server returned killed=%v", killed["killed"])
+	}
+	sessions, _ := killed["sessions"].(float64)
+	if int(sessions) < 1 {
+		t.Fatalf("expected at least 1 session reported by kill-headless-server, got %v", killed["sessions"])
+	}
+
+	// After killing, headless list should be empty.
+	var afterKill []map[string]any
+	c.callToolJSON(t, "list-sessions", map[string]any{"headless": true}, &afterKill)
+	if len(afterKill) != 0 {
+		t.Fatalf("expected 0 headless sessions after kill-headless-server, got %d", len(afterKill))
+	}
+}

@@ -22,8 +22,9 @@ type PaneState struct {
 // call, then uses OS-specific inspection to determine whether the foreground
 // process is alive and waiting for input.
 func (t *tmuxClient) GetPaneState(ctx context.Context, paneID string) (*PaneState, error) {
+	socket, bareID := parseTarget(paneID)
 	// Query pid, dead flag, and dead exit status in a single tmux call.
-	out, err := t.run(ctx, "display-message", "-p", "-t", paneID,
+	out, err := t.runWithSocket(ctx, socket, "display-message", "-p", "-t", bareID,
 		"#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}")
 	if err != nil {
 		return nil, fmt.Errorf("get pane state: %w", err)

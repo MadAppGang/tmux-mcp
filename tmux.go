@@ -66,6 +66,12 @@ type CreatedPane struct {
 	WindowID string `json:"windowId"`
 }
 
+// headlessSocket is the tmux socket name used for isolated headless sessions.
+const headlessSocket = "mcp-headless"
+
+// headlessPrefix is the ID prefix that identifies headless targets.
+const headlessPrefix = "headless:"
+
 // tmuxClient wraps tmux CLI interactions.
 type tmuxClient struct {
 	shellType string
@@ -75,22 +81,67 @@ func newTmuxClient(shellType string) *tmuxClient {
 	return &tmuxClient{shellType: shellType}
 }
 
+// parseTarget splits a target ID into its socket and bare ID.
+// IDs prefixed with "headless:" are routed to the mcp-headless socket.
+// All other IDs use the default tmux server (empty socket string).
+func parseTarget(target string) (socket string, id string) {
+	if strings.HasPrefix(target, headlessPrefix) {
+		return headlessSocket, strings.TrimPrefix(target, headlessPrefix)
+	}
+	return "", target
+}
+
 // run executes a tmux command and returns its combined output.
 func (t *tmuxClient) run(ctx context.Context, args ...string) (string, error) {
+	return t.runWithSocket(ctx, "", args...)
+}
+
+// runWithSocket executes a tmux command, optionally routing it to a named
+// socket via "-L <socket>". An empty socket uses the default tmux server.
+func (t *tmuxClient) runWithSocket(ctx context.Context, socket string, args ...string) (string, error) {
+	if socket != "" {
+		args = append([]string{"-L", socket}, args...)
+	}
 	cmd := exec.CommandContext(ctx, "tmux", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("tmux %s: %w: %s", args[0], err, strings.TrimSpace(string(exitErr.Stderr)))
+			subCmd := args[0]
+			if socket != "" {
+				subCmd = args[2] // skip "-L", socket
+			}
+			return "", fmt.Errorf("tmux %s: %w: %s", subCmd, err, strings.TrimSpace(string(exitErr.Stderr)))
 		}
-		return "", fmt.Errorf("tmux %s: %w", args[0], err)
+		subCmd := args[0]
+		if socket != "" {
+			subCmd = args[2]
+		}
+		return "", fmt.Errorf("tmux %s: %w", subCmd, err)
 	}
 	return strings.TrimRight(string(out), "\n"), nil
 }
 
-// ListSessions returns all active tmux sessions.
+// ListSessions returns all active tmux sessions on the default server.
 func (t *tmuxClient) ListSessions(ctx context.Context) ([]Session, error) {
-	out, err := t.run(ctx, "list-sessions",
+	return t.listSessionsOnSocket(ctx, "")
+}
+
+// ListHeadlessSessions returns all active sessions on the headless server.
+// IDs in the returned sessions are prefixed with "headless:".
+func (t *tmuxClient) ListHeadlessSessions(ctx context.Context) ([]Session, error) {
+	sessions, err := t.listSessionsOnSocket(ctx, headlessSocket)
+	if err != nil {
+		return sessions, err
+	}
+	for i := range sessions {
+		sessions[i].ID = headlessPrefix + sessions[i].ID
+	}
+	return sessions, nil
+}
+
+// listSessionsOnSocket lists sessions on the given tmux socket (empty = default).
+func (t *tmuxClient) listSessionsOnSocket(ctx context.Context, socket string) ([]Session, error) {
+	out, err := t.runWithSocket(ctx, socket, "list-sessions",
 		"-F", "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}")
 	if err != nil {
 		if strings.Contains(err.Error(), "no server running") ||
@@ -122,8 +173,9 @@ func (t *tmuxClient) ListSessions(ctx context.Context) ([]Session, error) {
 
 // ListWindows returns windows in the given session.
 func (t *tmuxClient) ListWindows(ctx context.Context, sessionID string) ([]Window, error) {
-	out, err := t.run(ctx, "list-windows",
-		"-t", sessionID,
+	socket, bareID := parseTarget(sessionID)
+	out, err := t.runWithSocket(ctx, socket, "list-windows",
+		"-t", bareID,
 		"-F", "#{window_id}\t#{window_name}\t#{window_active}\t#{window_panes}")
 	if err != nil {
 		return nil, err
@@ -132,6 +184,10 @@ func (t *tmuxClient) ListWindows(ctx context.Context, sessionID string) ([]Windo
 		return []Window{}, nil
 	}
 
+	prefix := ""
+	if socket != "" {
+		prefix = headlessPrefix
+	}
 	var windows []Window
 	for _, line := range strings.Split(out, "\n") {
 		parts := strings.Split(line, "\t")
@@ -140,7 +196,7 @@ func (t *tmuxClient) ListWindows(ctx context.Context, sessionID string) ([]Windo
 		}
 		panes, _ := strconv.Atoi(parts[3])
 		windows = append(windows, Window{
-			ID:     parts[0],
+			ID:     prefix + parts[0],
 			Name:   parts[1],
 			Active: parts[2] == "1",
 			Panes:  panes,
@@ -151,8 +207,9 @@ func (t *tmuxClient) ListWindows(ctx context.Context, sessionID string) ([]Windo
 
 // ListPanes returns panes in the given window with extended info.
 func (t *tmuxClient) ListPanes(ctx context.Context, windowID string) ([]Pane, error) {
-	out, err := t.run(ctx, "list-panes",
-		"-t", windowID,
+	socket, bareID := parseTarget(windowID)
+	out, err := t.runWithSocket(ctx, socket, "list-panes",
+		"-t", bareID,
 		"-F", "#{pane_id}\t#{pane_title}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}")
 	if err != nil {
 		return nil, err
@@ -161,6 +218,10 @@ func (t *tmuxClient) ListPanes(ctx context.Context, windowID string) ([]Pane, er
 		return []Pane{}, nil
 	}
 
+	prefix := ""
+	if socket != "" {
+		prefix = headlessPrefix
+	}
 	var panes []Pane
 	for _, line := range strings.Split(out, "\n") {
 		parts := strings.Split(line, "\t")
@@ -170,7 +231,7 @@ func (t *tmuxClient) ListPanes(ctx context.Context, windowID string) ([]Pane, er
 		width, _ := strconv.Atoi(parts[3])
 		height, _ := strconv.Atoi(parts[4])
 		panes = append(panes, Pane{
-			ID:             parts[0],
+			ID:             prefix + parts[0],
 			Title:          parts[1],
 			Active:         parts[2] == "1",
 			Width:          width,
@@ -186,24 +247,49 @@ func (t *tmuxClient) ListPanes(ctx context.Context, windowID string) ([]Pane, er
 // lines <= 0 uses the pane's default history size.
 // colors controls whether ANSI escape sequences are preserved.
 func (t *tmuxClient) CapturePane(ctx context.Context, paneID string, lines int, colors bool) (string, error) {
-	args := []string{"capture-pane", "-t", paneID, "-p"}
+	socket, bareID := parseTarget(paneID)
+	args := []string{"capture-pane", "-t", bareID, "-p"}
 	if lines > 0 {
 		args = append(args, "-S", strconv.Itoa(-lines))
 	}
 	if colors {
 		args = append(args, "-e")
 	}
-	return t.run(ctx, args...)
+	return t.runWithSocket(ctx, socket, args...)
 }
 
 // CreateSession creates a new detached tmux session.
 // Returns a CreatedSession with the session, window, and pane IDs.
 func (t *tmuxClient) CreateSession(ctx context.Context, name string) (*CreatedSession, error) {
+	return t.createSessionOnSocket(ctx, "", name, "")
+}
+
+// CreateHeadlessSession creates a new detached session on the headless tmux
+// server. The returned IDs are prefixed with "headless:" so all subsequent
+// tool calls are routed to the correct socket automatically.
+func (t *tmuxClient) CreateHeadlessSession(ctx context.Context, name, command string) (*CreatedSession, error) {
+	sess, err := t.createSessionOnSocket(ctx, headlessSocket, name, command)
+	if err != nil {
+		return nil, err
+	}
+	sess.SessionID = headlessPrefix + sess.SessionID
+	sess.WindowID = headlessPrefix + sess.WindowID
+	sess.PaneID = headlessPrefix + sess.PaneID
+	return sess, nil
+}
+
+// createSessionOnSocket is the shared implementation for session creation.
+// socket selects the tmux server; empty means the default server.
+// command, if non-empty, is passed to the shell as the initial command.
+func (t *tmuxClient) createSessionOnSocket(ctx context.Context, socket, name, command string) (*CreatedSession, error) {
 	args := []string{"new-session", "-d", "-P", "-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{pane_id}"}
 	if name != "" {
 		args = append(args, "-s", name)
 	}
-	out, err := t.run(ctx, args...)
+	if command != "" {
+		args = append(args, command)
+	}
+	out, err := t.runWithSocket(ctx, socket, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -222,11 +308,12 @@ func (t *tmuxClient) CreateSession(ctx context.Context, name string) (*CreatedSe
 // CreateWindow creates a new window in the given session.
 // Returns a CreatedWindow with the window and pane IDs.
 func (t *tmuxClient) CreateWindow(ctx context.Context, sessionID, name string) (*CreatedWindow, error) {
-	args := []string{"new-window", "-t", sessionID, "-P", "-F", "#{window_id}\t#{window_name}\t#{pane_id}"}
+	socket, bareID := parseTarget(sessionID)
+	args := []string{"new-window", "-t", bareID, "-P", "-F", "#{window_id}\t#{window_name}\t#{pane_id}"}
 	if name != "" {
 		args = append(args, "-n", name)
 	}
-	out, err := t.run(ctx, args...)
+	out, err := t.runWithSocket(ctx, socket, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -234,10 +321,14 @@ func (t *tmuxClient) CreateWindow(ctx context.Context, sessionID, name string) (
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("unexpected tmux output: %q", out)
 	}
+	prefix := ""
+	if socket != "" {
+		prefix = headlessPrefix
+	}
 	return &CreatedWindow{
-		WindowID:   parts[0],
+		WindowID:   prefix + parts[0],
 		WindowName: parts[1],
-		PaneID:     parts[2],
+		PaneID:     prefix + parts[2],
 	}, nil
 }
 
@@ -245,14 +336,15 @@ func (t *tmuxClient) CreateWindow(ctx context.Context, sessionID, name string) (
 // size is a percentage (0 means use tmux default of 50%).
 // Returns a CreatedPane with the new pane ID and its parent window ID.
 func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, size int) (*CreatedPane, error) {
-	args := []string{"split-window", "-t", paneID, "-P", "-F", "#{pane_id}\t#{window_id}"}
+	socket, bareID := parseTarget(paneID)
+	args := []string{"split-window", "-t", bareID, "-P", "-F", "#{pane_id}\t#{window_id}"}
 	if direction == "horizontal" {
 		args = append(args, "-h")
 	}
 	if size > 0 {
 		args = append(args, "-p", strconv.Itoa(size))
 	}
-	out, err := t.run(ctx, args...)
+	out, err := t.runWithSocket(ctx, socket, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -260,9 +352,13 @@ func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, si
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("unexpected tmux output: %q", out)
 	}
+	prefix := ""
+	if socket != "" {
+		prefix = headlessPrefix
+	}
 	return &CreatedPane{
-		PaneID:   parts[0],
-		WindowID: parts[1],
+		PaneID:   prefix + parts[0],
+		WindowID: prefix + parts[1],
 	}, nil
 }
 
@@ -271,12 +367,13 @@ func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, si
 // rather than interpreting key names like "Enter" or "C-c".
 // When enter is true, a real Enter keystroke is appended after the keys.
 func (t *tmuxClient) SendKeys(ctx context.Context, paneID, keys string, literal, enter bool) error {
-	args := []string{"send-keys", "-t", paneID}
+	socket, bareID := parseTarget(paneID)
+	args := []string{"send-keys", "-t", bareID}
 	if literal {
 		args = append(args, "-l")
 	}
 	args = append(args, keys)
-	if _, err := t.run(ctx, args...); err != nil {
+	if _, err := t.runWithSocket(ctx, socket, args...); err != nil {
 		return err
 	}
 	if enter {
@@ -284,7 +381,7 @@ func (t *tmuxClient) SendKeys(ctx context.Context, paneID, keys string, literal,
 		// does not cause "Enter" to be treated as the five literal characters
 		// E-n-t-e-r. This second call intentionally omits -l so tmux
 		// interprets "Enter" as the Return key.
-		if _, err := t.run(ctx, "send-keys", "-t", paneID, "Enter"); err != nil {
+		if _, err := t.runWithSocket(ctx, socket, "send-keys", "-t", bareID, "Enter"); err != nil {
 			return err
 		}
 	}
@@ -296,6 +393,8 @@ func (t *tmuxClient) SendKeys(ctx context.Context, paneID, keys string, literal,
 // written to a separate file, then uses "tmux wait-for" to block until the
 // command finishes. The context deadline controls the overall timeout.
 func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string) (*CommandResult, error) {
+	socket, _ := parseTarget(paneID)
+
 	id := uuid.New().String()
 	outFile := fmt.Sprintf("/tmp/tmux-mcp-%s.out", id)
 	exitFile := fmt.Sprintf("/tmp/tmux-mcp-%s.exit", id)
@@ -312,11 +411,18 @@ func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string)
 	}
 
 	// Block until the command signals completion or the context is cancelled.
-	if err := exec.CommandContext(ctx, "tmux", "wait-for", waitChannel).Run(); err != nil {
+	// The wait-for must target the same tmux server that the pane lives on.
+	var waitErr error
+	if socket != "" {
+		waitErr = exec.CommandContext(ctx, "tmux", "-L", socket, "wait-for", waitChannel).Run()
+	} else {
+		waitErr = exec.CommandContext(ctx, "tmux", "wait-for", waitChannel).Run()
+	}
+	if waitErr != nil {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("command timed out: %w", ctx.Err())
 		}
-		return nil, fmt.Errorf("wait-for: %w", err)
+		return nil, fmt.Errorf("wait-for: %w", waitErr)
 	}
 
 	outputBytes, err := os.ReadFile(outFile)
@@ -366,7 +472,8 @@ func (t *tmuxClient) wrapCommand(command, outFile, exitFile, waitChannel string)
 
 // ResizePaneAbsolute resizes a pane to exact dimensions in columns and rows.
 func (t *tmuxClient) ResizePaneAbsolute(ctx context.Context, paneID string, width, height int) error {
-	_, err := t.run(ctx, "resize-pane", "-t", paneID,
+	socket, bareID := parseTarget(paneID)
+	_, err := t.runWithSocket(ctx, socket, "resize-pane", "-t", bareID,
 		"-x", strconv.Itoa(width),
 		"-y", strconv.Itoa(height))
 	return err
@@ -375,32 +482,57 @@ func (t *tmuxClient) ResizePaneAbsolute(ctx context.Context, paneID string, widt
 // ResizePaneRelative adjusts a pane size in the given direction.
 // direction must be one of U, D, L, R.
 func (t *tmuxClient) ResizePaneRelative(ctx context.Context, paneID, direction string, amount int) error {
-	_, err := t.run(ctx, "resize-pane", "-t", paneID, "-"+strings.ToUpper(direction), strconv.Itoa(amount))
+	socket, bareID := parseTarget(paneID)
+	_, err := t.runWithSocket(ctx, socket, "resize-pane", "-t", bareID, "-"+strings.ToUpper(direction), strconv.Itoa(amount))
 	return err
 }
 
 // RenameSession renames a tmux session.
 func (t *tmuxClient) RenameSession(ctx context.Context, sessionID, newName string) error {
-	_, err := t.run(ctx, "rename-session", "-t", sessionID, newName)
+	socket, bareID := parseTarget(sessionID)
+	_, err := t.runWithSocket(ctx, socket, "rename-session", "-t", bareID, newName)
 	return err
 }
 
 // KillSession kills a tmux session and all its windows.
 func (t *tmuxClient) KillSession(ctx context.Context, sessionID string) error {
-	_, err := t.run(ctx, "kill-session", "-t", sessionID)
+	socket, bareID := parseTarget(sessionID)
+	_, err := t.runWithSocket(ctx, socket, "kill-session", "-t", bareID)
 	return err
 }
 
 // KillWindow kills a tmux window and all its panes.
 func (t *tmuxClient) KillWindow(ctx context.Context, windowID string) error {
-	_, err := t.run(ctx, "kill-window", "-t", windowID)
+	socket, bareID := parseTarget(windowID)
+	_, err := t.runWithSocket(ctx, socket, "kill-window", "-t", bareID)
 	return err
 }
 
 // KillPane kills a tmux pane.
 func (t *tmuxClient) KillPane(ctx context.Context, paneID string) error {
-	_, err := t.run(ctx, "kill-pane", "-t", paneID)
+	socket, bareID := parseTarget(paneID)
+	_, err := t.runWithSocket(ctx, socket, "kill-pane", "-t", bareID)
 	return err
+}
+
+// KillHeadlessServer shuts down the headless tmux server and all its sessions.
+// Returns the number of sessions that were running before shutdown.
+// It kills sessions individually rather than using kill-server to avoid any
+// kill-server wrappers or guards in the environment.
+func (t *tmuxClient) KillHeadlessServer(ctx context.Context) (int, error) {
+	// List sessions on the headless socket (without the "headless:" prefix so we
+	// can pass the bare IDs directly to kill-session on the headless socket).
+	sessions, err := t.listSessionsOnSocket(ctx, headlessSocket)
+	if err != nil {
+		// No server running is not an error.
+		return 0, nil
+	}
+	n := len(sessions)
+	for _, s := range sessions {
+		// Kill each session on the headless socket using its bare ID.
+		_, _ = t.runWithSocket(ctx, headlessSocket, "kill-session", "-t", s.ID)
+	}
+	return n, nil
 }
 
 // DisplayMessage shows a transient message in the tmux status bar.

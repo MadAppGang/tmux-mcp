@@ -37,14 +37,76 @@ func main() {
 func registerTools(s *server.MCPServer, client *tmuxClient) {
 	// list-sessions
 	s.AddTool(mcp.NewTool("list-sessions",
-		mcp.WithDescription("List all active tmux sessions"),
+		mcp.WithDescription("List active tmux sessions. By default lists only the default server. Use headless=true for the isolated headless server, or all=true for both."),
+		mcp.WithBoolean("headless",
+			mcp.Description("List sessions on the headless server instead of the default server"),
+		),
+		mcp.WithBoolean("all",
+			mcp.Description("List sessions on both the default and headless servers"),
+		),
 		mcp.WithReadOnlyHintAnnotation(true),
-	), func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sessions, err := client.ListSessions(ctx)
-		if err != nil {
-			return mcp.NewToolResultErrorFromErr("failed to list sessions", err), nil
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		headless := req.GetBool("headless", false)
+		all := req.GetBool("all", false)
+
+		switch {
+		case all:
+			defaultSessions, err := client.ListSessions(ctx)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("failed to list sessions", err), nil
+			}
+			headlessSessions, err := client.ListHeadlessSessions(ctx)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("failed to list headless sessions", err), nil
+			}
+			return jsonResult(append(defaultSessions, headlessSessions...))
+		case headless:
+			sessions, err := client.ListHeadlessSessions(ctx)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("failed to list headless sessions", err), nil
+			}
+			return jsonResult(sessions)
+		default:
+			sessions, err := client.ListSessions(ctx)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("failed to list sessions", err), nil
+			}
+			return jsonResult(sessions)
 		}
-		return jsonResult(sessions)
+	})
+
+	// create-headless
+	s.AddTool(mcp.NewTool("create-headless",
+		mcp.WithDescription("Create an isolated headless tmux session invisible to the user's tmux ls. Returns IDs prefixed with \"headless:\" that route all subsequent tool calls to the isolated server."),
+		mcp.WithString("name",
+			mcp.Description("Session name (optional)"),
+		),
+		mcp.WithString("command",
+			mcp.Description("Command to run in the session (optional, defaults to shell)"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		name := req.GetString("name", "")
+		command := req.GetString("command", "")
+		created, err := client.CreateHeadlessSession(ctx, name, command)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("failed to create headless session", err), nil
+		}
+		return jsonResult(created)
+	})
+
+	// kill-headless-server
+	s.AddTool(mcp.NewTool("kill-headless-server",
+		mcp.WithDescription("Terminate all headless sessions and shut down the headless tmux server."),
+		mcp.WithDestructiveHintAnnotation(true),
+	), func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		n, err := client.KillHeadlessServer(ctx)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("failed to kill headless server", err), nil
+		}
+		return jsonResult(struct {
+			Killed   bool `json:"killed"`
+			Sessions int  `json:"sessions"`
+		}{Killed: true, Sessions: n})
 	})
 
 	// list-windows
