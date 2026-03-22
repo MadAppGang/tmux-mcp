@@ -1,0 +1,21 @@
+# Binary
+tmux-mcp
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Test
+*.test
+
+# AI session artifacts
+ai-docs/
+
+# Claude memory (project-specific)
+.claude/
+.claudemem/
