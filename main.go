@@ -16,7 +16,6 @@ func main() {
 	flag.Parse()
 
 	client := newTmuxClient(*shellType)
-	registry := newSessionRegistry()
 
 	s := server.NewMCPServer("tmux-mcp", "1.0.0",
 		server.WithToolCapabilities(true),
@@ -26,7 +25,6 @@ func main() {
 
 	registerTools(s, client)
 	registerAgentTools(s, client)
-	registerSessionTools(s, client, registry)
 	registerResources(s, client)
 
 	if err := server.ServeStdio(s); err != nil {
@@ -283,23 +281,47 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 
 	// execute-command
 	s.AddTool(mcp.NewTool("execute-command",
-		mcp.WithDescription("Run a shell command in a pane and wait for it to complete. Returns the full output and exit code."),
+		mcp.WithDescription("Run a shell command in a pane and wait for it to complete. Returns the full output and exit code. When headless=true and no paneId is provided, a temporary isolated session is created, the command runs, and the session is cleaned up automatically (no paneId in response)."),
 		mcp.WithString("paneId",
-			mcp.Required(),
-			mcp.Description("Pane ID to run the command in"),
+			mcp.Description("Pane ID to run the command in. Required when headless=false."),
 		),
 		mcp.WithString("command",
 			mcp.Required(),
 			mcp.Description("Shell command to execute"),
 		),
+		mcp.WithBoolean("headless",
+			mcp.Description("When true and no paneId is provided, auto-create a headless session, run the command, return output, and clean up. Default false."),
+		),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		paneID, err := req.RequireString("paneId")
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
 		command, err := req.RequireString("command")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
+		}
+		headless := req.GetBool("headless", false)
+		paneID := req.GetString("paneId", "")
+
+		if headless && paneID == "" {
+			// One-shot headless execution: create session, run, destroy.
+			created, err := client.CreateHeadlessSession(ctx, "", "")
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("failed to create headless session", err), nil
+			}
+			defer func() {
+				_ = client.KillSession(context.Background(), created.SessionID)
+			}()
+			result, err := client.ExecuteCommand(ctx, created.PaneID, command)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
+			}
+			// Return output without paneId — the session is gone.
+			return jsonResult(struct {
+				Output   string `json:"output"`
+				ExitCode int    `json:"exitCode"`
+			}{Output: result.Output, ExitCode: result.ExitCode})
+		}
+
+		if paneID == "" {
+			return mcp.NewToolResultError("paneId is required when headless=false"), nil
 		}
 		result, err := client.ExecuteCommand(ctx, paneID, command)
 		if err != nil {

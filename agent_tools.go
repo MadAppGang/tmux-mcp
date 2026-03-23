@@ -39,11 +39,10 @@ func watchResultToTaskResult(r *WatchResult) (*mcp.CreateTaskResult, error) {
 
 func registerStartAndWatch(s *server.MCPServer, client *tmuxClient) {
 	s.AddTaskTool(mcp.NewTool("start-and-watch",
-		mcp.WithDescription("Start a command in a pane and monitor its output. Reports periodic progress notifications and completes when a readiness pattern matches, a named trigger fires, or the timeout expires."),
+		mcp.WithDescription("Start a command in a pane and monitor its output. Reports periodic progress notifications and completes when a readiness pattern matches, a named trigger fires, or the timeout expires. When paneId is omitted, a new pane is created automatically (headless=true creates an isolated headless pane)."),
 		mcp.WithTaskSupport(mcp.TaskSupportRequired),
 		mcp.WithString("paneId",
-			mcp.Required(),
-			mcp.Description("Pane ID (e.g. %0) to run the command in"),
+			mcp.Description("Pane ID (e.g. %0) to run the command in. If omitted, a new pane is created automatically."),
 		),
 		mcp.WithString("command",
 			mcp.Required(),
@@ -52,6 +51,9 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient) {
 		mcp.WithString("pattern",
 			mcp.Required(),
 			mcp.Description("Regex pattern indicating readiness (e.g. \"listening on|ready in|compiled successfully\"). This is the primary trigger."),
+		),
+		mcp.WithBoolean("headless",
+			mcp.Description("When true and paneId is omitted, create an isolated headless pane. The returned paneId will have a 'headless:' prefix. Default false."),
 		),
 		mcp.WithString("mode",
 			mcp.Description("Notification preset: quick (0.5s poll/1s or 10 lines), medium (1s poll/5s or 40 lines), slow (2s poll/30s or 100 lines), line (200ms poll/1 line), bunch (500ms poll/10 lines), screen (1s poll/40 lines). Default: quick"),
@@ -64,10 +66,9 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient) {
 			mcp.Description("Max seconds to watch before giving up (default 60)"),
 		),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
-		paneID, err := req.RequireString("paneId")
-		if err != nil {
-			return nil, err
-		}
+		paneID := req.GetString("paneId", "")
+		headless := req.GetBool("headless", false)
+
 		command, err := req.RequireString("command")
 		if err != nil {
 			return nil, err
@@ -84,6 +85,23 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient) {
 		re, err := regexp.Compile(patternStr)
 		if err != nil {
 			return nil, fmt.Errorf("invalid pattern %q: %w", patternStr, err)
+		}
+
+		// If no paneId provided, auto-create one.
+		if paneID == "" {
+			if headless {
+				created, err := client.CreateHeadlessSession(ctx, "", "")
+				if err != nil {
+					return nil, fmt.Errorf("failed to create headless session: %w", err)
+				}
+				paneID = created.PaneID
+			} else {
+				created, err := client.CreateSession(ctx, "")
+				if err != nil {
+					return nil, fmt.Errorf("failed to create session: %w", err)
+				}
+				paneID = created.PaneID
+			}
 		}
 
 		mode := resolveMode(modeName)

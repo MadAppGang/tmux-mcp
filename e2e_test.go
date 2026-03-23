@@ -1268,124 +1268,54 @@ func TestCreateHeadless(t *testing.T) {
 	}
 }
 
-// ---- Session API tests ----
+// ---- Headless param tests ----
 
-func TestRunTool(t *testing.T) {
+func TestExecuteCommandHeadless(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
 	c := newMCPClient(t)
 
-	// Run "echo hello" — output should contain "hello" and exit code 0.
 	var result map[string]any
-	c.callToolJSON(t, "run", map[string]any{
-		"command": "echo hello",
-		"timeout": 30,
+	c.callToolJSON(t, "execute-command", map[string]any{
+		"command":  "echo hello headless",
+		"headless": true,
 	}, &result)
 
-	sessionID, _ := result["sessionId"].(string)
-	if sessionID == "" {
-		t.Fatal("run returned no sessionId")
-	}
 	output, _ := result["output"].(string)
-	if !strings.Contains(output, "hello") {
-		t.Fatalf("expected output to contain 'hello', got: %q", output)
+	if !strings.Contains(output, "hello headless") {
+		t.Fatalf("expected 'hello headless' in output, got: %q", output)
 	}
 	exitCode, _ := result["exitCode"].(float64)
 	if int(exitCode) != 0 {
-		t.Fatalf("expected exitCode 0, got %v", exitCode)
+		t.Fatalf("expected exitCode 0, got %d", int(exitCode))
 	}
-
-	// Run "exit 42" — exit code should be 42.
-	var result2 map[string]any
-	c.callToolJSON(t, "run", map[string]any{
-		"command": "exit 42",
-		"timeout": 30,
-	}, &result2)
-	exitCode2, _ := result2["exitCode"].(float64)
-	if int(exitCode2) != 42 {
-		t.Fatalf("expected exitCode 42, got %v", exitCode2)
+	// No paneId in response — session was cleaned up.
+	if _, hasPaneID := result["paneId"]; hasPaneID {
+		t.Fatal("headless execute-command response should not contain paneId")
 	}
 }
 
-func TestSessionLifecycle(t *testing.T) {
+func TestStartAndWatchHeadless(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
 	c := newMCPClient(t)
 
-	// session-start with a minimal shell.
-	var started map[string]any
-	c.callToolJSON(t, "session-start", map[string]any{
-		"command": "sh --norc",
-		"name":    "test-sh",
-	}, &started)
+	result := c.callTaskTool(t, "start-and-watch", map[string]any{
+		"command":  "echo 'server ready on port 3000'",
+		"pattern":  "ready on",
+		"headless": true,
+		"timeout":  10,
+	})
 
-	sessionID, _ := started["sessionId"].(string)
-	if sessionID == "" {
-		t.Fatal("session-start returned no sessionId")
+	event, _ := result["event"].(string)
+	if !strings.Contains(event, "pattern") {
+		t.Fatalf("expected event to contain 'pattern', got: %q", event)
 	}
-	name, _ := started["name"].(string)
-	if name != "test-sh" {
-		t.Fatalf("expected name 'test-sh', got %q", name)
-	}
-
-	// Give the shell a moment to start.
-	sleep(300 * time.Millisecond)
-
-	// session-send "echo hi".
-	var sendResult map[string]any
-	c.callToolJSON(t, "session-send", map[string]any{
-		"sessionId": sessionID,
-		"input":     "echo hi",
-		"enter":     true,
-	}, &sendResult)
-	if sendResult["sessionId"] != sessionID {
-		t.Fatalf("session-send returned unexpected sessionId: %v", sendResult["sessionId"])
-	}
-
-	// Give the shell time to produce output.
-	sleep(300 * time.Millisecond)
-
-	// session-read — output should contain "hi".
-	var readResult map[string]any
-	c.callToolJSON(t, "session-read", map[string]any{
-		"sessionId": sessionID,
-	}, &readResult)
-	output, _ := readResult["output"].(string)
-	if !strings.Contains(output, "hi") {
-		t.Fatalf("expected session-read output to contain 'hi', got: %q", output)
-	}
-
-	// session-list — should contain our session.
-	var sessions []map[string]any
-	c.callToolJSON(t, "session-list", map[string]any{}, &sessions)
-	found := false
-	for _, s := range sessions {
-		if s["sessionId"] == sessionID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("session-list did not include sessionId %q; sessions: %v", sessionID, sessions)
-	}
-
-	// session-close — session should be gone.
-	var closeResult map[string]any
-	c.callToolJSON(t, "session-close", map[string]any{
-		"sessionId": sessionID,
-	}, &closeResult)
-	if closeResult["closed"] != true {
-		t.Fatalf("session-close returned closed=%v", closeResult["closed"])
-	}
-
-	// session-list — should be empty (or at least not contain our session).
-	var sessionsAfter []map[string]any
-	c.callToolJSON(t, "session-list", map[string]any{}, &sessionsAfter)
-	for _, s := range sessionsAfter {
-		if s["sessionId"] == sessionID {
-			t.Fatalf("session-list still contains sessionId %q after close", sessionID)
-		}
+	// paneId should be headless-prefixed.
+	paneID, _ := result["paneId"].(string)
+	if !strings.HasPrefix(paneID, "headless:") {
+		t.Fatalf("expected headless paneId, got: %q", paneID)
 	}
 }
