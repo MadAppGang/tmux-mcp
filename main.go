@@ -16,6 +16,7 @@ func main() {
 	flag.Parse()
 
 	client := newTmuxClient(*shellType)
+	registry := newSessionRegistry()
 
 	s := server.NewMCPServer("tmux-mcp", "1.0.0",
 		server.WithToolCapabilities(true),
@@ -25,6 +26,7 @@ func main() {
 
 	registerTools(s, client)
 	registerAgentTools(s, client)
+	registerSessionTools(s, client, registry)
 	registerResources(s, client)
 
 	if err := server.ServeStdio(s); err != nil {
