@@ -68,18 +68,31 @@ func fillPaneState(_ context.Context, state *PaneState) error {
 	// 1. Wmesg == "ttyin": kernel sets this when a process is blocked in
 	//    n_tty_read (waiting for terminal input). Works for some processes.
 	//
-	// 2. Structural heuristic: tpgid == shell's own pgrp means no child
-	//    process has seized the terminal (the shell itself is foreground),
-	//    and the shell is in interruptible sleep (not running or zombie).
-	//    This catches readline/select loops which don't set Wmesg.
+	// 2. Structural heuristic: the foreground process group is in
+	//    interruptible sleep (P_stat == S). This covers two cases:
+	//    a. tpgid == shell's own pgrp: no child has seized the terminal —
+	//       the shell itself is at a readline/select prompt.
+	//    b. tpgid != shell's own pgrp: a child process (e.g. `cat`) has
+	//       seized the terminal and is blocked waiting for terminal input.
+	//    Modern macOS suppresses the Wmesg field so this sleep-state check
+	//    is the most reliable cross-process signal available.
 	for i := range procs {
 		if wmesgIsInput(&procs[i]) {
 			state.WaitingForInput = true
 			return nil
 		}
 	}
-	// Structural heuristic.
-	state.WaitingForInput = tpgid == shellPGRP && shellKP.Proc.P_stat == pStatSleep
+	// Structural heuristic: any foreground process in interruptible sleep
+	// indicates the terminal is blocked (idle shell prompt or a process
+	// waiting on stdin such as `cat`).
+	for i := range procs {
+		if procs[i].Proc.P_stat == pStatSleep {
+			state.WaitingForInput = true
+			return nil
+		}
+	}
+	// Final fallback: shell itself is sleeping with no child process group.
+	state.WaitingForInput = shellKP.Proc.P_stat == pStatSleep
 	return nil
 }
 

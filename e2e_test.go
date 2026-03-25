@@ -1017,15 +1017,19 @@ func TestWatchPaneUserInputTrigger(t *testing.T) {
 	sess := createSession(t, c, uniqueSession(t))
 	paneID := sess["paneId"].(string)
 
-	// Run a quick command so we're not already at shell prompt at monitor start.
+	// Start `cat` with no args — it reads from stdin and reliably shows
+	// waitingForInput=true on all platforms (unlike an idle bash shell which
+	// uses readline and may not surface n_tty_read/wait_woken in /proc/PID/wchan
+	// on Linux).
 	c.callToolJSON(t, "send-keys", map[string]any{
 		"paneId": paneID,
-		"keys":   "echo starting",
+		"keys":   "cat",
 		"enter":  true,
 	}, &map[string]any{})
-	sleep(300 * time.Millisecond)
+	sleep(500 * time.Millisecond)
 
-	// Watch for user_input (shell returns to prompt).
+	// Watch for user_input — cat is already blocked on stdin so this should
+	// fire immediately.
 	result := c.callTaskTool(t, "watch-pane", map[string]any{
 		"paneId":   paneID,
 		"triggers": "user_input",
@@ -1037,6 +1041,13 @@ func TestWatchPaneUserInputTrigger(t *testing.T) {
 	if event != "user_input" {
 		t.Fatalf("expected event='user_input', got %q", event)
 	}
+
+	// Clean up: send Ctrl-D (EOF) so cat exits and the shell is left tidy.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId":  paneID,
+		"keys":    "C-d",
+		"literal": false,
+	}, &map[string]any{})
 }
 
 func TestStartAndWatch(t *testing.T) {
