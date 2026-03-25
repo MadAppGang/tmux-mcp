@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -13,7 +14,24 @@ import (
 
 func main() {
 	shellType := flag.String("shell-type", "bash", "Shell type for exit code capture (bash/zsh/fish)")
+	scope := flag.String("scope", "", "Tool scope: agentic (default), primitives, or all")
 	flag.Parse()
+
+	// Resolve scope: flag > env > default
+	scopeVal := *scope
+	if scopeVal == "" {
+		scopeVal = os.Getenv("TMUX_MCP_SCOPE")
+	}
+	if scopeVal == "" {
+		scopeVal = "agentic"
+	}
+
+	switch scopeVal {
+	case "agentic", "primitives", "all":
+		// valid
+	default:
+		log.Fatalf("invalid scope %q: must be one of agentic, primitives, or all", scopeVal)
+	}
 
 	client := newTmuxClient(*shellType)
 
@@ -23,8 +41,16 @@ func main() {
 		server.WithTaskCapabilities(true, true, true),
 	)
 
-	registerTools(s, client)
-	registerAgentTools(s, client)
+	switch scopeVal {
+	case "primitives":
+		registerTools(s, client)
+	case "agentic":
+		registerAgenticScope(s, client)
+	case "all":
+		registerTools(s, client)
+		registerAgentTools(s, client)
+	}
+
 	registerResources(s, client)
 
 	if err := server.ServeStdio(s); err != nil {
@@ -34,8 +60,44 @@ func main() {
 
 // ---- Tool registration ----
 
+// registerTools registers all 14 Layer 1 (primitive) tools.
 func registerTools(s *server.MCPServer, client *tmuxClient) {
-	// list-sessions
+	registerListSessions(s, client)
+	registerCreateHeadless(s, client)
+	registerKillHeadlessServer(s, client)
+	registerListWindows(s, client)
+	registerListPanes(s, client)
+	registerCapturePane(s, client)
+	registerCreateSession(s, client)
+	registerCreateWindow(s, client)
+	registerSplitPane(s, client)
+	registerSendKeys(s, client)
+	registerExecuteCommand(s, client)
+	registerResizePane(s, client)
+	registerRenameSession(s, client)
+	registerKillSession(s, client)
+	registerKillWindow(s, client)
+	registerKillPane(s, client)
+}
+
+// registerAgenticScope registers the 6 Layer 2 tools plus 7 essential Layer 1
+// tools. This is the default scope.
+func registerAgenticScope(s *server.MCPServer, client *tmuxClient) {
+	// Essential Layer 1 tools
+	registerListSessions(s, client)
+	registerCreateSession(s, client)
+	registerCreateHeadless(s, client)
+	registerCapturePane(s, client)
+	registerExecuteCommand(s, client)
+	registerKillSession(s, client)
+	registerKillHeadlessServer(s, client)
+	// All Layer 2 tools
+	registerAgentTools(s, client)
+}
+
+// ---- Individual Layer 1 tool registrations ----
+
+func registerListSessions(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("list-sessions",
 		mcp.WithDescription("List active tmux sessions. By default lists only the default server. Use headless=true for the isolated headless server, or all=true for both."),
 		mcp.WithBoolean("headless",
@@ -74,8 +136,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 			return jsonResult(sessions)
 		}
 	})
+}
 
-	// create-headless
+func registerCreateHeadless(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("create-headless",
 		mcp.WithDescription("Create an isolated headless tmux session invisible to the user's tmux ls. Returns IDs prefixed with \"headless:\" that route all subsequent tool calls to the isolated server."),
 		mcp.WithString("name",
@@ -93,8 +156,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 		}
 		return jsonResult(created)
 	})
+}
 
-	// kill-headless-server
+func registerKillHeadlessServer(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("kill-headless-server",
 		mcp.WithDescription("Terminate all headless sessions and shut down the headless tmux server."),
 		mcp.WithDestructiveHintAnnotation(true),
@@ -108,8 +172,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 			Sessions int  `json:"sessions"`
 		}{Killed: true, Sessions: n})
 	})
+}
 
-	// list-windows
+func registerListWindows(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("list-windows",
 		mcp.WithDescription("List windows in a tmux session"),
 		mcp.WithString("sessionId",
@@ -128,8 +193,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 		}
 		return jsonResult(windows)
 	})
+}
 
-	// list-panes
+func registerListPanes(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("list-panes",
 		mcp.WithDescription("List panes in a tmux window with dimensions, current command, and path"),
 		mcp.WithString("windowId",
@@ -148,8 +214,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 		}
 		return jsonResult(panes)
 	})
+}
 
-	// capture-pane
+func registerCapturePane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("capture-pane",
 		mcp.WithDescription("Capture terminal content from a pane"),
 		mcp.WithString("paneId",
@@ -176,8 +243,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 		}
 		return mcp.NewToolResultText(content), nil
 	})
+}
 
-	// create-session
+func registerCreateSession(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("create-session",
 		mcp.WithDescription("Create a new tmux session"),
 		mcp.WithString("name",
@@ -191,8 +259,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 		}
 		return jsonResult(created)
 	})
+}
 
-	// create-window
+func registerCreateWindow(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("create-window",
 		mcp.WithDescription("Create a new window in a tmux session"),
 		mcp.WithString("sessionId",
@@ -214,8 +283,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 		}
 		return jsonResult(created)
 	})
+}
 
-	// split-pane
+func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("split-pane",
 		mcp.WithDescription("Split a tmux pane horizontally or vertically"),
 		mcp.WithString("paneId",
@@ -242,8 +312,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 		}
 		return jsonResult(created)
 	})
+}
 
-	// send-keys
+func registerSendKeys(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("send-keys",
 		mcp.WithDescription("Send keystrokes to a pane. By default treats input as literal text. Set literal=false to interpret tmux key names (e.g. C-c, Enter, Escape)"),
 		mcp.WithString("paneId",
@@ -278,8 +349,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 			PaneID string `json:"paneId"`
 		}{PaneID: paneID})
 	})
+}
 
-	// execute-command
+func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("execute-command",
 		mcp.WithDescription("Run a shell command in a pane and wait for it to complete. Returns the full output and exit code. When headless=true and no paneId is provided, a temporary isolated session is created, the command runs, and the session is cleaned up automatically (no paneId in response)."),
 		mcp.WithString("paneId",
@@ -329,8 +401,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 		}
 		return jsonResult(result)
 	})
+}
 
-	// resize-pane
+func registerResizePane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("resize-pane",
 		mcp.WithDescription("Resize a tmux pane. Use width+height for absolute size, or direction+amount for relative adjustment"),
 		mcp.WithString("paneId",
@@ -383,8 +456,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 			PaneID string `json:"paneId"`
 		}{PaneID: paneID})
 	})
+}
 
-	// rename-session
+func registerRenameSession(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("rename-session",
 		mcp.WithDescription("Rename a tmux session"),
 		mcp.WithString("sessionId",
@@ -412,8 +486,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 			Name      string `json:"name"`
 		}{SessionID: sessionID, Name: newName})
 	})
+}
 
-	// kill-session
+func registerKillSession(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("kill-session",
 		mcp.WithDescription("Kill a tmux session and all its windows and panes"),
 		mcp.WithString("sessionId",
@@ -433,8 +508,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 			Killed string `json:"killed"`
 		}{Killed: sessionID})
 	})
+}
 
-	// kill-window
+func registerKillWindow(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("kill-window",
 		mcp.WithDescription("Kill a tmux window and all its panes"),
 		mcp.WithString("windowId",
@@ -454,8 +530,9 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 			Killed string `json:"killed"`
 		}{Killed: windowID})
 	})
+}
 
-	// kill-pane
+func registerKillPane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("kill-pane",
 		mcp.WithDescription("Kill a tmux pane"),
 		mcp.WithString("paneId",

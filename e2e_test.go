@@ -107,7 +107,7 @@ func newMCPClient(t *testing.T) *mcpClient {
 		shellType = "fish"
 	}
 
-	cmd := exec.Command(testBinaryPath, "--shell-type="+shellType)
+	cmd := exec.Command(testBinaryPath, "--shell-type="+shellType, "--scope=all")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatalf("stdin pipe: %v", err)
