@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release info
+        id: release
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Wait for release assets to be available
+          sleep 10
+
+          # Download checksums
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/checksums.txt" -o checksums.txt
+
+          DARWIN_ARM64_SHA=$(grep "darwin_arm64" checksums.txt | awk '{print $1}')
+          DARWIN_AMD64_SHA=$(grep "darwin_amd64" checksums.txt | awk '{print $1}')
+          LINUX_ARM64_SHA=$(grep "linux_arm64" checksums.txt | awk '{print $1}')
+          LINUX_AMD64_SHA=$(grep "linux_amd64" checksums.txt | awk '{print $1}')
+
+          echo "darwin_arm64_sha=$DARWIN_ARM64_SHA" >> $GITHUB_OUTPUT
+          echo "darwin_amd64_sha=$DARWIN_AMD64_SHA" >> $GITHUB_OUTPUT
+          echo "linux_arm64_sha=$LINUX_ARM64_SHA" >> $GITHUB_OUTPUT
+          echo "linux_amd64_sha=$LINUX_AMD64_SHA" >> $GITHUB_OUTPUT
+
+      - name: Update Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: MadAppGang/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        run: |
+          cat > tap/Formula/tmux-mcp.rb << 'FORMULA'
+          class TmuxMcp < Formula
+            desc "MCP server for agent-oriented tmux control with native process detection"
+            homepage "https://github.com/MadAppGang/tmux-mcp"
+            version "${{ steps.release.outputs.version }}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/MadAppGang/tmux-mcp/releases/download/v${{ steps.release.outputs.version }}/tmux-mcp_darwin_arm64.tar.gz"
+                sha256 "${{ steps.release.outputs.darwin_arm64_sha }}"
+              end
+              on_intel do
+                url "https://github.com/MadAppGang/tmux-mcp/releases/download/v${{ steps.release.outputs.version }}/tmux-mcp_darwin_amd64.tar.gz"
+                sha256 "${{ steps.release.outputs.darwin_amd64_sha }}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/MadAppGang/tmux-mcp/releases/download/v${{ steps.release.outputs.version }}/tmux-mcp_linux_arm64.tar.gz"
+                sha256 "${{ steps.release.outputs.linux_arm64_sha }}"
+              end
+              on_intel do
+                url "https://github.com/MadAppGang/tmux-mcp/releases/download/v${{ steps.release.outputs.version }}/tmux-mcp_linux_amd64.tar.gz"
+                sha256 "${{ steps.release.outputs.linux_amd64_sha }}"
+              end
+            end
+
+            depends_on "tmux"
+
+            def install
+              bin.install "tmux-mcp"
+            end
+
+            test do
+              assert_match "tmux-mcp", shell_output("#{bin}/tmux-mcp --help 2>&1", 2)
+            end
+          end
+          FORMULA
+
+      - name: Push to tap
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/tmux-mcp.rb
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Update tmux-mcp to v${{ steps.release.outputs.version }}"
+          git push
