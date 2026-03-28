@@ -22,7 +22,7 @@ Add to your MCP client config (`~/.claude/settings.json` for Claude Code):
   "mcpServers": {
     "tmux": {
       "command": "tmux-mcp",
-      "args": ["--shell-type", "zsh"]
+      "args": ["--shell-type", "zsh", "--scope", "agentic"]
     }
   }
 }
@@ -61,7 +61,7 @@ This project solves those four problems directly.
 | Tools | 13 | 6 | 7 | **20** |
 | Dependencies | Node.js / npx | None | Node.js + node-pty | **None (single binary)** |
 | Binary size | ~node_modules | ~4MB | ~node_modules | **~7MB** |
-| Async monitoring | No | No | No | **Yes (MCP Tasks API)** |
+| Async monitoring | No | No | No | **Yes (blocking tools with progress notifications)** |
 | Process input detection | No | No | Heuristic | **Native OS (kernel-level)** |
 | Structured JSON output | Partial | No | No | **Yes (all tools)** |
 | Zero-lookup chaining | No | No | No | **Yes (IDs in every response)** |
@@ -127,14 +127,14 @@ Layer 1: Tmux Primitives
 
 | Tool | Purpose | Key params | Returns |
 |---|---|---|---|
-| `start-and-watch` | Start a command and monitor until a readiness pattern matches | `paneId`, `command`, `pattern`, `mode`, `triggers`, `timeout` | `WatchResult` (async task) |
-| `watch-pane` | Monitor an existing pane until a trigger fires | `paneId`, `mode`, `triggers`, `timeout` | `WatchResult` (async task) |
+| `start-and-watch` | Start a command and monitor until a readiness pattern matches | `paneId`, `command`, `pattern`, `mode`, `triggers`, `timeout` | `WatchResult` |
+| `watch-pane` | Monitor an existing pane until a trigger fires | `paneId`, `mode`, `triggers`, `timeout` | `WatchResult` |
 | `pane-state` | Get OS-level process state | `paneId` | `{panePid, foregroundPid, foregroundCmd, isAlive, waitingForInput, exitCode}` |
 | `run-in-repl` | Send input to a running REPL and wait for the prompt | `paneId`, `input`, `promptPattern`, `timeout` | `{paneId, output}` |
 | `write-to-display` | Write coaching text to a side pane without entering agent context | `paneId`, `text`, `clear` | `{paneId}` |
 | `display-message` | Show a transient notification in the tmux status bar | `message`, `duration` | text |
 
-`start-and-watch` and `watch-pane` are **MCP Tasks** — they return immediately with a task ID, send progress notifications while running, and complete when a trigger fires. The agent can do other work while waiting.
+`start-and-watch` and `watch-pane` block until a trigger fires or the timeout expires, then return the result directly. Progress notifications are sent while monitoring.
 
 `WatchResult` structure:
 
@@ -350,7 +350,7 @@ This project started as a port of [nickgnd/tmux-mcp](https://github.com/nickgnd/
 | C-c handling | Issue #31: sends literal "C-c" instead of SIGINT | `send-keys` with `literal=false` interprets `C-c` as interrupt |
 | Consecutive commands | Issue #28: unreliable | Each call gets a unique UUID wait channel |
 | Response IDs | Inconsistent | All tools return structured JSON with IDs; zero lookup calls needed |
-| Async monitoring | None | MCP Tasks API with streaming progress notifications |
+| Async monitoring | None | Smart triggers with progress notifications and optional channel push |
 | Runtime | Node.js / npx | Single 7MB Go binary |
 | Tool count | 13 | 20 (14 primitives + 6 agent tools) |
 
@@ -359,7 +359,7 @@ The polling model requires an agent to call `get-command-result` in a loop, wast
 ## Configuration
 
 ```
-tmux-mcp [--shell-type bash|zsh|fish]
+tmux-mcp [--shell-type bash|zsh|fish] [--scope agentic|primitives|all] [--channel]
 ```
 
 `--shell-type` controls how `execute-command` captures exit codes from a pipeline:
@@ -372,10 +372,56 @@ tmux-mcp [--shell-type bash|zsh|fish]
 
 Match this to the shell running inside your tmux panes. A mismatch causes `execute-command` to report exit code `0` for every command.
 
+`--scope` controls which tool groups are registered:
+
+| Value | Tools registered |
+|---|---|
+| `agentic` (default) | 6 Layer 2 tools + 8 essential Layer 1 tools |
+| `primitives` | All 16 Layer 1 tools only |
+| `all` | All Layer 1 and Layer 2 tools |
+
+The scope can also be set via the `TMUX_MCP_SCOPE` environment variable. The flag takes precedence.
+
+`--channel` enables Claude Code channel mode. See the [Channel mode](#channel-mode) section below.
+
 **MCP resources** are also exposed:
 
 - `tmux://sessions` — JSON list of all active sessions
 - `tmux://pane/{paneId}` — current terminal content of a pane
+
+## Channel mode
+
+tmux-mcp can act as a [Claude Code channel](https://code.claude.com/docs/en/channels), pushing terminal events into your session proactively — without a pending tool call.
+
+Start with `--channel`:
+
+```bash
+claude --channels server:tmux-mcp
+```
+
+Or via `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "tmux": {
+      "command": "tmux-mcp",
+      "args": ["--shell-type", "zsh", "--scope", "agentic", "--channel"]
+    }
+  }
+}
+```
+
+When a trigger fires during `watch-pane` or `start-and-watch`, the tool result is returned as usual **and** a `notifications/claude/channel` notification is pushed. Claude sees the event even while working on something else.
+
+Channel notifications include:
+- `content`: human-readable event summary
+- `meta.paneId`: which pane fired
+- `meta.event`: trigger type (`exit`, `error`, `user_input`, `timeout`, etc.)
+- `meta.detail`: explanation
+- `meta.exitCode` / `meta.isAlive`: process state (for exit events)
+
+Without `--channel`, behavior is identical to previous versions. No channel capability is declared and no notifications are sent.
 
 ## Development
 
@@ -389,18 +435,20 @@ go test ./...          # full suite (tmux must be running)
 
 **Project structure:**
 
-| File | Lines | Purpose |
-|---|---|---|
-| `main.go` | 465 | MCP server setup, Layer 1 tool and resource registration |
-| `tmux.go` | 411 | `tmuxClient`: tmux CLI wrappers, data types, `ExecuteCommand` with wait-for |
-| `agent_tools.go` | 369 | Layer 2 tool registration: `start-and-watch`, `watch-pane`, `pane-state`, `run-in-repl`, `write-to-display`, `display-message` |
-| `triggers.go` | 443 | `NotificationMode`, `Trigger`, `monitorPane` loop, `parseTriggers`, `WatchResult` |
-| `process.go` | 72 | `PaneState` struct, `GetPaneState` (tmux query + OS dispatch) |
-| `process_darwin.go` | 113 | macOS: `sysctl kern.proc.pid`, `wmesg ttyin` detection |
-| `process_linux.go` | 107 | Linux: `/proc/wchan`, `/proc/syscall` detection |
-| `process_other.go` | 12 | Stub for other platforms (`WaitingForInput` always false) |
-| `e2e_test.go` | 1124 | MCP client harness, JSON-RPC transport, tool test helpers |
-| `scenarios_test.go` | 372 | End-to-end scenario tests: dev server, REPL, build |
+| File | Purpose |
+|---|---|
+| `main.go` | MCP server setup, Layer 1 tool and resource registration |
+| `tmux.go` | `tmuxClient`: tmux CLI wrappers, data types, `ExecuteCommand` with wait-for |
+| `agent_tools.go` | Layer 2 tool registration: `start-and-watch`, `watch-pane`, `pane-state`, `run-in-repl`, `write-to-display`, `display-message` |
+| `channel.go` | Channel mode: `ChannelEmitter`, notifications, instructions |
+| `triggers.go` | `NotificationMode`, `Trigger`, `monitorPane` loop, `parseTriggers`, `WatchResult` |
+| `process.go` | `PaneState` struct, `GetPaneState` (tmux query + OS dispatch) |
+| `process_darwin.go` | macOS: `sysctl kern.proc.pid`, `wmesg ttyin` detection |
+| `process_linux.go` | Linux: `/proc/wchan`, `/proc/syscall` detection |
+| `process_other.go` | Stub for other platforms (`WaitingForInput` always false) |
+| `e2e_test.go` | MCP client harness and individual tool tests (50 E2E tests across 3 files) |
+| `scenarios_test.go` | Multi-step scenario tests including channel mode |
+| `missing_tests_test.go` | Bug fix coverage, scope filtering, trigger and negative tests |
 
 ## Troubleshooting
 
