@@ -12,35 +12,29 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-func registerAgentTools(s *server.MCPServer, client *tmuxClient) {
-	registerStartAndWatch(s, client)
-	registerWatchPane(s, client)
+func registerAgentTools(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
+	registerStartAndWatch(s, client, emitter)
+	registerWatchPane(s, client, emitter)
 	registerPaneState(s, client)
 	registerRunInREPL(s, client)
 	registerWriteToDisplay(s, client)
 	registerDisplayMessage(s, client)
 }
 
-// watchResultToTaskResult serialises a WatchResult into a CreateTaskResult
-// using WithModelImmediateResponse so the model sees it when the task completes.
-func watchResultToTaskResult(r *WatchResult) (*mcp.CreateTaskResult, error) {
-	data, err := json.Marshal(r)
+// watchResultToToolResult serialises a WatchResult into a CallToolResult.
+func watchResultToToolResult(r *WatchResult) (*mcp.CallToolResult, error) {
+	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal watch result: %w", err)
 	}
-	return &mcp.CreateTaskResult{
-		Result: mcp.Result{
-			Meta: mcp.WithModelImmediateResponse(string(data)),
-		},
-	}, nil
+	return mcp.NewToolResultText(string(data)), nil
 }
 
 // ---- start-and-watch ----
 
-func registerStartAndWatch(s *server.MCPServer, client *tmuxClient) {
-	s.AddTaskTool(mcp.NewTool("start-and-watch",
-		mcp.WithDescription("Start a command in a pane and monitor its output. Reports periodic progress notifications and completes when a readiness pattern matches, a named trigger fires, or the timeout expires. When paneId is omitted, a new pane is created automatically (headless=true creates an isolated headless pane)."),
-		mcp.WithTaskSupport(mcp.TaskSupportRequired),
+func registerStartAndWatch(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
+	s.AddTool(mcp.NewTool("start-and-watch",
+		mcp.WithDescription("Start a command in a pane and monitor its output. Blocks until a readiness pattern matches, a named trigger fires, or the timeout expires. When paneId is omitted, a new pane is created automatically (headless=true creates an isolated headless pane)."),
 		mcp.WithString("paneId",
 			mcp.Description("Pane ID (e.g. %0) to run the command in. If omitted, a new pane is created automatically."),
 		),
@@ -65,7 +59,7 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient) {
 		mcp.WithNumber("timeout",
 			mcp.Description("Max seconds to watch before giving up (default 60)"),
 		),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		paneID := req.GetString("paneId", "")
 		headless := req.GetBool("headless", false)
 
@@ -128,23 +122,19 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient) {
 			return nil, fmt.Errorf("failed to send command: %w", err)
 		}
 
-		result, err := monitorPane(ctx, s, client, paneID, mode, triggers, timeoutSecs)
+		result, err := monitorPane(ctx, s, client, paneID, mode, triggers, timeoutSecs, emitter)
 		if err != nil {
 			return nil, err
 		}
-		// Send a progress notification containing the full WatchResult so clients
-		// can read the structured result without needing to poll tasks/result.
-		sendWatchResultNotification(ctx, s, result)
-		return watchResultToTaskResult(result)
+		return watchResultToToolResult(result)
 	})
 }
 
 // ---- watch-pane ----
 
-func registerWatchPane(s *server.MCPServer, client *tmuxClient) {
-	s.AddTaskTool(mcp.NewTool("watch-pane",
-		mcp.WithDescription("Monitor a pane using smart triggers. Reports periodic progress notifications and completes when a trigger fires or the timeout expires."),
-		mcp.WithTaskSupport(mcp.TaskSupportRequired),
+func registerWatchPane(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
+	s.AddTool(mcp.NewTool("watch-pane",
+		mcp.WithDescription("Monitor a pane using smart triggers. Blocks until a trigger fires or the timeout expires."),
 		mcp.WithString("paneId",
 			mcp.Required(),
 			mcp.Description("Pane ID (e.g. %0) to monitor"),
@@ -159,7 +149,7 @@ func registerWatchPane(s *server.MCPServer, client *tmuxClient) {
 		mcp.WithNumber("timeout",
 			mcp.Description("Max seconds to watch before giving up (default 60)"),
 		),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CreateTaskResult, error) {
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		paneID, err := req.RequireString("paneId")
 		if err != nil {
 			return nil, err
@@ -172,30 +162,11 @@ func registerWatchPane(s *server.MCPServer, client *tmuxClient) {
 		mode := resolveMode(modeName)
 		triggers := parseTriggers(triggerSpec, client)
 
-		result, err := monitorPane(ctx, s, client, paneID, mode, triggers, timeoutSecs)
+		result, err := monitorPane(ctx, s, client, paneID, mode, triggers, timeoutSecs, emitter)
 		if err != nil {
 			return nil, err
 		}
-		// Send a progress notification containing the full WatchResult so clients
-		// can read the structured result without needing to poll tasks/result.
-		sendWatchResultNotification(ctx, s, result)
-		return watchResultToTaskResult(result)
-	})
-}
-
-// sendWatchResultNotification sends a notifications/progress notification that
-// embeds the full WatchResult JSON. This allows test clients and SDK-aware
-// clients to receive the structured result without needing tasks/result.
-// The method is "notifications/progress" with a custom message field.
-func sendWatchResultNotification(ctx context.Context, s *server.MCPServer, r *WatchResult) {
-	data, err := json.Marshal(r)
-	if err != nil {
-		return
-	}
-	_ = s.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
-		"progress": -1, // sentinel: -1 means "final watch result"
-		"total":    -1,
-		"message":  string(data),
+		return watchResultToToolResult(result)
 	})
 }
 
@@ -270,21 +241,39 @@ func registerRunInREPL(s *server.MCPServer, client *tmuxClient) {
 			return mcp.NewToolResultErrorFromErr("failed to send input", err), nil
 		}
 
+		// Record the initial foreground command so we can detect REPL exit.
+		initialState, _ := client.GetPaneState(ctx, paneID)
+		initialCmd := ""
+		if initialState != nil {
+			initialCmd = initialState.ForegroundCmd
+		}
+
 		deadline := time.Now().Add(time.Duration(timeoutSecs) * time.Second)
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 
+		var lastNewContent string
 		for {
 			select {
 			case <-ctx.Done():
 				return mcp.NewToolResultError("context cancelled waiting for REPL prompt"), nil
-			case t := <-ticker.C:
+			case tick := <-ticker.C:
 				output, err := client.CapturePane(ctx, paneID, 0, false)
 				if err != nil {
+					// Pane may have been destroyed — check if process exited.
+					paneState, _ := client.GetPaneState(ctx, paneID)
+					if paneState != nil && !paneState.IsAlive {
+						return jsonResult(struct {
+							PaneID string `json:"paneId"`
+							Output string `json:"output"`
+							Exited bool   `json:"exited"`
+						}{PaneID: paneID, Output: lastNewContent, Exited: true})
+					}
 					continue
 				}
 				// Use diffContent to find lines added after the baseline.
 				newContent := diffContent(baseline, output)
+				lastNewContent = newContent
 				// Match line-by-line from the end.
 				contentLines := strings.Split(newContent, "\n")
 				for i := len(contentLines) - 1; i >= 0; i-- {
@@ -297,7 +286,20 @@ func registerRunInREPL(s *server.MCPServer, client *tmuxClient) {
 						}{PaneID: paneID, Output: result})
 					}
 				}
-				if t.After(deadline) {
+
+				// Check if the REPL process has exited.
+				paneState, _ := client.GetPaneState(ctx, paneID)
+				if paneState != nil {
+					if !paneState.IsAlive || (initialCmd != "" && paneState.ForegroundCmd != initialCmd) {
+						return jsonResult(struct {
+							PaneID string `json:"paneId"`
+							Output string `json:"output"`
+							Exited bool   `json:"exited"`
+						}{PaneID: paneID, Output: strings.TrimSpace(newContent), Exited: true})
+					}
+				}
+
+				if tick.After(deadline) {
 					// Return whatever we have with a timeout note.
 					return jsonResult(struct {
 						PaneID string `json:"paneId"`

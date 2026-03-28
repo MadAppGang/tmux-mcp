@@ -61,6 +61,7 @@ type jsonRPCResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.Number     `json:"id"`
 	Result  json.RawMessage `json:"result,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
 	Error   *jsonRPCErr     `json:"error,omitempty"`
 	Method  string          `json:"method,omitempty"` // non-empty for notifications
 }
@@ -86,18 +87,14 @@ type mcpClient struct {
 	stdin  io.WriteCloser
 	nextID atomic.Int64
 
-	mu      sync.Mutex
-	pending map[int64]*pendingCall
-
-	// watchResults receives final WatchResult notifications sent by the server
-	// when start-and-watch or watch-pane completes. The server sends a
-	// notifications/progress with progress=-1 and message=WatchResult JSON.
-	watchResults chan map[string]any
+	mu                   sync.Mutex
+	pending              map[int64]*pendingCall
+	channelNotifications chan map[string]any
 }
 
 // newMCPClient starts a fresh tmux-mcp process, performs the initialize
 // handshake, and returns a ready-to-use client.
-func newMCPClient(t *testing.T) *mcpClient {
+func newMCPClient(t *testing.T, extraArgs ...string) *mcpClient {
 	t.Helper()
 
 	shellType := "zsh"
@@ -107,7 +104,8 @@ func newMCPClient(t *testing.T) *mcpClient {
 		shellType = "fish"
 	}
 
-	cmd := exec.Command(testBinaryPath, "--shell-type="+shellType, "--scope=all")
+	args := append([]string{"--shell-type=" + shellType, "--scope=all"}, extraArgs...)
+	cmd := exec.Command(testBinaryPath, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatalf("stdin pipe: %v", err)
@@ -124,10 +122,10 @@ func newMCPClient(t *testing.T) *mcpClient {
 	}
 
 	c := &mcpClient{
-		cmd:          cmd,
-		stdin:        stdin,
-		pending:      make(map[int64]*pendingCall),
-		watchResults: make(chan map[string]any, 32),
+		cmd:                  cmd,
+		stdin:                stdin,
+		pending:              make(map[int64]*pendingCall),
+		channelNotifications: make(chan map[string]any, 64),
 	}
 
 	// Start background reader.
@@ -185,25 +183,12 @@ func (c *mcpClient) readLoop(reader *bufio.Reader) {
 
 		// Notification: has method, no numeric id.
 		if msg.Method != "" {
-			if msg.Method == "notifications/progress" {
-				// Check if this is a final WatchResult notification
-				// (progress=-1 is the sentinel set by sendWatchResultNotification).
-				var params struct {
-					Progress float64 `json:"progress"`
-					Message  string  `json:"message"`
-				}
-				if err := json.Unmarshal([]byte(line), &struct {
-					Params *struct {
-						Progress float64 `json:"progress"`
-						Message  string  `json:"message"`
-					} `json:"params"`
-				}{Params: &params}); err == nil && params.Progress == -1 && params.Message != "" {
-					var watchResult map[string]any
-					if err := json.Unmarshal([]byte(params.Message), &watchResult); err == nil {
-						select {
-						case c.watchResults <- watchResult:
-						default:
-						}
+			if msg.Method == "notifications/claude/channel" && msg.Params != nil {
+				var params map[string]any
+				if err := json.Unmarshal(msg.Params, &params); err == nil {
+					select {
+					case c.channelNotifications <- params:
+					default:
 					}
 				}
 			}
@@ -313,87 +298,6 @@ func (c *mcpClient) callToolJSON(t *testing.T, name string, args map[string]any,
 	text := c.callToolText(t, name, args)
 	if err := json.Unmarshal([]byte(text), out); err != nil {
 		t.Fatalf("unmarshal %s result JSON: %v\ntext: %s", name, err, text)
-	}
-}
-
-// callTaskTool calls a TaskTool (watch-pane, start-and-watch) with task
-// augmentation. It sends the tool call (getting back taskId), then waits for
-// either:
-//  1. A notifications/progress notification with progress=-1 that contains the
-//     full WatchResult JSON (sent by sendWatchResultNotification in agent_tools.go).
-//  2. A tasks/get poll showing the task has completed (fallback).
-func (c *mcpClient) callTaskTool(t *testing.T, name string, args map[string]any) map[string]any {
-	t.Helper()
-
-	// Drain any stale watch results before sending the new call.
-	for len(c.watchResults) > 0 {
-		<-c.watchResults
-	}
-
-	params := map[string]any{
-		"name":      name,
-		"arguments": args,
-		"task":      map[string]any{},
-	}
-	raw := c.call(t, "tools/call", params)
-
-	// Extract taskId from the immediate CreateTaskResult response.
-	var createResult struct {
-		Task struct {
-			TaskId string `json:"taskId"`
-			Status string `json:"status"`
-		} `json:"task"`
-	}
-	if err := json.Unmarshal(raw, &createResult); err != nil {
-		t.Fatalf("unmarshal CreateTaskResult: %v\nraw: %s", err, raw)
-	}
-	taskID := createResult.Task.TaskId
-	if taskID == "" {
-		t.Fatalf("task tool %s returned no taskId", name)
-	}
-
-	// Wait for the WatchResult notification (sent by sendWatchResultNotification
-	// in agent_tools.go just before the handler returns), with a fallback poll.
-	deadline := time.Now().Add(120 * time.Second)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case watchResult := <-c.watchResults:
-			// Got the final WatchResult via the progress notification.
-			return watchResult
-
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				t.Fatalf("task tool %s timed out after 120s", name)
-			}
-			// Poll tasks/get as a fallback to check completion.
-			getRaw := c.call(t, "tasks/get", map[string]any{"taskId": taskID})
-			var taskInfo struct {
-				Status string `json:"status"`
-			}
-			if err := json.Unmarshal(getRaw, &taskInfo); err != nil {
-				continue
-			}
-			switch taskInfo.Status {
-			case "failed":
-				t.Fatalf("task tool %s failed", name)
-			case "cancelled":
-				t.Fatalf("task tool %s was cancelled", name)
-			case "completed":
-				// Task completed but we missed the notification.
-				// Block a bit longer for the notification to arrive.
-				select {
-				case watchResult := <-c.watchResults:
-					return watchResult
-				case <-time.After(2 * time.Second):
-					// Give up — return a minimal result.
-					t.Logf("task %s completed but WatchResult notification not received", taskID)
-					return map[string]any{"event": "completed", "taskId": taskID}
-				}
-			}
-		}
 	}
 }
 
@@ -991,12 +895,13 @@ func TestWatchPaneErrorTrigger(t *testing.T) {
 			"echo 'fatal error: something broke'", "Enter").Run() //nolint:errcheck
 	}()
 
-	result := c.callTaskTool(t, "watch-pane", map[string]any{
+	var result map[string]any
+	c.callToolJSON(t, "watch-pane", map[string]any{
 		"paneId":   paneID,
 		"triggers": "error",
 		"mode":     "quick",
 		"timeout":  15,
-	})
+	}, &result)
 
 	event, _ := result["event"].(string)
 	if event != "error" {
@@ -1030,12 +935,13 @@ func TestWatchPaneUserInputTrigger(t *testing.T) {
 
 	// Watch for user_input — cat is already blocked on stdin so this should
 	// fire immediately.
-	result := c.callTaskTool(t, "watch-pane", map[string]any{
+	var result map[string]any
+	c.callToolJSON(t, "watch-pane", map[string]any{
 		"paneId":   paneID,
 		"triggers": "user_input",
 		"mode":     "quick",
 		"timeout":  10,
-	})
+	}, &result)
 
 	event, _ := result["event"].(string)
 	if event != "user_input" {
@@ -1058,12 +964,13 @@ func TestStartAndWatch(t *testing.T) {
 	sess := createSession(t, c, uniqueSession(t))
 	paneID := sess["paneId"].(string)
 
-	result := c.callTaskTool(t, "start-and-watch", map[string]any{
+	var result map[string]any
+	c.callToolJSON(t, "start-and-watch", map[string]any{
 		"paneId":  paneID,
 		"command": "echo 'server ready on port 3000'",
 		"pattern": "ready on port",
 		"timeout": 15,
-	})
+	}, &result)
 
 	event, _ := result["event"].(string)
 	// Should match the pattern trigger (event name is "pattern:ready on port").
@@ -1085,12 +992,13 @@ func TestWatchPaneTimeout(t *testing.T) {
 	paneID := sess["paneId"].(string)
 
 	start := time.Now()
-	result := c.callTaskTool(t, "watch-pane", map[string]any{
+	var result map[string]any
+	c.callToolJSON(t, "watch-pane", map[string]any{
 		"paneId":   paneID,
 		"triggers": "pattern:this_will_never_match_xyzzy",
 		"mode":     "quick",
 		"timeout":  3,
-	})
+	}, &result)
 	elapsed := time.Since(start)
 
 	event, _ := result["event"].(string)
@@ -1121,12 +1029,13 @@ func TestWatchPaneExitTrigger(t *testing.T) {
 		exec.Command("tmux", "send-keys", "-t", paneID, "exit", "Enter").Run() //nolint:errcheck
 	}()
 
-	result := c.callTaskTool(t, "watch-pane", map[string]any{
+	var result map[string]any
+	c.callToolJSON(t, "watch-pane", map[string]any{
 		"paneId":   paneID,
 		"triggers": "exit",
 		"mode":     "quick",
 		"timeout":  10,
-	})
+	}, &result)
 
 	event, _ := result["event"].(string)
 	if event != "exit" {
@@ -1313,12 +1222,13 @@ func TestStartAndWatchHeadless(t *testing.T) {
 	}
 	c := newMCPClient(t)
 
-	result := c.callTaskTool(t, "start-and-watch", map[string]any{
+	var result map[string]any
+	c.callToolJSON(t, "start-and-watch", map[string]any{
 		"command":  "echo 'server ready on port 3000'",
 		"pattern":  "ready on",
 		"headless": true,
 		"timeout":  10,
-	})
+	}, &result)
 
 	event, _ := result["event"].(string)
 	if !strings.Contains(event, "pattern") {
@@ -1328,5 +1238,205 @@ func TestStartAndWatchHeadless(t *testing.T) {
 	paneID, _ := result["paneId"].(string)
 	if !strings.HasPrefix(paneID, "headless:") {
 		t.Fatalf("expected headless paneId, got: %q", paneID)
+	}
+}
+
+// ---- Channel mode tests ----
+
+// startMCPProcess starts the tmux-mcp binary and a background readLoop but
+// does NOT perform the MCP initialize handshake. Callers can issue initialize
+// themselves and inspect the raw response.
+func startMCPProcess(t *testing.T, extraArgs ...string) *mcpClient {
+	t.Helper()
+
+	shellType := "zsh"
+	if s := os.Getenv("SHELL"); strings.Contains(s, "bash") {
+		shellType = "bash"
+	} else if strings.Contains(s, "fish") {
+		shellType = "fish"
+	}
+
+	args := append([]string{"--shell-type=" + shellType, "--scope=all"}, extraArgs...)
+	cmd := exec.Command(testBinaryPath, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start process: %v", err)
+	}
+
+	c := &mcpClient{
+		cmd:                  cmd,
+		stdin:                stdin,
+		pending:              make(map[int64]*pendingCall),
+		channelNotifications: make(chan map[string]any, 64),
+	}
+
+	go c.readLoop(bufio.NewReader(stdoutPipe))
+	t.Cleanup(func() { c.close() })
+	return c
+}
+
+// sendInitialized sends the notifications/initialized notification (no response expected).
+func sendInitialized(c *mcpClient) {
+	notif := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	}
+	data, _ := json.Marshal(notif)
+	fmt.Fprintf(c.stdin, "%s\n", data) //nolint:errcheck
+}
+
+func TestChannelCapabilityDeclared(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+
+	c := startMCPProcess(t, "--channel")
+
+	raw := c.call(t, "initialize", map[string]any{
+		"protocolVersion": "2025-06-18",
+		"capabilities":    map[string]any{},
+		"clientInfo": map[string]any{
+			"name":    "e2e-test",
+			"version": "1.0.0",
+		},
+	})
+	sendInitialized(c)
+
+	var result struct {
+		Capabilities struct {
+			Experimental map[string]any `json:"experimental"`
+		} `json:"capabilities"`
+		Instructions string `json:"instructions"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("unmarshal initialize result: %v", err)
+	}
+
+	if result.Capabilities.Experimental == nil {
+		t.Fatal("expected capabilities.experimental to be non-nil when --channel is set")
+	}
+	if _, ok := result.Capabilities.Experimental["claude/channel"]; !ok {
+		t.Fatalf("expected capabilities.experimental[\"claude/channel\"] to be present, got: %v",
+			result.Capabilities.Experimental)
+	}
+	if result.Instructions == "" {
+		t.Fatal("expected non-empty instructions when --channel is set")
+	}
+}
+
+func TestChannelCapabilityAbsentByDefault(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+
+	c := startMCPProcess(t) // no --channel flag
+
+	raw := c.call(t, "initialize", map[string]any{
+		"protocolVersion": "2025-06-18",
+		"capabilities":    map[string]any{},
+		"clientInfo": map[string]any{
+			"name":    "e2e-test",
+			"version": "1.0.0",
+		},
+	})
+	sendInitialized(c)
+
+	var result struct {
+		Capabilities struct {
+			Experimental map[string]any `json:"experimental"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("unmarshal initialize result: %v", err)
+	}
+
+	if _, ok := result.Capabilities.Experimental["claude/channel"]; ok {
+		t.Fatal("expected capabilities.experimental[\"claude/channel\"] to be absent without --channel flag")
+	}
+}
+
+func TestChannelNotificationOnExit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+
+	c := newMCPClient(t, "--channel")
+	sess := createSession(t, c, uniqueSession(t))
+	paneID := sess["paneId"].(string)
+
+	// Enable remain-on-exit so tmux keeps the pane alive after the shell exits.
+	exec.Command("tmux", "set-option", "-t", paneID, "remain-on-exit", "on").Run() //nolint:errcheck
+
+	// Start watch-pane in the background — it blocks until the exit trigger fires.
+	watchDone := make(chan map[string]any, 1)
+	go func() {
+		var result map[string]any
+		c.callToolJSON(t, "watch-pane", map[string]any{
+			"paneId":   paneID,
+			"triggers": "exit",
+			"mode":     "quick",
+			"timeout":  15,
+		}, &result)
+		watchDone <- result
+	}()
+
+	// Give watch-pane a moment to start before sending exit.
+	sleep(500 * time.Millisecond)
+	exec.Command("tmux", "send-keys", "-t", paneID, "exit 42", "Enter").Run() //nolint:errcheck
+
+	// Wait for the watch-pane tool to complete.
+	var watchResult map[string]any
+	select {
+	case watchResult = <-watchDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for watch-pane to complete")
+	}
+
+	// Verify the tool result reports an exit event.
+	event, _ := watchResult["event"].(string)
+	if event != "exit" {
+		t.Fatalf("watch-pane: expected event='exit', got %q", event)
+	}
+
+	// Collect any channel notification that arrived.
+	var notification map[string]any
+	select {
+	case notification = <-c.channelNotifications:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for notifications/claude/channel notification")
+	}
+
+	// Verify notification content.
+	content, _ := notification["content"].(string)
+	if !strings.Contains(content, "exit") {
+		t.Fatalf("notification content should contain 'exit', got: %q", content)
+	}
+	if !strings.Contains(content, paneID) {
+		t.Fatalf("notification content should contain paneId %q, got: %q", paneID, content)
+	}
+
+	meta, ok := notification["meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("notification missing 'meta' map, got: %v", notification["meta"])
+	}
+
+	if meta["event"] != "exit" {
+		t.Fatalf("meta.event: expected 'exit', got %q", meta["event"])
+	}
+	if meta["paneId"] != paneID {
+		t.Fatalf("meta.paneId: expected %q, got %q", paneID, meta["paneId"])
+	}
+	exitCode, _ := meta["exitCode"].(string)
+	if exitCode != "42" {
+		t.Fatalf("meta.exitCode: expected '42', got %q", exitCode)
 	}
 }

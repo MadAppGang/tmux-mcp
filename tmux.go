@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -43,6 +44,7 @@ type CommandResult struct {
 	PaneID   string `json:"paneId"`
 	Output   string `json:"output"`
 	ExitCode int    `json:"exitCode"`
+	TimedOut bool   `json:"timedOut,omitempty"`
 }
 
 // CreatedSession holds the IDs returned when a new session is created.
@@ -68,6 +70,20 @@ type CreatedPane struct {
 
 // headlessSocket is the tmux socket name used for isolated headless sessions.
 const headlessSocket = "mcp-headless"
+
+// CleanStaleHeadlessSocket checks if the headless tmux socket exists but the
+// server behind it is dead (e.g. after a crash). If so, it runs kill-server to
+// clean up the stale socket so a fresh server can be started.
+func CleanStaleHeadlessSocket() {
+	// Try to list sessions on the headless socket. If the server is alive this
+	// succeeds (or returns "no sessions"). If the socket is stale, tmux returns
+	// an error like "no server running on ...".
+	cmd := exec.Command("tmux", "-L", headlessSocket, "list-sessions")
+	if err := cmd.Run(); err != nil {
+		// Server is not running — kill-server will clean up any stale socket file.
+		_ = exec.Command("tmux", "-L", headlessSocket, "kill-server").Run()
+	}
+}
 
 // headlessPrefix is the ID prefix that identifies headless targets.
 const headlessPrefix = "headless:"
@@ -281,7 +297,16 @@ func (t *tmuxClient) CreateHeadlessSession(ctx context.Context, name, command st
 // createSessionOnSocket is the shared implementation for session creation.
 // socket selects the tmux server; empty means the default server.
 // command, if non-empty, is passed to the shell as the initial command.
+// If a session with the given name already exists, it returns the existing
+// session's IDs instead of erroring (idempotent create).
 func (t *tmuxClient) createSessionOnSocket(ctx context.Context, socket, name, command string) (*CreatedSession, error) {
+	// If a name was given, check if a session with that name already exists.
+	if name != "" {
+		if existing, err := t.findSessionByName(ctx, socket, name); err == nil {
+			return existing, nil
+		}
+	}
+
 	args := []string{"new-session", "-d", "-P", "-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{pane_id}"}
 	if name != "" {
 		args = append(args, "-s", name)
@@ -296,6 +321,32 @@ func (t *tmuxClient) createSessionOnSocket(ctx context.Context, socket, name, co
 	parts := strings.Split(out, "\t")
 	if len(parts) != 4 {
 		return nil, fmt.Errorf("unexpected tmux output: %q", out)
+	}
+	return &CreatedSession{
+		SessionID:   parts[0],
+		SessionName: parts[1],
+		WindowID:    parts[2],
+		PaneID:      parts[3],
+	}, nil
+}
+
+// findSessionByName looks up a session by name on the given socket.
+// Returns the session's IDs if found.
+func (t *tmuxClient) findSessionByName(ctx context.Context, socket, name string) (*CreatedSession, error) {
+	out, err := t.runWithSocket(ctx, socket, "list-sessions",
+		"-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{pane_id}",
+		"-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, fmt.Errorf("session not found: %s", name)
+	}
+	// Take the first matching line.
+	line := strings.Split(out, "\n")[0]
+	parts := strings.Split(line, "\t")
+	if len(parts) != 4 {
+		return nil, fmt.Errorf("unexpected tmux output: %q", line)
 	}
 	return &CreatedSession{
 		SessionID:   parts[0],
@@ -420,7 +471,17 @@ func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string)
 	}
 	if waitErr != nil {
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("command timed out: %w", ctx.Err())
+			// Bug 2 fix: on timeout, return partial output instead of a bare error.
+			partialOutput := ""
+			if data, err := os.ReadFile(outFile); err == nil {
+				partialOutput = strings.TrimRight(string(data), "\n")
+			}
+			return &CommandResult{
+				PaneID:   paneID,
+				Output:   partialOutput,
+				ExitCode: -1,
+				TimedOut: true,
+			}, nil
 		}
 		return nil, fmt.Errorf("wait-for: %w", waitErr)
 	}
@@ -430,7 +491,18 @@ func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string)
 		return nil, fmt.Errorf("read output file: %w", err)
 	}
 
-	exitBytes, err := os.ReadFile(exitFile)
+	// Bug 3 fix: retry reading exit file to handle race with fast-completing commands.
+	var exitBytes []byte
+	for attempt := 0; attempt < 4; attempt++ {
+		exitBytes, err = os.ReadFile(exitFile)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read exit file: %w", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read exit file: %w", err)
 	}
@@ -495,10 +567,39 @@ func (t *tmuxClient) RenameSession(ctx context.Context, sessionID, newName strin
 }
 
 // KillSession kills a tmux session and all its windows.
+// It accepts session IDs ($N), prefixed IDs (headless:$N), or session names.
 func (t *tmuxClient) KillSession(ctx context.Context, sessionID string) error {
 	socket, bareID := parseTarget(sessionID)
 	_, err := t.runWithSocket(ctx, socket, "kill-session", "-t", bareID)
+	if err != nil {
+		// If the direct target failed, try resolving by session name.
+		resolved, resolveErr := t.resolveSessionTarget(ctx, socket, bareID)
+		if resolveErr == nil {
+			_, err = t.runWithSocket(ctx, socket, "kill-session", "-t", resolved)
+		}
+	}
 	return err
+}
+
+// resolveSessionTarget attempts to resolve a session target that may be a name
+// rather than a tmux session ID. It searches the session list on the given socket.
+func (t *tmuxClient) resolveSessionTarget(ctx context.Context, socket, target string) (string, error) {
+	out, err := t.runWithSocket(ctx, socket, "list-sessions",
+		"-F", "#{session_id}\t#{session_name}")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.Split(line, "\t")
+		if len(parts) != 2 {
+			continue
+		}
+		sid, sname := parts[0], parts[1]
+		if sname == target || sid == target {
+			return sid, nil
+		}
+	}
+	return "", fmt.Errorf("session not found: %s", target)
 }
 
 // KillWindow kills a tmux window and all its panes.

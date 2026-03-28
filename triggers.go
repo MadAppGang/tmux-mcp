@@ -274,6 +274,7 @@ func monitorPane(
 	mode NotificationMode,
 	triggers []Trigger,
 	timeoutSecs int,
+	emitter *ChannelEmitter,
 ) (*WatchResult, error) {
 	start := time.Now()
 	timeout := time.Duration(timeoutSecs) * time.Second
@@ -320,25 +321,29 @@ func monitorPane(
 				for _, trig := range triggers {
 					fired, detail := trig.Check(ctx, ms)
 					if fired {
-						return &WatchResult{
+						result := &WatchResult{
 							PaneID:    paneID,
 							Event:     trig.Name,
 							Detail:    detail,
 							Elapsed:   elapsed.Seconds(),
 							Output:    ms.AllOutput.String(),
 							PaneState: paneState,
-						}, nil
+						}
+						emitter.Emit(ctx, result)
+						return result, nil
 					}
 				}
 				if elapsed >= time.Duration(timeoutSecs)*time.Second {
-					return &WatchResult{
+					result := &WatchResult{
 						PaneID:    paneID,
 						Event:     "timeout",
 						Detail:    fmt.Sprintf("Timed out after %ds", timeoutSecs),
 						Elapsed:   elapsed.Seconds(),
 						Output:    ms.AllOutput.String(),
 						PaneState: paneState,
-					}, nil
+					}
+					emitter.Emit(ctx, result)
+					return result, nil
 				}
 				continue
 			}
@@ -381,14 +386,16 @@ func monitorPane(
 			for _, trig := range triggers {
 				fired, detail := trig.Check(ctx, ms)
 				if fired {
-					return &WatchResult{
+					result := &WatchResult{
 						PaneID:    paneID,
 						Event:     trig.Name,
 						Detail:    detail,
 						Elapsed:   elapsed.Seconds(),
 						Output:    ms.AllOutput.String(),
 						PaneState: paneState,
-					}, nil
+					}
+					emitter.Emit(ctx, result)
+					return result, nil
 				}
 			}
 
@@ -414,14 +421,16 @@ func monitorPane(
 
 			// Check overall timeout.
 			if elapsed >= timeout {
-				return &WatchResult{
+				result := &WatchResult{
 					PaneID:    paneID,
 					Event:     "timeout",
 					Detail:    fmt.Sprintf("Timed out after %ds", timeoutSecs),
 					Elapsed:   elapsed.Seconds(),
 					Output:    ms.AllOutput.String(),
 					PaneState: paneState,
-				}, nil
+				}
+				emitter.Emit(ctx, result)
+				return result, nil
 			}
 		}
 	}

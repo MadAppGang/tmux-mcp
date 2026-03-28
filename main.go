@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -15,6 +16,7 @@ import (
 func main() {
 	shellType := flag.String("shell-type", "bash", "Shell type for exit code capture (bash/zsh/fish)")
 	scope := flag.String("scope", "", "Tool scope: agentic (default), primitives, or all")
+	channelMode := flag.Bool("channel", false, "Enable Claude Code channel mode: push tmux events as channel notifications")
 	flag.Parse()
 
 	// Resolve scope: flag > env > default
@@ -33,22 +35,47 @@ func main() {
 		log.Fatalf("invalid scope %q: must be one of agentic, primitives, or all", scopeVal)
 	}
 
+	// Clean up any stale headless socket from a previous crash.
+	CleanStaleHeadlessSocket()
+
 	client := newTmuxClient(*shellType)
 
-	s := server.NewMCPServer("tmux-mcp", "1.0.0",
+	var serverOpts []server.ServerOption
+	serverOpts = append(serverOpts,
 		server.WithToolCapabilities(true),
 		server.WithResourceCapabilities(true, true),
-		server.WithTaskCapabilities(true, true, true),
 	)
+
+	if *channelMode {
+		hooks := &server.Hooks{}
+		hooks.AddAfterInitialize(func(
+			ctx context.Context, id any,
+			req *mcp.InitializeRequest,
+			result *mcp.InitializeResult,
+		) {
+			if result.Capabilities.Experimental == nil {
+				result.Capabilities.Experimental = make(map[string]any)
+			}
+			result.Capabilities.Experimental["claude/channel"] = map[string]any{}
+		})
+		serverOpts = append(serverOpts,
+			server.WithHooks(hooks),
+			server.WithInstructions(channelInstructions),
+		)
+	}
+
+	s := server.NewMCPServer("tmux-mcp", "1.0.0", serverOpts...)
+
+	emitter := newChannelEmitter(*channelMode, s)
 
 	switch scopeVal {
 	case "primitives":
-		registerTools(s, client)
+		registerTools(s, client, emitter)
 	case "agentic":
-		registerAgenticScope(s, client)
+		registerAgenticScope(s, client, emitter)
 	case "all":
-		registerTools(s, client)
-		registerAgentTools(s, client)
+		registerTools(s, client, emitter)
+		registerAgentTools(s, client, emitter)
 	}
 
 	registerResources(s, client)
@@ -61,7 +88,7 @@ func main() {
 // ---- Tool registration ----
 
 // registerTools registers all 14 Layer 1 (primitive) tools.
-func registerTools(s *server.MCPServer, client *tmuxClient) {
+func registerTools(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
 	registerListSessions(s, client)
 	registerCreateHeadless(s, client)
 	registerKillHeadlessServer(s, client)
@@ -82,17 +109,18 @@ func registerTools(s *server.MCPServer, client *tmuxClient) {
 
 // registerAgenticScope registers the 6 Layer 2 tools plus 7 essential Layer 1
 // tools. This is the default scope.
-func registerAgenticScope(s *server.MCPServer, client *tmuxClient) {
+func registerAgenticScope(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
 	// Essential Layer 1 tools
 	registerListSessions(s, client)
 	registerCreateSession(s, client)
 	registerCreateHeadless(s, client)
 	registerCapturePane(s, client)
+	registerSendKeys(s, client)
 	registerExecuteCommand(s, client)
 	registerKillSession(s, client)
 	registerKillHeadlessServer(s, client)
 	// All Layer 2 tools
-	registerAgentTools(s, client)
+	registerAgentTools(s, client, emitter)
 }
 
 // ---- Individual Layer 1 tool registrations ----
@@ -364,6 +392,9 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 		mcp.WithBoolean("headless",
 			mcp.Description("When true and no paneId is provided, auto-create a headless session, run the command, return output, and clean up. Default false."),
 		),
+		mcp.WithNumber("timeoutSeconds",
+			mcp.Description("Maximum seconds to wait for the command to complete before returning with timedOut:true and partial output (default: no timeout)"),
+		),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		command, err := req.RequireString("command")
 		if err != nil {
@@ -371,6 +402,14 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 		}
 		headless := req.GetBool("headless", false)
 		paneID := req.GetString("paneId", "")
+
+		// Apply per-call timeout if provided.
+		timeoutSecs := req.GetInt("timeoutSeconds", 0)
+		if timeoutSecs > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+			defer cancel()
+		}
 
 		if headless && paneID == "" {
 			// One-shot headless execution: create session, run, destroy.
@@ -389,7 +428,8 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 			return jsonResult(struct {
 				Output   string `json:"output"`
 				ExitCode int    `json:"exitCode"`
-			}{Output: result.Output, ExitCode: result.ExitCode})
+				TimedOut bool   `json:"timedOut,omitempty"`
+			}{Output: result.Output, ExitCode: result.ExitCode, TimedOut: result.TimedOut})
 		}
 
 		if paneID == "" {
