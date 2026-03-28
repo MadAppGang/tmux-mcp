@@ -236,16 +236,17 @@ func registerRunInREPL(s *server.MCPServer, client *tmuxClient) {
 		// Capture baseline content before sending input.
 		baseline, _ := client.CapturePane(ctx, paneID, 0, false)
 
-		// Send the input with Enter.
-		if err := client.SendKeys(ctx, paneID, input, true, true); err != nil {
-			return mcp.NewToolResultErrorFromErr("failed to send input", err), nil
-		}
-
-		// Record the initial foreground command so we can detect REPL exit.
+		// Record the initial foreground command BEFORE sending input
+		// so we can detect REPL exit (foreground command change).
 		initialState, _ := client.GetPaneState(ctx, paneID)
 		initialCmd := ""
 		if initialState != nil {
 			initialCmd = initialState.ForegroundCmd
+		}
+
+		// Send the input with Enter.
+		if err := client.SendKeys(ctx, paneID, input, true, true); err != nil {
+			return mcp.NewToolResultErrorFromErr("failed to send input", err), nil
 		}
 
 		deadline := time.Now().Add(time.Duration(timeoutSecs) * time.Second)
