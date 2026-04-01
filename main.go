@@ -87,7 +87,7 @@ func main() {
 
 // ---- Tool registration ----
 
-// registerTools registers all 14 Layer 1 (primitive) tools.
+// registerTools registers all 15 Layer 1 (primitive) tools.
 func registerTools(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
 	registerListSessions(s, client)
 	registerCreateHeadless(s, client)
@@ -105,9 +105,10 @@ func registerTools(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmit
 	registerKillSession(s, client)
 	registerKillWindow(s, client)
 	registerKillPane(s, client)
+	registerScreenshotPane(s, client)
 }
 
-// registerAgenticScope registers the 6 Layer 2 tools plus 7 essential Layer 1
+// registerAgenticScope registers the 6 Layer 2 tools plus 8 essential Layer 1
 // tools. This is the default scope.
 func registerAgenticScope(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
 	// Essential Layer 1 tools
@@ -119,6 +120,7 @@ func registerAgenticScope(s *server.MCPServer, client *tmuxClient, emitter *Chan
 	registerExecuteCommand(s, client)
 	registerKillSession(s, client)
 	registerKillHeadlessServer(s, client)
+	registerScreenshotPane(s, client)
 	// All Layer 2 tools
 	registerAgentTools(s, client, emitter)
 }
@@ -591,6 +593,34 @@ func registerKillPane(s *server.MCPServer, client *tmuxClient) {
 		return jsonResult(struct {
 			Killed string `json:"killed"`
 		}{Killed: paneID})
+	})
+}
+
+func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
+	s.AddTool(mcp.NewTool("screenshot-pane",
+		mcp.WithDescription("Capture terminal content as a visual screenshot opened in browser. Renders ANSI colors, styles, and layout using xterm.js with the detected terminal font."),
+		mcp.WithString("paneId",
+			mcp.Required(),
+			mcp.Description("Pane ID (e.g. %0) or target"),
+		),
+		mcp.WithString("theme",
+			mcp.Description(`Color theme: "dark" (default) or "light"`),
+			mcp.Enum("dark", "light"),
+		),
+		mcp.WithString("output",
+			mcp.Description(`Output mode: "browser" (default, opens in browser) or "html" (returns HTML as text)`),
+			mcp.Enum("browser", "html"),
+		),
+		mcp.WithReadOnlyHintAnnotation(true),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		paneID, err := req.RequireString("paneId")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		theme := req.GetString("theme", "dark")
+		output := req.GetString("output", "browser")
+
+		return handleScreenshotPane(ctx, client, paneID, theme, output)
 	})
 }
 

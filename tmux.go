@@ -642,3 +642,37 @@ func (t *tmuxClient) DisplayMessage(ctx context.Context, message string, duratio
 	_, err := t.run(ctx, "display-message", "-d", strconv.Itoa(durationMs), message)
 	return err
 }
+
+// CapturePaneRaw captures pane content with ANSI escape codes and preserved
+// trailing whitespace. Unlike CapturePane, it always uses -e -p -N flags:
+// -e preserves color/style escape codes, -p prints to stdout, -N preserves
+// trailing spaces. This is intended for visual reproduction (screenshots)
+// where whitespace layout matters.
+func (t *tmuxClient) CapturePaneRaw(ctx context.Context, paneID string) (string, error) {
+	socket, bareID := parseTarget(paneID)
+	args := []string{"capture-pane", "-t", bareID, "-e", "-p", "-N"}
+	return t.runWithSocket(ctx, socket, args...)
+}
+
+// GetPaneDimensions queries a pane's current width and height.
+func (t *tmuxClient) GetPaneDimensions(ctx context.Context, paneID string) (cols, rows int, err error) {
+	socket, bareID := parseTarget(paneID)
+	out, err := t.runWithSocket(ctx, socket, "display-message",
+		"-t", bareID, "-p", "#{pane_width}\t#{pane_height}")
+	if err != nil {
+		return 0, 0, err
+	}
+	parts := strings.Split(strings.TrimSpace(out), "\t")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("unexpected display-message output: %q", out)
+	}
+	cols, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse pane width %q: %w", parts[0], err)
+	}
+	rows, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse pane height %q: %w", parts[1], err)
+	}
+	return cols, rows, nil
+}
