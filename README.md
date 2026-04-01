@@ -86,7 +86,7 @@ Layer 1: Tmux Primitives
   create-session  create-window  split-pane
   list-sessions   list-windows   list-panes
   execute-command send-keys      capture-pane
-  resize-pane     rename-session
+  screenshot-pane resize-pane    rename-session
   kill-session    kill-window    kill-pane
 ```
 
@@ -104,6 +104,7 @@ Layer 1: Tmux Primitives
 | `list-windows` | List windows in a session | `sessionId` | `[{id, name, active, panes}]` |
 | `list-panes` | List panes with dimensions and current path | `windowId` | `[{id, title, active, width, height, currentCommand, currentPath}]` |
 | `capture-pane` | Read terminal content | `paneId`, `lines`, `colors` | raw text |
+| `screenshot-pane` | Visual screenshot opened in browser | `paneId`, `theme`, `output` | file path or HTML |
 | `create-session` | Create a detached session | `name` (optional) | `{sessionId, sessionName, windowId, paneId}` |
 | `create-window` | Add a window to a session | `sessionId`, `name` | `{windowId, windowName, paneId}` |
 | `split-pane` | Split a pane horizontally or vertically | `paneId`, `direction`, `size` | `{paneId, windowId}` |
