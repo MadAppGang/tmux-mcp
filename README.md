@@ -377,8 +377,8 @@ Match this to the shell running inside your tmux panes. A mismatch causes `execu
 
 | Value | Tools registered |
 |---|---|
-| `agentic` (default) | 6 Layer 2 tools + 8 essential Layer 1 tools |
-| `primitives` | All 16 Layer 1 tools only |
+| `agentic` (default) | 6 Layer 2 tools + 13 essential Layer 1 tools |
+| `primitives` | All 17 Layer 1 tools only |
 | `all` | All Layer 1 and Layer 2 tools |
 
 The scope can also be set via the `TMUX_MCP_SCOPE` environment variable. The flag takes precedence.

@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -29,6 +30,85 @@ type terminalStyle struct {
 	FontSize   int    // font size in px
 	Background string // hex color for terminal background (e.g. "#000000")
 	Foreground string // hex color for terminal foreground (e.g. "#d4d4d4")
+}
+
+// findChrome discovers a Chrome/Chromium binary on the system.
+// Returns the path or empty string if not found.
+func findChrome() string {
+	candidates := []string{
+		"google-chrome-stable",
+		"google-chrome",
+		"chromium",
+		"chromium-browser",
+	}
+	for _, name := range candidates {
+		if path, err := exec.LookPath(name); err == nil {
+			return path
+		}
+	}
+	// macOS app bundle
+	macPath := "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+	if _, err := os.Stat(macPath); err == nil {
+		return macPath
+	}
+	return ""
+}
+
+// renderHTMLToPNG renders an HTML string to a PNG image using headless Chrome.
+// cols and rows are used to approximate the window size.
+func renderHTMLToPNG(ctx context.Context, htmlContent string, cols, rows int) ([]byte, error) {
+	chromePath := findChrome()
+	if chromePath == "" {
+		return nil, fmt.Errorf("chrome/chromium not found")
+	}
+
+	// Write HTML to a temp file.
+	tmpHTML, err := os.CreateTemp("", "tmux-screenshot-*.html")
+	if err != nil {
+		return nil, fmt.Errorf("create temp HTML file: %w", err)
+	}
+	defer os.Remove(tmpHTML.Name())
+	if _, err := tmpHTML.WriteString(htmlContent); err != nil {
+		tmpHTML.Close()
+		return nil, fmt.Errorf("write HTML: %w", err)
+	}
+	tmpHTML.Close()
+
+	// Create temp output path for PNG.
+	tmpPNG, err := os.CreateTemp("", "tmux-screenshot-*.png")
+	if err != nil {
+		return nil, fmt.Errorf("create temp PNG file: %w", err)
+	}
+	tmpPNG.Close()
+	defer os.Remove(tmpPNG.Name())
+
+	// Approximate window size from terminal dimensions.
+	const charWidth = 8
+	const lineHeight = 18
+	const padding = 40
+	width := cols*charWidth + padding
+	height := rows*lineHeight + padding
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, chromePath,
+		"--headless=new",
+		"--disable-gpu",
+		"--no-sandbox",
+		fmt.Sprintf("--screenshot=%s", tmpPNG.Name()),
+		fmt.Sprintf("--window-size=%d,%d", width, height),
+		tmpHTML.Name(),
+	)
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("chrome headless render: %w", err)
+	}
+
+	pngData, err := os.ReadFile(tmpPNG.Name())
+	if err != nil {
+		return nil, fmt.Errorf("read PNG output: %w", err)
+	}
+	return pngData, nil
 }
 
 // handleScreenshotPane is the handler for the screenshot-pane tool.
@@ -52,19 +132,31 @@ func handleScreenshotPane(ctx context.Context, client *tmuxClient, paneID, theme
 	html := generateScreenshotHTML(ansiContent, cols, rows, style, theme)
 
 	// 5. Output based on mode.
-	if output == "html" {
+	switch output {
+	case "html":
 		return mcp.NewToolResultText(html), nil
-	}
-
-	// Default: browser mode.
-	filePath, err := openInBrowser(html)
-	if err != nil {
-		if filePath != "" {
-			return mcp.NewToolResultText(fmt.Sprintf("Screenshot saved but could not open browser: %s\nFile: %s", err, filePath)), nil
+	case "browser":
+		filePath, err := openInBrowser(html)
+		if err != nil {
+			if filePath != "" {
+				return mcp.NewToolResultText(fmt.Sprintf("Screenshot saved but could not open browser: %s\nFile: %s", err, filePath)), nil
+			}
+			return mcp.NewToolResultErrorFromErr("failed to open screenshot", err), nil
 		}
-		return mcp.NewToolResultErrorFromErr("failed to open screenshot", err), nil
+		return mcp.NewToolResultText(fmt.Sprintf("Screenshot opened in browser: %s", filePath)), nil
+	default:
+		// Default: render PNG image via headless Chrome.
+		pngData, renderErr := renderHTMLToPNG(ctx, html, cols, rows)
+		if renderErr == nil {
+			return mcp.NewToolResultImage(
+				"Terminal screenshot of pane "+paneID,
+				base64.StdEncoding.EncodeToString(pngData),
+				"image/png",
+			), nil
+		}
+		// Fallback: return HTML as text with a note.
+		return mcp.NewToolResultText("Note: PNG rendering unavailable (" + renderErr.Error() + "). Returning HTML instead.\n\n" + html), nil
 	}
-	return mcp.NewToolResultText(fmt.Sprintf("Screenshot opened in browser: %s", filePath)), nil
 }
 
 // defaultStyle returns a terminalStyle with safe defaults.

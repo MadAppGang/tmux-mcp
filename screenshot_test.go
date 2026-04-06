@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -341,5 +342,88 @@ func TestGenerateScreenshotHTMLSpecialChars(t *testing.T) {
 				t.Error("raw HTML-special content should not appear unencoded in output")
 			}
 		})
+	}
+}
+
+// ---------- TestScreenshotPaneDefaultReturnsImage ----------
+
+// REGRESSION: screenshot-pane opens visible browser instead of returning image — Fixed in /dev:fix session dev-fix-20260406-130232-07e187db
+func TestScreenshotPaneDefaultReturnsImage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	c := newMCPClient(t)
+	sess := createSession(t, c, uniqueSession(t))
+	paneID := sess["paneId"].(string)
+
+	// Call screenshot-pane with default output mode (no "output" param).
+	raw := c.callToolRaw(t, "screenshot-pane", map[string]any{
+		"paneId": paneID,
+	})
+
+	// The result should contain image content, not just text with a file path.
+	var result struct {
+		Content []struct {
+			Type     string `json:"type"`
+			MIMEType string `json:"mimeType"`
+			Data     string `json:"data"`
+			Text     string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("unmarshal result: %v\nraw: %s", err, raw)
+	}
+
+	hasImage := false
+	for _, item := range result.Content {
+		if item.Type == "image" {
+			hasImage = true
+			if item.MIMEType != "image/png" {
+				t.Errorf("expected image/png MIME type, got %s", item.MIMEType)
+			}
+			if item.Data == "" {
+				t.Error("image data is empty")
+			}
+		}
+	}
+	if !hasImage {
+		t.Error("default screenshot-pane output should contain image content, but no image content block found")
+	}
+}
+
+// ---------- TestToolDescriptionsContainGuidance ----------
+
+// REGRESSION: tool descriptions lack cross-references between capture-pane and screenshot-pane — Fixed in /dev:fix session dev-fix-20260406-130232-07e187db
+func TestToolDescriptionsContainGuidance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	c := newMCPClient(t)
+
+	// Get tools list.
+	raw := c.call(t, "tools/list", map[string]any{})
+	var result struct {
+		Tools []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("unmarshal tools/list: %v", err)
+	}
+
+	for _, tool := range result.Tools {
+		switch tool.Name {
+		case "screenshot-pane":
+			// Should mention capture-pane as the preferred alternative for text.
+			if !strings.Contains(strings.ToLower(tool.Description), "capture-pane") {
+				t.Error("screenshot-pane description should reference capture-pane as preferred for text content")
+			}
+		case "capture-pane":
+			// Should mention screenshot-pane for visual needs.
+			if !strings.Contains(strings.ToLower(tool.Description), "screenshot-pane") {
+				t.Error("capture-pane description should reference screenshot-pane for visual rendering needs")
+			}
+		}
 	}
 }

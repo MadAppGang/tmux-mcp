@@ -108,18 +108,22 @@ func registerTools(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmit
 	registerScreenshotPane(s, client)
 }
 
-// registerAgenticScope registers the 6 Layer 2 tools plus 8 essential Layer 1
+// registerAgenticScope registers the 6 Layer 2 tools plus essential Layer 1
 // tools. This is the default scope.
 func registerAgenticScope(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
 	// Essential Layer 1 tools
 	registerListSessions(s, client)
+	registerListWindows(s, client)
+	registerListPanes(s, client)
 	registerCreateSession(s, client)
 	registerCreateHeadless(s, client)
+	registerSplitPane(s, client)
 	registerCapturePane(s, client)
 	registerSendKeys(s, client)
 	registerExecuteCommand(s, client)
 	registerKillSession(s, client)
 	registerKillHeadlessServer(s, client)
+	registerKillPane(s, client)
 	registerScreenshotPane(s, client)
 	// All Layer 2 tools
 	registerAgentTools(s, client, emitter)
@@ -248,7 +252,7 @@ func registerListPanes(s *server.MCPServer, client *tmuxClient) {
 
 func registerCapturePane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("capture-pane",
-		mcp.WithDescription("Capture terminal content from a pane"),
+		mcp.WithDescription("Capture terminal text content from a pane as plain text. Preferred tool for reading command output, logs, and text-based terminal content. Use screenshot-pane only when visual rendering (colors, layout, TUI graphics) matters."),
 		mcp.WithString("paneId",
 			mcp.Required(),
 			mcp.Description("Pane ID (e.g. %0) or target"),
@@ -598,7 +602,7 @@ func registerKillPane(s *server.MCPServer, client *tmuxClient) {
 
 func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("screenshot-pane",
-		mcp.WithDescription("Capture terminal content as a visual screenshot opened in browser. Renders ANSI colors, styles, and layout using xterm.js with the detected terminal font."),
+		mcp.WithDescription("Render a visual PNG screenshot of a terminal pane with full ANSI colors, styles, and layout via xterm.js. Returns an image the model can see. Use ONLY when visual appearance matters (TUI layouts, color-coded output, ANSI art). For reading text content, prefer capture-pane instead."),
 		mcp.WithString("paneId",
 			mcp.Required(),
 			mcp.Description("Pane ID (e.g. %0) or target"),
@@ -608,7 +612,7 @@ func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
 			mcp.Enum("dark", "light"),
 		),
 		mcp.WithString("output",
-			mcp.Description(`Output mode: "browser" (default, opens in browser) or "html" (returns HTML as text)`),
+			mcp.Description(`Output mode: default returns a PNG image; "browser" opens in system browser; "html" returns raw HTML as text`),
 			mcp.Enum("browser", "html"),
 		),
 		mcp.WithReadOnlyHintAnnotation(true),
@@ -618,7 +622,7 @@ func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		theme := req.GetString("theme", "dark")
-		output := req.GetString("output", "browser")
+		output := req.GetString("output", "")
 
 		return handleScreenshotPane(ctx, client, paneID, theme, output)
 	})

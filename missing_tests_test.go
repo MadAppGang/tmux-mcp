@@ -232,10 +232,27 @@ func TestScopeAgentic(t *testing.T) {
 	names := toolNames(t, c)
 
 	agenticRequired := []string{
+		// Layer 1 (13 essential primitives)
+		"list-sessions",
+		"list-windows",
+		"list-panes",
+		"create-session",
+		"create-headless",
+		"split-pane",
+		"capture-pane",
 		"send-keys",
+		"execute-command",
+		"kill-session",
+		"kill-headless-server",
+		"kill-pane",
+		"screenshot-pane",
+		// Layer 2 (6 agent workflow tools)
 		"start-and-watch",
 		"watch-pane",
-		"execute-command",
+		"pane-state",
+		"run-in-repl",
+		"write-to-display",
+		"display-message",
 	}
 	for _, tool := range agenticRequired {
 		if !names[tool] {
@@ -244,13 +261,92 @@ func TestScopeAgentic(t *testing.T) {
 	}
 
 	primitiveOnly := []string{
-		"split-pane",
 		"resize-pane",
+		"rename-session",
+		"create-window",
+		"kill-window",
 	}
 	for _, tool := range primitiveOnly {
 		if names[tool] {
 			t.Errorf("agentic scope: expected tool %q to be absent (primitives only), but it is present", tool)
 		}
+	}
+
+	// Verify exact tool count to catch accidental additions/removals.
+	expectedCount := len(agenticRequired)
+	actualCount := len(names)
+	if actualCount != expectedCount {
+		t.Errorf("agentic scope: expected %d tools, got %d", expectedCount, actualCount)
+	}
+}
+
+// ---- 5b. TestAgenticSplitAndList ----
+// Validates the real agent workflow: create session, split pane, list panes,
+// execute command in split — all within agentic scope.
+
+func TestAgenticSplitAndList(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	c := newMCPClientCustomScope(t, "agentic")
+
+	// Create session.
+	sess := createSession(t, c, uniqueSession(t))
+	paneID := sess["paneId"].(string)
+	sessionID := sess["sessionId"].(string)
+
+	// Split pane — this was previously missing from agentic scope.
+	var split map[string]any
+	c.callToolJSON(t, "split-pane", map[string]any{
+		"paneId":    paneID,
+		"direction": "horizontal",
+	}, &split)
+	splitPaneID := split["paneId"].(string)
+	if splitPaneID == "" {
+		t.Fatal("split-pane returned no paneId")
+	}
+	if splitPaneID == paneID {
+		t.Fatal("split-pane returned the same paneId as the original")
+	}
+
+	// List windows — also previously missing from agentic scope.
+	var windows []map[string]any
+	c.callToolJSON(t, "list-windows", map[string]any{"sessionId": sessionID}, &windows)
+	if len(windows) == 0 {
+		t.Fatal("list-windows returned no windows")
+	}
+	windowID := windows[0]["id"].(string)
+
+	// List panes — should see both original and split pane.
+	var panes []map[string]any
+	c.callToolJSON(t, "list-panes", map[string]any{"windowId": windowID}, &panes)
+	if len(panes) < 2 {
+		t.Fatalf("expected at least 2 panes after split, got %d", len(panes))
+	}
+
+	// Execute command in the split pane.
+	var execResult map[string]any
+	c.callToolJSON(t, "execute-command", map[string]any{
+		"paneId":  splitPaneID,
+		"command": "echo hello-from-split",
+	}, &execResult)
+	output := execResult["output"].(string)
+	if !strings.Contains(output, "hello-from-split") {
+		t.Fatalf("expected 'hello-from-split' in output, got: %s", output)
+	}
+	exitCode := int(execResult["exitCode"].(float64))
+	if exitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", exitCode)
+	}
+
+	// Kill the split pane — also previously missing from agentic scope.
+	c.callToolJSON(t, "kill-pane", map[string]any{"paneId": splitPaneID}, &map[string]any{})
+
+	// Verify only original pane remains.
+	var panesAfter []map[string]any
+	c.callToolJSON(t, "list-panes", map[string]any{"windowId": windowID}, &panesAfter)
+	if len(panesAfter) != 1 {
+		t.Fatalf("expected 1 pane after kill, got %d", len(panesAfter))
 	}
 }
 
