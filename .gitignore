@@ -18,4 +18,8 @@ ai-docs/
 
 # Claude memory (project-specific)
 .claude/
-.claudemem/
+
+# Added by claudeup
+.mnemex/
+gtd/sessions/
+.agents/

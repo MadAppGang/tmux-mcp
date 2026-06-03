@@ -66,6 +66,7 @@ type CreatedWindow struct {
 type CreatedPane struct {
 	PaneID   string `json:"paneId"`
 	WindowID string `json:"windowId"`
+	Reused   bool   `json:"reused,omitempty"`
 }
 
 // headlessSocket is the tmux socket name used for isolated headless sessions.
@@ -675,4 +676,86 @@ func (t *tmuxClient) GetPaneDimensions(ctx context.Context, paneID string) (cols
 		return 0, 0, fmt.Errorf("parse pane height %q: %w", parts[1], err)
 	}
 	return cols, rows, nil
+}
+
+// getWindowIDForPane returns the window ID that contains the given pane.
+// The returned ID is prefixed with "headless:" when the pane lives on the
+// headless socket.
+func (t *tmuxClient) getWindowIDForPane(ctx context.Context, paneID string) (string, error) {
+	socket, bareID := parseTarget(paneID)
+	out, err := t.runWithSocket(ctx, socket, "display-message", "-t", bareID, "-p", "#{window_id}")
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(out)
+	if socket != "" {
+		id = headlessPrefix + id
+	}
+	return id, nil
+}
+
+// findIdlePaneInWindow finds an idle (shell at prompt) pane in the same window
+// as sourcePaneID, excluding the source pane itself. Returns the pane ID if
+// found, or empty string if no idle pane is available.
+//
+// A pane is considered idle when it is alive and its foreground process is the
+// shell itself sitting at a prompt — i.e. no child command has taken over the
+// terminal. We detect that with paneIsIdleShell rather than WaitingForInput,
+// because WaitingForInput is not reliable across platforms: an idle interactive
+// shell reports waitingForInput=false on Linux (readline blocks in poll/select,
+// not n_tty_read) while reporting true on macOS. The "shell is the foreground
+// process" signal is consistent on both and is also strictly more correct — a
+// pane running `bash script.sh` has a child in the foreground and is not idle.
+func (t *tmuxClient) findIdlePaneInWindow(ctx context.Context, sourcePaneID string) (string, error) {
+	windowID, err := t.getWindowIDForPane(ctx, sourcePaneID)
+	if err != nil {
+		return "", fmt.Errorf("get window for pane %s: %w", sourcePaneID, err)
+	}
+
+	panes, err := t.ListPanes(ctx, windowID)
+	if err != nil {
+		return "", fmt.Errorf("list panes in window %s: %w", windowID, err)
+	}
+
+	for _, p := range panes {
+		if p.ID == sourcePaneID {
+			continue
+		}
+		state, err := t.GetPaneState(ctx, p.ID)
+		if err != nil {
+			continue
+		}
+		if paneIsIdleShell(state) {
+			return p.ID, nil
+		}
+	}
+
+	return "", nil
+}
+
+// paneIsIdleShell reports whether a pane is an idle shell at its prompt: alive,
+// with a shell as the foreground process and no child command running. The
+// "no child" part is the foreground PID matching the pane's own (shell) PID —
+// when a command like `cat` or `yes` runs, it becomes the foreground process
+// and ForegroundPID diverges from PanePID. This signal is reliable on both
+// macOS and Linux, unlike PaneState.WaitingForInput.
+func paneIsIdleShell(state *PaneState) bool {
+	if state == nil || !state.IsAlive {
+		return false
+	}
+	if !isShellProcess(state.ForegroundCmd) {
+		return false
+	}
+	// The shell must be the foreground process (no child command running).
+	return state.ForegroundPID == state.PanePID
+}
+
+// isShellProcess returns true if the command name is a known shell.
+func isShellProcess(cmd string) bool {
+	switch cmd {
+	case "zsh", "-zsh", "bash", "-bash", "fish", "sh", "-sh",
+		"dash", "ksh", "-ksh", "csh", "-csh", "tcsh", "-tcsh":
+		return true
+	}
+	return false
 }
