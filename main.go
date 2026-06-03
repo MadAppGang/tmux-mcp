@@ -321,7 +321,7 @@ func registerCreateWindow(s *server.MCPServer, client *tmuxClient) {
 
 func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("split-pane",
-		mcp.WithDescription("Split a tmux pane horizontally or vertically"),
+		mcp.WithDescription("Split a tmux pane horizontally or vertically. If an idle pane already exists in the same window, it will be reused instead of creating a new split (the response will include \"reused\": true)"),
 		mcp.WithString("paneId",
 			mcp.Required(),
 			mcp.Description("Pane ID to split"),
@@ -340,6 +340,17 @@ func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 		}
 		direction := req.GetString("direction", "vertical")
 		size := req.GetInt("size", 0)
+
+		// Try to reuse an existing idle pane in the same window.
+		if idlePaneID, findErr := client.findIdlePaneInWindow(ctx, paneID); findErr == nil && idlePaneID != "" {
+			windowID, _ := client.getWindowIDForPane(ctx, idlePaneID)
+			return jsonResult(&CreatedPane{
+				PaneID:   idlePaneID,
+				WindowID: windowID,
+				Reused:   true,
+			})
+		}
+
 		created, err := client.SplitPane(ctx, paneID, direction, size)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to split pane", err), nil

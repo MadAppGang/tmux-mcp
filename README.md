@@ -107,7 +107,7 @@ Layer 1: Tmux Primitives
 | `screenshot-pane` | Visual screenshot opened in browser | `paneId`, `theme`, `output` | file path or HTML |
 | `create-session` | Create a detached session | `name` (optional) | `{sessionId, sessionName, windowId, paneId}` |
 | `create-window` | Add a window to a session | `sessionId`, `name` | `{windowId, windowName, paneId}` |
-| `split-pane` | Split a pane horizontally or vertically | `paneId`, `direction`, `size` | `{paneId, windowId}` |
+| `split-pane` | Split a pane horizontally or vertically. Reuses an existing idle pane in the same window if one is available | `paneId`, `direction`, `size` | `{paneId, windowId, reused?}` |
 | `send-keys` | Send keystrokes or text to a pane | `paneId`, `keys`, `literal`, `enter` | `{paneId}` |
 | `execute-command` | Run a command and wait for completion | `paneId`, `command` | `{paneId, output, exitCode}` |
 | `resize-pane` | Resize absolutely or relatively | `paneId`, `width`+`height` or `direction`+`amount` | `{paneId}` |

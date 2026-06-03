@@ -248,6 +248,14 @@ func TestScenario_ChannelMultiPaneMonitoring(t *testing.T) {
 	sess := createSession(t, c, uniqueSession(t))
 	paneA := sess["paneId"].(string)
 
+	// Occupy paneA so split-pane from paneB won't reuse it.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId": paneA,
+		"keys":   "cat",
+		"enter":  true,
+	}, &map[string]any{})
+	waitForPaneBusy(t, c, paneA)
+
 	// Create pane B.
 	var splitB map[string]any
 	c.callToolJSON(t, "split-pane", map[string]any{
@@ -255,6 +263,14 @@ func TestScenario_ChannelMultiPaneMonitoring(t *testing.T) {
 		"direction": "horizontal",
 	}, &splitB)
 	paneB := splitB["paneId"].(string)
+
+	// Occupy paneB so split-pane from paneB won't reuse paneA again.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId": paneB,
+		"keys":   "cat",
+		"enter":  true,
+	}, &map[string]any{})
+	waitForPaneBusy(t, c, paneB)
 
 	// Create pane C.
 	var splitC map[string]any
@@ -264,13 +280,32 @@ func TestScenario_ChannelMultiPaneMonitoring(t *testing.T) {
 	}, &splitC)
 	paneC := splitC["paneId"].(string)
 
+	// Exit cat in panes A and B, then wait until both are back at a shell
+	// prompt before driving them — a fixed sleep raced against prompt redraw.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId":  paneA,
+		"keys":    "C-d",
+		"literal": false,
+	}, &map[string]any{})
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId":  paneB,
+		"keys":    "C-d",
+		"literal": false,
+	}, &map[string]any{})
+	waitForPaneIdle(t, c, paneA)
+	waitForPaneIdle(t, c, paneB)
+
 	drainNotifications(c)
 
-	// Pane A: start-and-watch with a readiness message.
+	// Pane A: start-and-watch with a readiness message. start-and-watch
+	// captures its baseline after sending the command, so an instantaneous
+	// echo can land in the baseline and never register as new output. A short
+	// sleep before the echo guarantees the readiness line is printed *during*
+	// monitoring (same approach as TestScenario_ChannelBuildMonitoring).
 	var resultA map[string]any
 	c.callToolJSON(t, "start-and-watch", map[string]any{
 		"paneId":   paneA,
-		"command":  "echo 'pane-a-ready'",
+		"command":  "sleep 0.3 && echo 'pane-a-ready'",
 		"pattern":  "pane-a-ready",
 		"timeout":  10,
 		"triggers": "exit",
@@ -411,6 +446,49 @@ func drainNotifications(c *mcpClient) {
 			return
 		}
 	}
+}
+
+// waitForPaneIdle polls pane-state until the pane is an idle shell at its
+// prompt — the exact condition split-pane's reuse logic checks. It mirrors
+// paneIsIdleShell in tmux.go: a shell foreground process that is also the
+// pane's own process (no child command running). It does NOT key off
+// waitingForInput, which is unreliable across platforms (an idle shell reports
+// false on Linux, true on macOS). Fatal on timeout so a stuck pane surfaces as
+// a failure rather than a silently-skipped wait.
+func waitForPaneIdle(t *testing.T, c *mcpClient, paneID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var state map[string]any
+		c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state)
+		cmd, _ := state["foregroundCmd"].(string)
+		fgPid, _ := state["foregroundPid"].(float64)
+		panePid, _ := state["panePid"].(float64)
+		if isShellProcess(cmd) && fgPid == panePid {
+			return
+		}
+		sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("pane %s did not return to an idle shell prompt within 5s", paneID)
+}
+
+// waitForPaneBusy polls pane-state until the pane's foreground process is no
+// longer a shell — i.e. a launched command has taken over. Used after
+// send-keys that start a process (cat, yes) so the test does not proceed until
+// the process is actually running. Fatal on timeout.
+func waitForPaneBusy(t *testing.T, c *mcpClient, paneID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var state map[string]any
+		c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state)
+		cmd, _ := state["foregroundCmd"].(string)
+		if cmd != "" && !isShellProcess(cmd) {
+			return
+		}
+		sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("pane %s did not start a foreground process within 5s", paneID)
 }
 
 // TestScenario_DevServerWorkflow simulates an agent starting a dev server,
@@ -621,6 +699,15 @@ func TestScenario_MultiPaneOrchestration(t *testing.T) {
 	paneA := sess["paneId"].(string)
 	windowID := sess["windowId"].(string)
 
+	// Occupy paneA so it won't be reused by subsequent splits (pane-reuse
+	// skips panes whose foreground process is not a shell).
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId": paneA,
+		"keys":   "cat",
+		"enter":  true,
+	}, &map[string]any{})
+	waitForPaneBusy(t, c, paneA)
+
 	// Split pane A horizontally → pane B.
 	var splitB map[string]any
 	c.callToolJSON(t, "split-pane", map[string]any{
@@ -629,6 +716,14 @@ func TestScenario_MultiPaneOrchestration(t *testing.T) {
 	}, &splitB)
 	paneB := splitB["paneId"].(string)
 
+	// Occupy paneB so it won't be reused by the next split.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId": paneB,
+		"keys":   "cat",
+		"enter":  true,
+	}, &map[string]any{})
+	waitForPaneBusy(t, c, paneB)
+
 	// Split pane B vertically → pane C.
 	var splitC map[string]any
 	c.callToolJSON(t, "split-pane", map[string]any{
@@ -636,6 +731,21 @@ func TestScenario_MultiPaneOrchestration(t *testing.T) {
 		"direction": "vertical",
 	}, &splitC)
 	paneC := splitC["paneId"].(string)
+
+	// Exit cat in panes A and B, then wait until both are back at a shell
+	// prompt before the rest of the test drives them.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId":  paneA,
+		"keys":    "C-d",
+		"literal": false,
+	}, &map[string]any{})
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId":  paneB,
+		"keys":    "C-d",
+		"literal": false,
+	}, &map[string]any{})
+	waitForPaneIdle(t, c, paneA)
+	waitForPaneIdle(t, c, paneB)
 
 	// Verify we have 3 panes.
 	var panes []map[string]any
@@ -776,4 +886,211 @@ func TestScenario_ProcessLifecycle(t *testing.T) {
 		t.Fatalf("step 3: expected isAlive=true after sleep, got %v", state3["isAlive"])
 	}
 	t.Logf("step 3 (after sleep): foregroundCmd=%v waitingForInput=%v", state3["foregroundCmd"], state3["waitingForInput"])
+}
+
+// ---- Pane-reuse tests ----
+
+// TestScenario_SplitPaneReusesIdlePane verifies that split-pane reuses an
+// existing idle pane in the same window instead of creating a new split.
+func TestScenario_SplitPaneReusesIdlePane(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	c := newMCPClient(t)
+	sess := createSession(t, c, uniqueSession(t))
+	paneA := sess["paneId"].(string)
+
+	// Split paneA → get paneB (new pane, should not be reused).
+	var splitB map[string]any
+	c.callToolJSON(t, "split-pane", map[string]any{
+		"paneId":    paneA,
+		"direction": "horizontal",
+	}, &splitB)
+	paneB := splitB["paneId"].(string)
+	if paneB == "" {
+		t.Fatal("split-pane returned empty paneId for paneB")
+	}
+	reusedB, _ := splitB["reused"].(bool)
+	t.Logf("first split: paneB=%s reused=%v", paneB, reusedB)
+
+	// Leave paneB idle (shell at prompt). Poll until it is genuinely an idle
+	// shell (foreground == the shell itself, no transient prompt-hook child).
+	waitForPaneIdle(t, c, paneB)
+
+	// Split paneA again → should reuse paneB since it's idle.
+	var splitReuse map[string]any
+	c.callToolJSON(t, "split-pane", map[string]any{
+		"paneId":    paneA,
+		"direction": "horizontal",
+	}, &splitReuse)
+	reusedPane := splitReuse["paneId"].(string)
+	reusedFlag, _ := splitReuse["reused"].(bool)
+
+	t.Logf("second split: paneId=%s reused=%v", reusedPane, reusedFlag)
+
+	if reusedPane != paneB {
+		t.Fatalf("expected reused paneId=%s, got %s", paneB, reusedPane)
+	}
+	if !reusedFlag {
+		t.Fatalf("expected reused=true, got false")
+	}
+}
+
+// TestScenario_SplitPaneCreatesNewWhenAllBusy verifies that split-pane creates
+// a new pane when all existing sibling panes are busy (running a process).
+func TestScenario_SplitPaneCreatesNewWhenAllBusy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	c := newMCPClient(t)
+	sess := createSession(t, c, uniqueSession(t))
+	paneA := sess["paneId"].(string)
+
+	// Split paneA → get paneB.
+	var splitB map[string]any
+	c.callToolJSON(t, "split-pane", map[string]any{
+		"paneId":    paneA,
+		"direction": "horizontal",
+	}, &splitB)
+	paneB := splitB["paneId"].(string)
+	if paneB == "" {
+		t.Fatal("split-pane returned empty paneId for paneB")
+	}
+
+	// Start an external process in paneB to make it busy.
+	// Use `yes > /dev/null` which spawns a real foreground process that is
+	// actively running (not in interruptible sleep), so pane-state detects
+	// it as not waiting for input.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId": paneB,
+		"keys":   "yes > /dev/null",
+		"enter":  true,
+	}, &map[string]any{})
+	sleep(1000 * time.Millisecond)
+
+	// Verify paneB is busy (not waiting for input).
+	var busyState map[string]any
+	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneB}, &busyState)
+	t.Logf("paneB state: waitingForInput=%v foregroundCmd=%v", busyState["waitingForInput"], busyState["foregroundCmd"])
+
+	// Split paneA again → should create a NEW pane since paneB is busy.
+	var splitC map[string]any
+	c.callToolJSON(t, "split-pane", map[string]any{
+		"paneId":    paneA,
+		"direction": "horizontal",
+	}, &splitC)
+	paneC := splitC["paneId"].(string)
+	reusedFlag, _ := splitC["reused"].(bool)
+
+	t.Logf("split while busy: paneC=%s reused=%v", paneC, reusedFlag)
+
+	if paneC == paneB {
+		t.Fatalf("expected a new pane, but got busy paneB=%s", paneB)
+	}
+	if reusedFlag {
+		t.Fatalf("expected reused=false for new pane, got true")
+	}
+
+	// Clean up: send C-c to paneB to stop yes.
+	exec.Command("tmux", "send-keys", "-t", paneB, "C-c", "").Run() //nolint:errcheck
+}
+
+// TestScenario_SplitPaneReusesCorrectPaneAmongMultiple verifies that when
+// multiple sibling panes exist, split-pane reuses an idle one and skips busy ones.
+func TestScenario_SplitPaneReusesCorrectPaneAmongMultiple(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	c := newMCPClient(t)
+	sess := createSession(t, c, uniqueSession(t))
+	paneA := sess["paneId"].(string)
+
+	// Make paneA busy so that subsequent splits cannot reuse it.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId": paneA,
+		"keys":   "yes > /dev/null",
+		"enter":  true,
+	}, &map[string]any{})
+	sleep(500 * time.Millisecond)
+
+	// Split paneA → paneB (new pane, paneA is busy so no reuse).
+	var splitB map[string]any
+	c.callToolJSON(t, "split-pane", map[string]any{
+		"paneId":    paneA,
+		"direction": "horizontal",
+	}, &splitB)
+	paneB := splitB["paneId"].(string)
+	if paneB == "" {
+		t.Fatal("split-pane returned empty paneId for paneB")
+	}
+	t.Logf("created paneB=%s reused=%v", paneB, splitB["reused"])
+
+	// Make paneB busy too.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId": paneB,
+		"keys":   "yes > /dev/null",
+		"enter":  true,
+	}, &map[string]any{})
+	sleep(500 * time.Millisecond)
+
+	// Split paneA → paneC (new pane, both paneA and paneB are busy).
+	var splitC map[string]any
+	c.callToolJSON(t, "split-pane", map[string]any{
+		"paneId":    paneA,
+		"direction": "vertical",
+	}, &splitC)
+	paneC := splitC["paneId"].(string)
+	if paneC == "" {
+		t.Fatal("split-pane returned empty paneId for paneC")
+	}
+	t.Logf("created paneC=%s reused=%v", paneC, splitC["reused"])
+
+	// Now we have 3 panes: paneA (busy), paneB (busy), paneC (idle).
+	// Stop paneB's busy process to leave it idle too, but keep paneA busy.
+	exec.Command("tmux", "send-keys", "-t", paneB, "C-c", "").Run() //nolint:errcheck
+	sleep(500 * time.Millisecond)
+
+	// Now: paneA=busy, paneB=idle, paneC=idle.
+	// Make paneB busy again.
+	c.callToolJSON(t, "send-keys", map[string]any{
+		"paneId": paneB,
+		"keys":   "yes > /dev/null",
+		"enter":  true,
+	}, &map[string]any{})
+	sleep(500 * time.Millisecond)
+
+	// Now: paneA=busy, paneB=busy, paneC=idle.
+	var stateA map[string]any
+	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneA}, &stateA)
+	t.Logf("paneA: waitingForInput=%v foregroundCmd=%v", stateA["waitingForInput"], stateA["foregroundCmd"])
+
+	var stateB map[string]any
+	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneB}, &stateB)
+	t.Logf("paneB: waitingForInput=%v foregroundCmd=%v", stateB["waitingForInput"], stateB["foregroundCmd"])
+
+	var stateC map[string]any
+	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneC}, &stateC)
+	t.Logf("paneC: waitingForInput=%v foregroundCmd=%v", stateC["waitingForInput"], stateC["foregroundCmd"])
+
+	// Split paneA → should reuse paneC (the only idle one among siblings).
+	var splitReuse map[string]any
+	c.callToolJSON(t, "split-pane", map[string]any{
+		"paneId":    paneA,
+		"direction": "horizontal",
+	}, &splitReuse)
+	reusedPane := splitReuse["paneId"].(string)
+	reusedFlag, _ := splitReuse["reused"].(bool)
+
+	t.Logf("split with mixed panes: reusedPane=%s reused=%v", reusedPane, reusedFlag)
+
+	if !reusedFlag {
+		t.Fatalf("expected reused=true, got false")
+	}
+	if reusedPane != paneC {
+		t.Fatalf("expected to reuse idle paneC=%s, got %s", paneC, reusedPane)
+	}
+
+	// Clean up: send C-c to busy panes.
+	exec.Command("tmux", "send-keys", "-t", paneA, "C-c", "").Run() //nolint:errcheck
+	exec.Command("tmux", "send-keys", "-t", paneB, "C-c", "").Run() //nolint:errcheck
 }
