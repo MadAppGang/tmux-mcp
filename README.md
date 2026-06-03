@@ -4,7 +4,7 @@ Agent-oriented MCP server for tmux — native process detection, smart triggers,
 
 ## Quick start
 
-**Prerequisites**: tmux installed, Go 1.21+ or a pre-built binary.
+**Prerequisites**: tmux installed, Go 1.26.1+ or a pre-built binary.
 
 ```bash
 # Install via Go
