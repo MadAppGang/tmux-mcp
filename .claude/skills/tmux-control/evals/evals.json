@@ -1,0 +1,34 @@
+{
+  "skill_name": "tmux-control",
+  "notes": "Each PROMPT uses a {{SOCKET}} placeholder. At spawn time, replace it with a UNIQUE socket per run (e.g. eval0-skill, eval0-base) — never share a socket between the with-skill and baseline arms, because tmux config loads only at server start: whichever run creates the server first decides whether -f /dev/null matters, which would invert eval 0's measurement. Every run must prefix every tmux call with its -L socket, never touch the default server, and kill-server its socket first (clear stale) and last (teardown).",
+  "evals": [
+    {
+      "id": 0,
+      "name": "isolated-sandbox-survives-resurrect",
+      "prompt": "I want to run a quick sandboxed command in tmux that stays completely separate from my own tmux sessions — I have a bunch of work sessions open and use tmux-resurrect/continuum, and I do NOT want this throwaway job to show up among them or get saved into my restore state. Using a tmux server on the socket named '{{SOCKET}}', start a detached session, run `printf 'sandbox-ran\\n'` in it, then show me the output. Then run `tmux -L {{SOCKET}} list-sessions` and confirm it shows ONLY the session you created — nothing of mine. Finally tear the whole thing down. Don't touch my default tmux server at all.",
+      "expected_output": "Agent creates the server with `-f /dev/null` (so resurrect/continuum config doesn't restore the user's sessions), runs the command, captures 'sandbox-ran', shows list-sessions containing only its own session, and kill-servers the socket. Baseline likely omits -f /dev/null, so list-sessions would be polluted by restored user sessions.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "capture-exit-code-from-pane",
+      "prompt": "On an isolated tmux server (socket '{{SOCKET}}'), run the command `bash -c 'echo doing-work; exit 3'` in a pane and tell me the exact numeric exit code it returned. A pane normally vanishes when its command finishes, so make sure you can actually read the exit status. Then clean up the server.",
+      "expected_output": "Agent retrieves exit code 3 reliably — either via `remain-on-exit on` + reading `#{pane_dead_status}`, or by echoing a sentinel like `echo RC=$?` / signalling `wait-for` and parsing it. Reports 3. Tears down the socket. Baseline may lose the output when the pane closes and fail to get a definitive code.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "id-capture-and-run-and-read",
+      "prompt": "On an isolated tmux server (socket '{{SOCKET}}'), set up two panes: one running `seq 1 5` and one running `printf 'second-pane\\n'`. Capture the output of BOTH panes and show it to me, clearly labeling which pane is which. Then kill the server. I'll be creating and removing panes during this so make sure you address each pane reliably and don't mix them up.",
+      "expected_output": "Agent captures each pane's id at creation with `-P -F '#{pane_id}'`, addresses each by its `%id` (not a shifting index), reads both panes' output, labels them correctly (1..5 vs second-pane), and kills the server. Baseline may address by brittle index and conflate panes.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "situational-awareness-survey-and-reuse",
+      "prompt": "Set up a scenario on an isolated tmux server (socket '{{SOCKET}}') that mimics a window I'm already working in: a session whose first pane is an idle shell (that's 'mine', the user's), plus a second pane running `sleep 200` (a busy app), plus a third idle shell pane that YOU created and marked as yours. Now: survey the window and tell me, for every pane, its id, whether it's free or busy, and whether it belongs to me or to you. Then say which pane you would reuse to run a new command WITHOUT disturbing my panes — and explain why. Don't actually run anything in my panes. Clean up the server when done.",
+      "expected_output": "Agent surveys with one list-panes -F covering pane_id/pane_current_command/@owned_by; correctly classifies each pane free-vs-busy from the foreground command (shell=free, sleep=busy) and ownership from a pane-scoped @owned_by marker it set with `-p`; identifies its OWN idle pane as the one to reuse and refuses to touch the user's panes. Baseline lacks the ownership marker concept, may set the option without -p (leaking it to all panes), and may not infer free/busy from pane_current_command.",
+      "files": []
+    }
+  ]
+}

@@ -483,6 +483,19 @@ chmod +x /path/to/tmux-mcp
 /path/to/tmux-mcp --help    # verify it starts
 ```
 
+## Bundled agent skill: tmux-control
+
+The repo ships a Claude Code project skill at `.claude/skills/tmux-control/` that
+teaches an agent to drive **raw tmux from the shell** — complementary to this MCP
+server. Use the MCP tools for structured, watched interactions; use the skill
+when an agent needs direct tmux primitives (relative-to-self pane management,
+anchored exit-sentinel run-and-watch, isolated `-L` servers that survive
+tmux-resurrect/continuum via `-f /dev/null`, pane ownership marking with
+pane-scoped options).
+
+The skill's guidance is empirically verified on tmux 3.6a and was refined
+through blind multi-model review (see `.claude/skills/tmux-control/evals/`).
+
 ## License
 
 MIT
