@@ -23,3 +23,28 @@ ai-docs/
 .mnemex/
 gtd/sessions/
 .agents/
+
+# Added by claudeup
+# Local claudemem indexes are generated from the repo and should not be committed.
+
+# Added by claudeup
+# Team Claude settings should be committed so everyone gets the same project behavior.
+!/.claude/
+!/.claude/settings.json
+# Statusline worktree markers are local runtime state.
+.claude/.statusline-worktree-*
+# Claude cache contents are local generated data and can grow quickly.
+.claude/cache/
+# Runtime lock files are local process state and should be regenerated locally.
+.claude/scheduled_tasks.lock
+# Personal Claude settings belong to each developer and should not be shared.
+.claude/settings.local.json
+
+# Skill eval workspaces are throwaway test output (transcripts, gradings, review HTML).
+.claude/skills/*-workspace/
+# Coaching plugin runtime state — local, not for sharing.
+.claude/.coaching/
+**/.coaching/
+# Personal Claude state (per-developer, not shared)
+.claude/gtd/
+.claude/multimodel-team.json

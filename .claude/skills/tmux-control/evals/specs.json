@@ -1,0 +1,50 @@
+{
+  "skill_name": "tmux-control",
+  "contract": "Each run writes two machine-readable artifacts and nothing graded comes from prose: (1) commands.txt — every tmux command verbatim, one per line; (2) outcome.txt — the exact literal output that decides pass/fail, captured AFTER the work but BEFORE kill-server. Grading diffs outcome.txt against the desired literal and checks commands.txt for the key technique substring. Each eval run uses its own unique -L socket and never touches the default server.",
+  "evals": [
+    {
+      "id": 0,
+      "name": "isolated-sandbox-survives-resurrect",
+      "goal": "Run a throwaway command in an isolated tmux server that resurrect/continuum cannot repopulate, so the sandbox contains ONLY the session we created.",
+      "key_technique": "-f /dev/null",
+      "expected_command": "tmux -L <sock> -f /dev/null new-session -d -s sandbox",
+      "outcome_capture": "tmux -L <sock> list-sessions   (write its raw stdout to outcome.txt, before kill-server)",
+      "desired_outcome_literal": "exactly one session line, whose name is the one we created (e.g. 'sandbox'); NO other session names present",
+      "pass_if": "outcome.txt has exactly 1 session line AND commands.txt contains '-f /dev/null'",
+      "discriminator": "A run WITHOUT -f /dev/null gets continuum-restored sessions -> outcome.txt shows many session lines (polluted). With it -> exactly 1."
+    },
+    {
+      "id": 1,
+      "name": "capture-exit-code-from-pane",
+      "goal": "Read the exact numeric exit code (3) of a command whose pane vanishes on completion.",
+      "key_technique": "wait-for|remain-on-exit",
+      "expected_command": "either: run cmd then `echo RC=$?` + `tmux wait-for -S done`/`tmux wait-for done` then capture; OR set `remain-on-exit on` and read `#{pane_dead_status}`",
+      "outcome_capture": "the exit code the agent extracted (write just the number, e.g. '3', to outcome.txt)",
+      "desired_outcome_literal": "3",
+      "pass_if": "outcome.txt == '3' AND commands.txt contains 'wait-for' OR 'remain-on-exit'",
+      "discriminator": "Naive run loses the exit status when the pane closes -> cannot produce a definitive 3."
+    },
+    {
+      "id": 2,
+      "name": "id-capture-and-run-and-read",
+      "goal": "Run a command in each of two panes and read both outputs back without mixing the panes up, addressing each by its stable %id.",
+      "key_technique": "-P -F",
+      "expected_command": "P1=$(tmux -L <sock> ... new-session/split -P -F '#{pane_id}'); address every later command by -t $P1 / -t $P2",
+      "outcome_capture": "the two captured pane bodies, labeled, written to outcome.txt as 'pane1:\\n1\\n2\\n3\\n4\\n5\\npane2:\\nsecond-pane'",
+      "desired_outcome_literal": "pane running seq 1 5 -> lines 1 2 3 4 5; pane running printf -> 'second-pane'; correctly attributed to their panes",
+      "pass_if": "outcome.txt contains '1\\n2\\n3\\n4\\n5' attributed to one pane AND 'second-pane' to the other AND commands.txt contains '-P -F'",
+      "discriminator": "Index-based addressing (base-index shifts) can swap which pane is which."
+    },
+    {
+      "id": 3,
+      "name": "situational-awareness-survey-and-reuse",
+      "goal": "Survey a 3-pane window and classify each pane as free/busy and mine/user's, then pick the agent's OWN idle pane to reuse without disturbing the user's panes.",
+      "key_technique": "set-option -p",
+      "expected_command": "mark agent pane: `tmux -L <sock> set-option -p -t <pane> @owned_by agent`; survey: `tmux -L <sock> list-panes -F '#{pane_id} #{pane_current_command} #{@owned_by}'`",
+      "outcome_capture": "the raw list-panes survey line for all 3 panes PLUS one line 'REUSE: <pane-id>' stating the chosen pane, written to outcome.txt",
+      "desired_outcome_literal": "3 panes surveyed: a user shell (free, unmarked), a user pane running sleep (busy, unmarked), an agent shell (free, @owned_by=agent); REUSE line names the agent's own free shell pane",
+      "pass_if": "survey shows @owned_by=agent on exactly the agent's pane AND that pane's command is a shell AND the REUSE line names that pane AND commands.txt contains 'set-option -p'",
+      "discriminator": "Without -p the ownership option is set session-wide and leaks to ALL panes -> survey shows every pane as owned, making the reuse choice unsafe/ambiguous."
+    }
+  ]
+}
