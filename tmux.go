@@ -453,6 +453,12 @@ func (t *tmuxClient) CreateWindow(ctx context.Context, sessionID, name string) (
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("unexpected tmux output: %q", out)
 	}
+	// A new window comes with a pane, and we made it — claim it, exactly as
+	// SplitPane and createSessionOnSocket do. Without this the pane is
+	// indistinguishable from one of the user's, so it could never be reused.
+	// markPaneOwned wants the bare ID, so call it before prefixing.
+	_ = t.markPaneOwned(ctx, socket, parts[2])
+
 	prefix := ""
 	if socket != "" {
 		prefix = headlessPrefix

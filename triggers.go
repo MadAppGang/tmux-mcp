@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/acarl005/stripansi"
 	"github.com/mark3labs/mcp-go/server"
@@ -286,17 +287,51 @@ type WatchResult struct {
 // The command can be echoed more than once: a plain shell echoes it as it is
 // accepted, and a prompt that redraws the accepted command line (powerlevel10k
 // does) echoes it a second time. Both echoes are contiguous and precede any real
-// output, so drop leading lines while they still contain the command — but never
-// scan past the first line that does not, or a command whose genuine output
-// repeats its own name would be swallowed.
+// output, so drop leading lines for as long as they are echoes — and stop at the
+// first line that is not, because everything from there on is the command's own
+// output.
 func dropEcho(lines []string, cmd string) []string {
 	if cmd == "" {
 		return lines
 	}
-	for len(lines) > 0 && strings.Contains(lines[0], cmd) {
+	for len(lines) > 0 && isCommandEcho(lines[0], cmd) {
 		lines = lines[1:]
 	}
 	return lines
+}
+
+// promptSigils are the characters a shell prompt conventionally ends with, just
+// before the command the user typed.
+const promptSigils = "$%#>❯»›➜λ"
+
+// isCommandEcho reports whether line is the shell echoing back cmd, rather than
+// output the command itself produced.
+//
+// Merely containing the command is not enough to decide, and treating it as
+// enough is a bug: a server started with `./serve` that logs "ready: ./serve"
+// would have its readiness line deleted as if it were an echo, and the caller
+// waiting on that line would time out against a server that started perfectly
+// well.
+//
+// What distinguishes an echo is not the command but what sits in front of it: an
+// echo is the command typed at a prompt, so everything preceding it is either
+// nothing at all or a prompt, which conventionally ends in one of promptSigils.
+// In "ready: ./serve" the command is preceded by "ready:", which is no prompt, so
+// the line is output and survives.
+//
+// Anything trailing the command is ignored, because a prompt may redraw the
+// accepted line with decoration after it (a right-aligned clock, for instance).
+func isCommandEcho(line, cmd string) bool {
+	idx := strings.Index(line, cmd)
+	if idx < 0 {
+		return false
+	}
+	prefix := strings.TrimRight(line[:idx], " \t")
+	if prefix == "" {
+		return true // the bare echo, with no prompt in front of it
+	}
+	last, _ := utf8.DecodeLastRuneInString(prefix)
+	return strings.ContainsRune(promptSigils, last)
 }
 
 // monitorPane runs the smart trigger-based monitoring loop, taking its own

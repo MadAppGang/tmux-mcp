@@ -90,29 +90,114 @@ func TestErrorTriggerIgnoresFailWithinAWord(t *testing.T) {
 }
 
 // TestDropEcho covers stripping the shell's echo of the command we typed.
+//
+// The hard half is not removing the echo — it is knowing where the echo stops
+// and the command's own output begins.
 func TestDropEcho(t *testing.T) {
-	cmd := "npm run test:failfast"
-
-	// The echo is the first line and goes.
-	lines := []string{"~/app $ " + cmd, "PASS src/a.test.ts"}
-	got := dropEcho(lines, cmd)
-	if len(got) != 1 || got[0] != "PASS src/a.test.ts" {
-		t.Errorf("dropEcho did not strip the echoed command line: %q", got)
+	tests := []struct {
+		name string
+		cmd  string
+		in   []string
+		want []string
+	}{
+		{
+			name: "the echo at a prompt is stripped",
+			cmd:  "npm run test:failfast",
+			in:   []string{"~/app $ npm run test:failfast", "PASS src/a.test.ts"},
+			want: []string{"PASS src/a.test.ts"},
+		},
+		{
+			name: "a bare echo with no prompt in front of it is stripped",
+			cmd:  "npm run dev",
+			in:   []string{"npm run dev", "ready in 300ms"},
+			want: []string{"ready in 300ms"},
+		},
+		{
+			// What a powerlevel10k pane actually produces: the raw echo, and then
+			// the prompt redrawing the accepted line. Both have to go.
+			name: "both copies of a redrawn echo are stripped",
+			cmd:  `printf 'server up\n'`,
+			in: []string{
+				`printf 'server up\n'`,
+				`❯ printf 'server up\n'`,
+				"server up",
+			},
+			want: []string{"server up"},
+		},
+		{
+			// The regression. Genuine output may contain the command verbatim.
+			// "ready:" is not a prompt, so this line is output and must survive —
+			// it is the very line a caller watching for "^ready:" is waiting on,
+			// and deleting it makes a healthy server look like a timeout.
+			name: "output containing the command is not an echo",
+			cmd:  "./serve",
+			in:   []string{"❯ ./serve", "ready: ./serve"},
+			want: []string{"ready: ./serve"},
+		},
+		{
+			name: "a redraw decorated with a trailing clock is still an echo",
+			cmd:  "make build",
+			in:   []string{"~/p main ❯ make build                    11:59:03 PM", "compiling"},
+			want: []string{"compiling"},
+		},
+		{
+			name: "a later line repeating the command is real output",
+			cmd:  "npm run dev",
+			in:   []string{"ready in 300ms", "hint: rerun with npm run dev"},
+			want: []string{"ready in 300ms", "hint: rerun with npm run dev"},
+		},
+		{
+			name: "no command (watch-pane) changes nothing",
+			cmd:  "",
+			in:   []string{"npm run dev", "ready"},
+			want: []string{"npm run dev", "ready"},
+		},
+		{
+			name: "no lines",
+			cmd:  "npm run dev",
+			in:   nil,
+			want: nil,
+		},
 	}
 
-	// A later line that happens to repeat the command is real output and stays.
-	lines = []string{"PASS src/a.test.ts", "hint: rerun with " + cmd}
-	got = dropEcho(lines, cmd)
-	if len(got) != 2 {
-		t.Errorf("dropEcho swallowed real output: %q", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dropEcho(tc.in, tc.cmd)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("dropEcho(%q, %q)\n got: %q\nwant: %q", tc.in, tc.cmd, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCreateWindowMarksItsPane closes the last gap in the ownership invariant:
+// every pane the server creates must be marked, or it can never be reused.
+// SplitPane and createSessionOnSocket did this; CreateWindow did not.
+func TestCreateWindowMarksItsPane(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	client := newTmuxClient("bash")
+	ctx := context.Background()
+
+	name := uniqueSession(t)
+	sess, err := client.CreateSession(ctx, name)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	defer exec.Command("tmux", "kill-session", "-t", name).Run() //nolint:errcheck
+
+	win, err := client.CreateWindow(ctx, sess.SessionID, "work")
+	if err != nil {
+		t.Fatalf("create window: %v", err)
 	}
 
-	// No command (watch-pane) and no lines are both no-ops.
-	if got := dropEcho(lines, ""); len(got) != 2 {
-		t.Errorf("dropEcho with no command should not change the lines: %q", got)
+	owned, err := client.ownedPanesInWindow(ctx, win.WindowID)
+	if err != nil {
+		t.Fatalf("ownedPanesInWindow: %v", err)
 	}
-	if got := dropEcho(nil, cmd); got != nil {
-		t.Errorf("dropEcho(nil) = %q, want nil", got)
+	if !owned[win.PaneID] {
+		t.Errorf("pane %s came from create-window, so it is ours, but it is not marked owned", win.PaneID)
 	}
 }
 
@@ -456,6 +541,10 @@ func TestDetachedSessionIsNotEightyColumns(t *testing.T) {
 	width := int(panes[0]["width"].(float64))
 	if width != detachedWidth {
 		t.Errorf("detached pane is %d columns wide, want %d (80 wraps long output lines)", width, detachedWidth)
+	}
+	height := int(panes[0]["height"].(float64))
+	if height != detachedHeight {
+		t.Errorf("detached pane is %d rows tall, want %d (24 gives almost no scrollback to read)", height, detachedHeight)
 	}
 }
 
