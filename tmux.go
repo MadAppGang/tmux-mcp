@@ -72,6 +72,13 @@ type CreatedPane struct {
 // headlessSocket is the tmux socket name used for isolated headless sessions.
 const headlessSocket = "mcp-headless"
 
+// Size given to sessions we create detached. tmux would otherwise use
+// default-size (80x24), which wraps long output lines. See createSessionOnSocket.
+const (
+	detachedWidth  = 200
+	detachedHeight = 50
+)
+
 // CleanStaleHeadlessSocket checks if the headless tmux socket exists but the
 // server behind it is dead (e.g. after a crash). If so, it runs kill-server to
 // clean up the stale socket so a fresh server can be started.
@@ -79,15 +86,38 @@ func CleanStaleHeadlessSocket() {
 	// Try to list sessions on the headless socket. If the server is alive this
 	// succeeds (or returns "no sessions"). If the socket is stale, tmux returns
 	// an error like "no server running on ...".
-	cmd := exec.Command("tmux", "-L", headlessSocket, "list-sessions")
+	//
+	// Both commands go through socketArgs because either can be the one that
+	// starts the server, and a server started without -f /dev/null would load
+	// the user's config. See socketArgs.
+	cmd := exec.Command("tmux", append(socketArgs(headlessSocket), "list-sessions")...)
 	if err := cmd.Run(); err != nil {
 		// Server is not running — kill-server will clean up any stale socket file.
-		_ = exec.Command("tmux", "-L", headlessSocket, "kill-server").Run()
+		_ = exec.Command("tmux", append(socketArgs(headlessSocket), "kill-server")...).Run()
 	}
 }
 
 // headlessPrefix is the ID prefix that identifies headless targets.
 const headlessPrefix = "headless:"
+
+// Pane options we set on every pane we create. They are read back to decide
+// whether a pane is ours to reuse or kill.
+//
+// paneOptWitness holds the pane's own ID and exists to make a record
+// self-certifying: a record counts only when its witness equals the pane it was
+// read from. That is not redundant with the -p (pane-scoped) flag — it is the
+// backstop for a missing one. tmux user options inherit down the scope chain
+// when interpolated in a pane-context format string, so an option set at
+// session scope (any set-option that forgets -p) resolves for *every* pane in
+// that session. Without the witness, one such slip would make all of the user's
+// panes look agent-owned, and pane reuse would then run commands in their
+// shell. A single option value can equal only one pane's ID, so the witness
+// makes that failure structurally impossible rather than merely unlikely.
+const (
+	paneOptWitness = "@mcp_pane"
+	paneOptOwner   = "@mcp_owner"
+	ownerAgent     = "agent"
+)
 
 // tmuxClient wraps tmux CLI interactions.
 type tmuxClient struct {
@@ -108,30 +138,47 @@ func parseTarget(target string) (socket string, id string) {
 	return "", target
 }
 
+// socketArgs returns the global tmux flags that must precede a subcommand in
+// order to target the given socket. An empty socket means the default server,
+// which needs no flags.
+//
+// The "-f /dev/null" is what makes the headless server actually isolated. tmux
+// reads a configuration file when a server first starts, so without this flag
+// the very first command on the headless socket loads the user's ~/.tmux.conf —
+// and a config using tmux-resurrect/tmux-continuum (or any run-shell that
+// creates sessions) then restores the user's entire workspace *into* the
+// supposedly isolated server. Passing the flag on every command is harmless,
+// because a running server does not re-read its config, and it removes any
+// question of which command happens to start the server.
+//
+// The flag must go here, in the global prefix, and nowhere else: tmux overloads
+// -f by position. "tmux -f /dev/null new-session" names a config file, but
+// "new-session -f /dev/null" would parse /dev/null as the new session's *client
+// flags*, and "split-window -f" is a full-width split.
+func socketArgs(socket string) []string {
+	if socket == "" {
+		return nil
+	}
+	return []string{"-L", socket, "-f", os.DevNull}
+}
+
 // run executes a tmux command and returns its combined output.
 func (t *tmuxClient) run(ctx context.Context, args ...string) (string, error) {
 	return t.runWithSocket(ctx, "", args...)
 }
 
-// runWithSocket executes a tmux command, optionally routing it to a named
-// socket via "-L <socket>". An empty socket uses the default tmux server.
+// runWithSocket executes a tmux command, routing it to the given socket.
+// An empty socket uses the default tmux server.
 func (t *tmuxClient) runWithSocket(ctx context.Context, socket string, args ...string) (string, error) {
-	if socket != "" {
-		args = append([]string{"-L", socket}, args...)
-	}
-	cmd := exec.CommandContext(ctx, "tmux", args...)
+	full := append(socketArgs(socket), args...)
+	cmd := exec.CommandContext(ctx, "tmux", full...)
 	out, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			subCmd := args[0]
-			if socket != "" {
-				subCmd = args[2] // skip "-L", socket
-			}
-			return "", fmt.Errorf("tmux %s: %w: %s", subCmd, err, strings.TrimSpace(string(exitErr.Stderr)))
-		}
+		// Report against args, not full, so the subcommand name is args[0]
+		// regardless of how many global flags the socket prefixed.
 		subCmd := args[0]
-		if socket != "" {
-			subCmd = args[2]
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("tmux %s: %w: %s", subCmd, err, strings.TrimSpace(string(exitErr.Stderr)))
 		}
 		return "", fmt.Errorf("tmux %s: %w", subCmd, err)
 	}
@@ -308,7 +355,16 @@ func (t *tmuxClient) createSessionOnSocket(ctx context.Context, socket, name, co
 		}
 	}
 
-	args := []string{"new-session", "-d", "-P", "-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{pane_id}"}
+	// A detached session has no client to take its size from, so tmux falls back
+	// to default-size (80x24). At 80 columns a dev server's output wraps, which
+	// silently breaks readiness regexes that expect a match on one line. Ask for
+	// a size that behaves like a real terminal instead.
+	args := []string{
+		"new-session", "-d",
+		"-x", strconv.Itoa(detachedWidth),
+		"-y", strconv.Itoa(detachedHeight),
+		"-P", "-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{pane_id}",
+	}
 	if name != "" {
 		args = append(args, "-s", name)
 	}
@@ -323,12 +379,36 @@ func (t *tmuxClient) createSessionOnSocket(ctx context.Context, socket, name, co
 	if len(parts) != 4 {
 		return nil, fmt.Errorf("unexpected tmux output: %q", out)
 	}
-	return &CreatedSession{
+	created := &CreatedSession{
 		SessionID:   parts[0],
 		SessionName: parts[1],
 		WindowID:    parts[2],
 		PaneID:      parts[3],
-	}, nil
+	}
+	// We made this pane, so claim it. Failure is not fatal: the pane works, it
+	// just won't be a reuse candidate later.
+	_ = t.markPaneOwned(ctx, socket, created.PaneID)
+	return created, nil
+}
+
+// markPaneOwned records that we created a pane, so that reuse and teardown can
+// tell our panes from the user's. tmux itself stores no creator.
+//
+// The -p flag is what scopes an option to a single pane; paneOptWitness is the
+// backstop for ever omitting it. See the constant's doc comment — without the
+// witness, one session-scoped write would make every pane in the user's session
+// look agent-owned.
+//
+// paneID must be a bare tmux ID (no "headless:" prefix), because it is compared
+// against #{pane_id}, which tmux always reports bare.
+func (t *tmuxClient) markPaneOwned(ctx context.Context, socket, paneID string) error {
+	if _, err := t.runWithSocket(ctx, socket,
+		"set-option", "-p", "-t", paneID, paneOptWitness, paneID); err != nil {
+		return err
+	}
+	_, err := t.runWithSocket(ctx, socket,
+		"set-option", "-p", "-t", paneID, paneOptOwner, ownerAgent)
+	return err
 }
 
 // findSessionByName looks up a session by name on the given socket.
@@ -389,7 +469,10 @@ func (t *tmuxClient) CreateWindow(ctx context.Context, sessionID, name string) (
 // Returns a CreatedPane with the new pane ID and its parent window ID.
 func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, size int) (*CreatedPane, error) {
 	socket, bareID := parseTarget(paneID)
-	args := []string{"split-window", "-t", bareID, "-P", "-F", "#{pane_id}\t#{window_id}"}
+	// -d leaves the source pane active. Without it every split moves the user's
+	// cursor into the pane the agent just made, interrupting whatever they were
+	// typing — including, typically, their conversation with the agent.
+	args := []string{"split-window", "-d", "-t", bareID, "-P", "-F", "#{pane_id}\t#{window_id}"}
 	if direction == "horizontal" {
 		args = append(args, "-h")
 	}
@@ -404,6 +487,10 @@ func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, si
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("unexpected tmux output: %q", out)
 	}
+	if e := t.markPaneOwned(ctx, socket, parts[0]); e != nil {
+		fmt.Fprintf(os.Stderr, "DEBUG markPaneOwned(%q) FAILED: %v\n", parts[0], e)
+	}
+
 	prefix := ""
 	if socket != "" {
 		prefix = headlessPrefix
@@ -463,13 +550,11 @@ func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string)
 	}
 
 	// Block until the command signals completion or the context is cancelled.
-	// The wait-for must target the same tmux server that the pane lives on.
-	var waitErr error
-	if socket != "" {
-		waitErr = exec.CommandContext(ctx, "tmux", "-L", socket, "wait-for", waitChannel).Run()
-	} else {
-		waitErr = exec.CommandContext(ctx, "tmux", "wait-for", waitChannel).Run()
-	}
+	// The wait-for must target the same tmux server that the pane lives on, and
+	// goes through socketArgs because wait-for will itself start a server if
+	// none is running. See socketArgs.
+	waitArgs := append(socketArgs(socket), "wait-for", waitChannel)
+	waitErr := exec.CommandContext(ctx, "tmux", waitArgs...).Run()
 	if waitErr != nil {
 		if ctx.Err() != nil {
 			// Bug 2 fix: on timeout, return partial output instead of a bare error.
@@ -694,22 +779,71 @@ func (t *tmuxClient) getWindowIDForPane(ctx context.Context, paneID string) (str
 	return id, nil
 }
 
-// findIdlePaneInWindow finds an idle (shell at prompt) pane in the same window
-// as sourcePaneID, excluding the source pane itself. Returns the pane ID if
-// found, or empty string if no idle pane is available.
+// ownedPanesInWindow returns the panes in the window that we created, keyed by
+// the same (possibly "headless:"-prefixed) ID that ListPanes reports.
 //
-// A pane is considered idle when it is alive and its foreground process is the
-// shell itself sitting at a prompt — i.e. no child command has taken over the
-// terminal. We detect that with paneIsIdleShell rather than WaitingForInput,
-// because WaitingForInput is not reliable across platforms: an idle interactive
-// shell reports waitingForInput=false on Linux (readline blocks in poll/select,
-// not n_tty_read) while reporting true on macOS. The "shell is the foreground
-// process" signal is consistent on both and is also strictly more correct — a
-// pane running `bash script.sh` has a child in the foreground and is not idle.
+// A pane counts as ours only when its witness equals its own ID *and* it is
+// marked as agent-owned. Requiring the witness is what makes the check safe
+// against a session-scoped option leak — see paneOptWitness.
+func (t *tmuxClient) ownedPanesInWindow(ctx context.Context, windowID string) (map[string]bool, error) {
+	socket, bareID := parseTarget(windowID)
+	out, err := t.runWithSocket(ctx, socket, "list-panes", "-t", bareID,
+		"-F", fmt.Sprintf("#{pane_id}\t#{%s}\t#{%s}", paneOptWitness, paneOptOwner))
+	if err != nil {
+		return nil, err
+	}
+	prefix := ""
+	if socket != "" {
+		prefix = headlessPrefix
+	}
+	owned := make(map[string]bool)
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.Split(line, "\t")
+		if len(parts) != 3 {
+			continue
+		}
+		paneID, witness, owner := parts[0], parts[1], parts[2]
+		if witness == paneID && owner == ownerAgent {
+			owned[prefix+paneID] = true
+		}
+	}
+	return owned, nil
+}
+
+// findIdlePaneInWindow finds a pane in the same window as sourcePaneID that we
+// created and that is now sitting idle, so it can be reused instead of piling
+// up another split. It returns the pane ID, or empty string if there is none.
+//
+// Two conditions, and both are load-bearing.
+//
+// It must be *ours*. tmux records no creator, so we mark the panes we make
+// (markPaneOwned) and treat every unmarked pane as the user's. Reusing an
+// unmarked pane means typing into whatever shell the user left at a prompt —
+// which may be sitting at an `ssh prod`, a `sudo -i`, or a psql session, where
+// "reuse" would execute the agent's command in their privileged context, and a
+// later teardown would kill the pane out from under them. Idle is not the same
+// as free.
+//
+// It must be *idle*, which we take to mean alive with the shell itself as the
+// foreground process — no child command has taken over the terminal. That is
+// paneIsIdleShell rather than WaitingForInput, because WaitingForInput is not
+// consistent across platforms: an idle interactive shell reports
+// waitingForInput=false on Linux (readline blocks in poll/select, not
+// n_tty_read) but true on macOS. The "shell is the foreground process" signal
+// agrees on both, and is strictly more correct anyway — a pane running
+// `bash script.sh` has a child in the foreground and is not idle.
 func (t *tmuxClient) findIdlePaneInWindow(ctx context.Context, sourcePaneID string) (string, error) {
 	windowID, err := t.getWindowIDForPane(ctx, sourcePaneID)
 	if err != nil {
 		return "", fmt.Errorf("get window for pane %s: %w", sourcePaneID, err)
+	}
+
+	owned, err := t.ownedPanesInWindow(ctx, windowID)
+	if err != nil {
+		return "", fmt.Errorf("list owned panes in window %s: %w", windowID, err)
+	}
+	if len(owned) == 0 {
+		return "", nil
 	}
 
 	panes, err := t.ListPanes(ctx, windowID)
@@ -718,7 +852,7 @@ func (t *tmuxClient) findIdlePaneInWindow(ctx context.Context, sourcePaneID stri
 	}
 
 	for _, p := range panes {
-		if p.ID == sourcePaneID {
+		if p.ID == sourcePaneID || !owned[p.ID] {
 			continue
 		}
 		state, err := t.GetPaneState(ctx, p.ID)

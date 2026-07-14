@@ -127,7 +127,16 @@ var shellNames = map[string]bool{
 	"ksh": true, "tcsh": true, "csh": true,
 }
 
-var errorRe = regexp.MustCompile(`(?i)error[: ]|fatal|panic|exception|failed|FAIL`)
+// errorRe matches output that looks like a failure.
+//
+// The case-insensitivity is scoped deliberately. A blanket (?i) over the whole
+// pattern makes the bare FAIL alternative match "fail" as a substring anywhere,
+// so watching `npm run test:failfast` or a command carrying --fail-fast fires an
+// error event against the echoed command line before the command has produced a
+// single byte. FAIL stays case-sensitive and word-bounded, which is what it was
+// there for: the uppercase FAIL that test runners print (`FAIL src/x.test.ts`,
+// `FAIL\tpkg/foo`). Lowercase "failed" is still caught by its own alternative.
+var errorRe = regexp.MustCompile(`(?i:error[: ]|fatal|panic|exception|failed)|\bFAIL\b`)
 
 // buildTrigger constructs a Trigger for the given name string.
 func buildTrigger(name string, client *tmuxClient) *Trigger {
@@ -253,19 +262,46 @@ func buildTrigger(name string, client *tmuxClient) *Trigger {
 // WatchResult is the structured result returned by watch-pane and start-and-watch.
 type WatchResult struct {
 	PaneID    string     `json:"paneId"`
-	Event     string     `json:"event"`            // trigger name or "timeout"
-	Detail    string     `json:"detail"`           // human-readable explanation
-	Elapsed   float64    `json:"elapsed"`          // seconds
-	Output    string     `json:"output"`           // all new content accumulated
+	Event     string     `json:"event"`               // trigger name or "timeout"
+	Detail    string     `json:"detail"`              // human-readable explanation
+	Elapsed   float64    `json:"elapsed"`             // seconds
+	Output    string     `json:"output"`              // all new content accumulated
 	PaneState *PaneState `json:"paneState,omitempty"` // final process state
 }
 
-// monitorPane runs the smart trigger-based monitoring loop.
+// dropEcho removes the shell's echo of a command we just typed from the front of
+// the new-output lines.
 //
-// It polls at mode.PollInterval, checks all triggers each tick, accumulates
-// new output, and sends progress notifications based on the mode's thresholds.
-// It returns when a trigger fires, the timeout expires, or the context is
-// cancelled.
+// The pane displays the typed command line before the command emits anything, so
+// with a correctly-taken baseline that echo is the first new output — and the
+// error and pattern triggers would otherwise match against the command text
+// itself. Watching `npm run test:failfast` would fire an error event, and
+// start-and-watch(command: "npm run dev", pattern: "dev") would report ready
+// before the server had started.
+//
+// (Until the baseline race was fixed, the echo landed inside the baseline by
+// accident, so one bug was concealing the other. Fixing only the race would have
+// shipped this one.)
+//
+// The command can be echoed more than once: a plain shell echoes it as it is
+// accepted, and a prompt that redraws the accepted command line (powerlevel10k
+// does) echoes it a second time. Both echoes are contiguous and precede any real
+// output, so drop leading lines while they still contain the command — but never
+// scan past the first line that does not, or a command whose genuine output
+// repeats its own name would be swallowed.
+func dropEcho(lines []string, cmd string) []string {
+	if cmd == "" {
+		return lines
+	}
+	for len(lines) > 0 && strings.Contains(lines[0], cmd) {
+		lines = lines[1:]
+	}
+	return lines
+}
+
+// monitorPane runs the smart trigger-based monitoring loop, taking its own
+// baseline from the pane's current contents. This is the watch-pane entry point:
+// no command is being sent, so there is nothing to exclude from the output.
 func monitorPane(
 	ctx context.Context,
 	s *server.MCPServer,
@@ -276,11 +312,46 @@ func monitorPane(
 	timeoutSecs int,
 	emitter *ChannelEmitter,
 ) (*WatchResult, error) {
+	return monitorPaneFrom(ctx, s, client, paneID, nil, "", mode, triggers, timeoutSecs, emitter)
+}
+
+// monitorPaneFrom polls at mode.PollInterval, checks all triggers each tick,
+// accumulates new output, and sends progress notifications based on the mode's
+// thresholds. It returns when a trigger fires, the timeout expires, or the
+// context is cancelled.
+//
+// baseline, when non-nil, is pane content the caller captured *before* it sent
+// its command. Capturing it here instead would be a race: by the time we run,
+// the caller has already sent the command, so a fast one ("echo done") can
+// finish before the snapshot. Its output then lands inside the baseline, never
+// registers as new content, and the readiness pattern never matches — the tool
+// reports a timeout for a command that succeeded in under a millisecond.
+//
+// echoCmd, when non-empty, is that command; its echoed line is stripped from the
+// trigger input. See dropEcho.
+func monitorPaneFrom(
+	ctx context.Context,
+	s *server.MCPServer,
+	client *tmuxClient,
+	paneID string,
+	baseline *string,
+	echoCmd string,
+	mode NotificationMode,
+	triggers []Trigger,
+	timeoutSecs int,
+	emitter *ChannelEmitter,
+) (*WatchResult, error) {
 	start := time.Now()
 	timeout := time.Duration(timeoutSecs) * time.Second
 
-	// Capture baseline so we only surface new content.
-	baseline, _ := client.CapturePane(ctx, paneID, 0, false)
+	// Only surface content newer than the baseline. Prefer the caller's, which
+	// predates their command; fall back to capturing one now.
+	var base string
+	if baseline != nil {
+		base = *baseline
+	} else {
+		base, _ = client.CapturePane(ctx, paneID, 0, false)
+	}
 
 	// Fetch initial process state to record the starting command.
 	initialState, _ := client.GetPaneState(ctx, paneID)
@@ -291,7 +362,7 @@ func monitorPane(
 
 	ms := &MonitorState{
 		PaneID:           paneID,
-		Baseline:         baseline,
+		Baseline:         base,
 		InitialCmd:       initialCmd,
 		LastProgressTime: start,
 		LastOutputTime:   start,
@@ -349,11 +420,22 @@ func monitorPane(
 			}
 			ms.Current = current
 
-			// Compute new content since baseline.
-			newContent := diffContent(baseline, current)
-			// Accumulate new output that wasn't seen last poll.
-			// Compare against the previous NewContent to detect genuinely new lines.
-			if newContent != "" && newContent != ms.NewContent {
+			// Compute new content since baseline. This is the whole diff each
+			// poll, not an increment.
+			newContent := diffContent(base, current)
+			// Accumulate only the part that extends what we already recorded.
+			// Appending the whole diff (as this did) re-appends everything seen
+			// so far every time the diff grows, so the output handed back is a
+			// pile of overlapping copies of itself.
+			switch {
+			case newContent == ms.NewContent:
+				// Nothing new.
+			case strings.HasPrefix(newContent, ms.NewContent):
+				ms.AllOutput.WriteString(newContent[len(ms.NewContent):])
+			case newContent != "":
+				// The screen scrolled, so the diff is no longer an extension of
+				// the previous one and there is nothing better to do here. A
+				// screen diff cannot reconstruct a transcript it never saw.
 				ms.AllOutput.WriteString(newContent)
 			}
 			ms.NewContent = newContent
@@ -368,6 +450,8 @@ func monitorPane(
 					nonEmpty = append(nonEmpty, l)
 				}
 			}
+			// Keep the command we typed out of the triggers' view.
+			nonEmpty = dropEcho(nonEmpty, echoCmd)
 			ms.NewLines = nonEmpty
 
 			// Track output quiescence for idle trigger.

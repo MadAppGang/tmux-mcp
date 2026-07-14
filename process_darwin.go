@@ -43,17 +43,12 @@ func fillPaneState(_ context.Context, state *PaneState) error {
 		return nil
 	}
 
-	var fgPID int
-	var fgCmd string
-
+	members := make([]procInfo, 0, len(procs))
 	for i := range procs {
 		kp := &procs[i]
-		pid := int(kp.Proc.P_pid)
-		if pid > fgPID {
-			fgPID = pid
-			fgCmd = commFromKP(kp)
-		}
+		members = append(members, procInfo{PID: int(kp.Proc.P_pid), Comm: commFromKP(kp)})
 	}
+	fgPID, fgCmd := foregroundOfGroup(members, tpgid)
 
 	if fgPID == 0 {
 		fgPID = panePID
