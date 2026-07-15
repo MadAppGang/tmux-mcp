@@ -455,32 +455,41 @@ func monitorPaneFrom(
 			}
 			ms.Current = current
 
-			// Compute new content since baseline. This is the whole diff each
-			// poll, not an increment.
+			// newContent is everything new since the baseline; delta is the part
+			// of it that appeared since the previous poll.
+			//
+			// Everything below keys off delta, not newContent. This is what makes
+			// monitoring independent of what the shell prompt does. Keying idle
+			// detection off newContent means any command whose output is still on
+			// screen looks perpetually active, so idle:N can only ever fire when
+			// the whole diff happens to come back empty — which in turn only
+			// happens when the prompt keeps changing (a live clock) so the
+			// baseline no longer matches the bottom of the screen. Off delta,
+			// idle fires whenever the screen simply stops changing, whatever the
+			// prompt looks like.
 			newContent := diffContent(base, current)
-			// Accumulate only the part that extends what we already recorded.
-			// Appending the whole diff (as this did) re-appends everything seen
-			// so far every time the diff grows, so the output handed back is a
-			// pile of overlapping copies of itself.
+			var delta string
 			switch {
 			case newContent == ms.NewContent:
-				// Nothing new.
+				delta = ""
 			case strings.HasPrefix(newContent, ms.NewContent):
-				ms.AllOutput.WriteString(newContent[len(ms.NewContent):])
-			case newContent != "":
-				// The screen scrolled, so the diff is no longer an extension of
-				// the previous one and there is nothing better to do here. A
-				// screen diff cannot reconstruct a transcript it never saw.
-				ms.AllOutput.WriteString(newContent)
+				delta = newContent[len(ms.NewContent):]
+			default:
+				// The screen scrolled, so the new diff is not an extension of the
+				// previous one; take it whole. A screen diff cannot reconstruct a
+				// transcript that has already scrolled off.
+				delta = newContent
 			}
 			ms.NewContent = newContent
+			if delta != "" {
+				ms.AllOutput.WriteString(delta)
+			}
 
-			// Strip ANSI for pattern matching.
-			cleanContent := stripansi.Strip(newContent)
-			newLines := strings.Split(strings.TrimRight(cleanContent, "\n"), "\n")
-			// Filter blank lines for trigger checking.
+			// Reduce the delta to non-blank lines for the triggers.
+			cleanDelta := stripansi.Strip(delta)
+			deltaLines := strings.Split(strings.TrimRight(cleanDelta, "\n"), "\n")
 			var nonEmpty []string
-			for _, l := range newLines {
+			for _, l := range deltaLines {
 				if strings.TrimSpace(l) != "" {
 					nonEmpty = append(nonEmpty, l)
 				}
@@ -489,7 +498,8 @@ func monitorPaneFrom(
 			nonEmpty = dropEcho(nonEmpty, echoCmd)
 			ms.NewLines = nonEmpty
 
-			// Track output quiescence for idle trigger.
+			// Track output quiescence for the idle trigger: only genuinely new
+			// output since the last poll counts.
 			if len(nonEmpty) > 0 {
 				ms.LastOutputTime = time.Now()
 			}
@@ -556,17 +566,29 @@ func monitorPaneFrom(
 }
 
 // diffContent returns the portion of current that comes after the initial
-// snapshot. It trims the leading lines that appear in initial.
-// ANSI stripping for matching is done by callers; this function preserves raw output.
+// snapshot. ANSI stripping for matching is done by callers; this function
+// preserves raw output.
 func diffContent(initial, current string) string {
 	if initial == "" {
 		return current
 	}
-	// Find where the initial content ends in the current output.
-	idx := strings.LastIndex(current, strings.TrimRight(initial, "\n"))
+	trimmed := strings.TrimRight(initial, "\n")
+	// Common case: the screen only grew, so the previous snapshot is still a
+	// prefix of the current one and everything past it is new. This has to be
+	// tried before LastIndex. When the baseline ends in a prompt that the shell
+	// reprints unchanged once a command finishes — any prompt without a live
+	// clock in it — that prompt appears twice in current, and LastIndex would
+	// anchor on the second one and report the command's own output as nothing
+	// new. That is the whole reason an instant command's readiness pattern could
+	// never match under a static prompt.
+	if after, ok := strings.CutPrefix(current, trimmed); ok {
+		return strings.TrimLeft(after, "\n")
+	}
+	// The screen scrolled, so the baseline is no longer a prefix; the newest
+	// content is whatever follows its last occurrence.
+	idx := strings.LastIndex(current, trimmed)
 	if idx < 0 {
 		return current
 	}
-	after := current[idx+len(strings.TrimRight(initial, "\n")):]
-	return strings.TrimLeft(after, "\n")
+	return strings.TrimLeft(current[idx+len(trimmed):], "\n")
 }

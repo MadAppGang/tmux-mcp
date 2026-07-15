@@ -295,6 +295,47 @@ func TestIdleShellSurvivesAPromptHookChild(t *testing.T) {
 	}
 }
 
+// TestDiffContentSurvivesAStaticPrompt is the regression for instant commands
+// being lost between two identical prompts.
+//
+// The monitor takes a baseline before running a command and then diffs the
+// screen against it. When the prompt carries a live clock every prompt line is
+// unique, so the baseline matches only where the command was typed and the
+// output that follows is correctly reported as new. Under a static prompt — a
+// clean shell, or CI — the prompt before and after the command are byte for
+// byte identical, and anchoring on the *last* occurrence skips straight past the
+// output. That is the difference between an instant command's readiness pattern
+// matching and the tool waiting out its whole timeout.
+func TestDiffContentSurvivesAStaticPrompt(t *testing.T) {
+	const prompt = "user@host ~ %"
+
+	// Baseline is the idle prompt; the command ran and the same prompt returned.
+	baseline := prompt
+	current := prompt + " expr 40 + 2\n42\n" + prompt
+
+	got := diffContent(baseline, current)
+	if !strings.Contains(got, "42") {
+		t.Fatalf("diffContent dropped the command output between two identical prompts:\n%q", got)
+	}
+
+	// The append case in general: the baseline is a prefix of the new screen, so
+	// the diff is exactly the appended tail.
+	if got := diffContent("line1\nline2", "line1\nline2\nline3\nline4"); got != "line3\nline4" {
+		t.Errorf("diffContent append case = %q, want %q", got, "line3\nline4")
+	}
+
+	// A stable screen yields no new content, which is what lets idle fire.
+	if got := diffContent(current, current); got != "" {
+		t.Errorf("diffContent of an unchanged screen = %q, want empty", got)
+	}
+
+	// When the screen has scrolled the baseline is no longer a prefix; fall back
+	// to whatever follows its last occurrence.
+	if got := diffContent("old", "scrolled\nold\nnew"); got != "new" {
+		t.Errorf("diffContent scroll fallback = %q, want %q", got, "new")
+	}
+}
+
 // ---- tmux-backed tests ----
 
 // tmuxExec runs a raw tmux command, bypassing the MCP server. Used to build
