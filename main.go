@@ -7,17 +7,50 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
+// version is the build's version string. GoReleaser sets it at link time
+// (-ldflags "-X main.version=<tag>"), so release tarballs report the clean git
+// tag; a plain `go build` leaves it as "dev".
+var version = "dev"
+
+// resolveVersion returns the build's version. GoReleaser's injected tag wins.
+// Failing that — the case that matters for the terminal plugin, which installs
+// this via `go install github.com/MadAppGang/tmux-mcp@latest` (its setup.go
+// dependency) — the resolved tag is carried in the binary's build info. That is
+// accepted only when it is a clean release tag: never the "(devel)" placeholder
+// and never a build with metadata such as the "+dirty" suffix a modified working
+// tree adds, so the reported version is always a real release and never a weird
+// local-build string.
+func resolveVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := info.Main.Version; v != "" && v != "(devel)" && !strings.Contains(v, "+") {
+			return v
+		}
+	}
+	return version
+}
+
 func main() {
 	shellType := flag.String("shell-type", "bash", "Shell type for exit code capture (bash/zsh/fish)")
 	scope := flag.String("scope", "", "Tool scope: agentic (default), primitives, or all")
 	channelMode := flag.Bool("channel", false, "Enable Claude Code channel mode: push tmux events as channel notifications")
+	showVersion := flag.Bool("version", false, "Print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(resolveVersion())
+		return
+	}
 
 	// Resolve scope: flag > env > default
 	scopeVal := *scope
@@ -64,7 +97,7 @@ func main() {
 		)
 	}
 
-	s := server.NewMCPServer("tmux-mcp", "1.0.0", serverOpts...)
+	s := server.NewMCPServer("tmux-mcp", resolveVersion(), serverOpts...)
 
 	emitter := newChannelEmitter(*channelMode, s)
 

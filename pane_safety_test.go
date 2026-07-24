@@ -336,6 +336,25 @@ func TestDiffContentSurvivesAStaticPrompt(t *testing.T) {
 	}
 }
 
+// TestVersionFlagIsNotHardcoded guards the automatic version wiring. The server
+// version used to be the literal "1.0.0" in main.go, stale across six releases.
+// It now comes from resolveVersion (GoReleaser's ldflags at release time, VCS
+// build info otherwise), so --version must report something real — and never the
+// old placeholder.
+func TestVersionFlagIsNotHardcoded(t *testing.T) {
+	out, err := exec.Command(testBinaryPath, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tmux-mcp --version failed: %v\n%s", err, out)
+	}
+	got := strings.TrimSpace(string(out))
+	if got == "" {
+		t.Fatal("--version printed nothing")
+	}
+	if got == "1.0.0" {
+		t.Errorf("--version is the old hardcoded placeholder %q; version injection is not wired", got)
+	}
+}
+
 // ---- tmux-backed tests ----
 
 // tmuxExec runs a raw tmux command, bypassing the MCP server. Used to build
