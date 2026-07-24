@@ -28,6 +28,41 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Tell the magus marketplace that a new tmux-mcp binary shipped, so it can
+  # patch-bump the terminal plugin that installs this binary via its setup.go
+  # dependency (github.com/MadAppGang/tmux-mcp@latest). claudeup notices the
+  # plugin version change and re-runs `go install @latest`, pulling the new
+  # binary — that is what keeps the plugin and the binary in lockstep.
+  #
+  # Requires a MAGUS_DISPATCH_TOKEN secret: a PAT with permission to send a
+  # repository_dispatch to MadAppGang/magus (the built-in GITHUB_TOKEN is scoped
+  # to this repo only). Without it, this job logs and skips, so releases are
+  # unaffected until the magus side is wired up.
+  notify-plugin:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch terminal-plugin bump to magus
+        env:
+          TOKEN: ${{ secrets.MAGUS_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "MAGUS_DISPATCH_TOKEN not set — skipping the terminal-plugin bump dispatch."
+            exit 0
+          fi
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/MadAppGang/magus/dispatches" \
+            -d "{\"event_type\":\"tmux-mcp-release\",\"client_payload\":{\"version\":\"${VERSION}\"}}")
+          if [ "$code" = "204" ]; then
+            echo "Dispatched tmux-mcp-release v${VERSION} to MadAppGang/magus."
+          else
+            echo "Dispatch to magus failed with HTTP ${code}." >&2
+            exit 1
+          fi
+
   update-homebrew:
     needs: release
     runs-on: ubuntu-latest
