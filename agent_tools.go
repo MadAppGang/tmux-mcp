@@ -117,12 +117,23 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient, emitter *Cha
 		// Append additional triggers.
 		triggers = append(triggers, parseTriggers(triggerSpec, client)...)
 
-		// Send the command to the pane.
+		// Snapshot the pane BEFORE sending, and hand that baseline to the
+		// monitor. If the monitor took its own baseline it would do so after the
+		// command had already been sent, and a command that finishes in under a
+		// millisecond ("echo done") would have its output captured *into* the
+		// baseline — never appearing as new content, never matching the readiness
+		// pattern, and reported as a timeout despite having succeeded.
+		baseline, _ := client.CapturePane(ctx, paneID, 0, false)
+
 		if err := client.SendKeys(ctx, paneID, command, true, true); err != nil {
 			return nil, fmt.Errorf("failed to send command: %w", err)
 		}
 
-		result, err := monitorPane(ctx, s, client, paneID, mode, triggers, timeoutSecs, emitter)
+		// Passing the command lets the monitor drop the shell's echo of it, which
+		// would otherwise be the first line of new output and would be matched by
+		// the error and pattern triggers. See dropEcho.
+		result, err := monitorPaneFrom(ctx, s, client, paneID, &baseline, command,
+			mode, triggers, timeoutSecs, emitter)
 		if err != nil {
 			return nil, err
 		}

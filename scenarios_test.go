@@ -491,6 +491,29 @@ func waitForPaneBusy(t *testing.T, c *mcpClient, paneID string) {
 	t.Fatalf("pane %s did not start a foreground process within 5s", paneID)
 }
 
+// waitForPaneRunning polls pane-state until the pane's foreground process is the
+// named command. Fatal on timeout.
+//
+// This is stricter than waitForPaneBusy, and the strictness is the point.
+// "Foreground is not a shell" is also satisfied by a prompt hook that a rich
+// prompt runs as its own job — powerlevel10k shells out to git for its VCS
+// segment — so waitForPaneBusy can return while the command under test has not
+// started yet. A test that then acts on that pane races the shell and blames the
+// product for it. Waiting for the command by name removes the race.
+func waitForPaneRunning(t *testing.T, c *mcpClient, paneID, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var state map[string]any
+		c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state)
+		if cmd, _ := state["foregroundCmd"].(string); cmd == want {
+			return
+		}
+		sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("pane %s did not start %q within 5s", paneID, want)
+}
+
 // TestScenario_DevServerWorkflow simulates an agent starting a dev server,
 // waiting for readiness, and running work in a second pane.
 func TestScenario_DevServerWorkflow(t *testing.T) {
@@ -1005,13 +1028,21 @@ func TestScenario_SplitPaneReusesCorrectPaneAmongMultiple(t *testing.T) {
 	sess := createSession(t, c, uniqueSession(t))
 	paneA := sess["paneId"].(string)
 
+	// Every wait here polls for the condition it actually needs rather than
+	// sleeping a fixed interval. A fixed sleep races the shell: if `yes` has not
+	// yet seized the terminal when we look, the pane still reads as idle and the
+	// reuse logic legitimately picks it, so the test fails on a product that is
+	// behaving correctly. The sibling reuse scenarios were converted to polling
+	// for exactly this reason; this one was missed, and it fails about half the
+	// time as a result.
+
 	// Make paneA busy so that subsequent splits cannot reuse it.
 	c.callToolJSON(t, "send-keys", map[string]any{
 		"paneId": paneA,
 		"keys":   "yes > /dev/null",
 		"enter":  true,
 	}, &map[string]any{})
-	sleep(500 * time.Millisecond)
+	waitForPaneRunning(t, c, paneA, "yes")
 
 	// Split paneA → paneB (new pane, paneA is busy so no reuse).
 	var splitB map[string]any
@@ -1026,12 +1057,13 @@ func TestScenario_SplitPaneReusesCorrectPaneAmongMultiple(t *testing.T) {
 	t.Logf("created paneB=%s reused=%v", paneB, splitB["reused"])
 
 	// Make paneB busy too.
+	waitForPaneIdle(t, c, paneB)
 	c.callToolJSON(t, "send-keys", map[string]any{
 		"paneId": paneB,
 		"keys":   "yes > /dev/null",
 		"enter":  true,
 	}, &map[string]any{})
-	sleep(500 * time.Millisecond)
+	waitForPaneRunning(t, c, paneB, "yes")
 
 	// Split paneA → paneC (new pane, both paneA and paneB are busy).
 	var splitC map[string]any
@@ -1048,16 +1080,19 @@ func TestScenario_SplitPaneReusesCorrectPaneAmongMultiple(t *testing.T) {
 	// Now we have 3 panes: paneA (busy), paneB (busy), paneC (idle).
 	// Stop paneB's busy process to leave it idle too, but keep paneA busy.
 	exec.Command("tmux", "send-keys", "-t", paneB, "C-c", "").Run() //nolint:errcheck
-	sleep(500 * time.Millisecond)
+	waitForPaneIdle(t, c, paneB)
 
 	// Now: paneA=busy, paneB=idle, paneC=idle.
-	// Make paneB busy again.
+	// Make paneB busy again, so paneC is the only idle sibling.
 	c.callToolJSON(t, "send-keys", map[string]any{
 		"paneId": paneB,
 		"keys":   "yes > /dev/null",
 		"enter":  true,
 	}, &map[string]any{})
-	sleep(500 * time.Millisecond)
+	waitForPaneRunning(t, c, paneB, "yes")
+
+	// paneC must be settled at its prompt, or it is not a reuse candidate either.
+	waitForPaneIdle(t, c, paneC)
 
 	// Now: paneA=busy, paneB=busy, paneC=idle.
 	var stateA map[string]any

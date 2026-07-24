@@ -42,9 +42,11 @@ func fillPaneState(_ context.Context, state *PaneState) error {
 		return nil
 	}
 
-	// Find the foreground process group leader (highest PID in group, or first found).
-	var fgPID int
-	var fgCmd string
+	// Collect the foreground process group, then let foregroundOfGroup pick which
+	// of its members represents the pane. See that function: taking the highest
+	// PID here reports a prompt hook's child (p10k's git, a version probe) as the
+	// foreground command of a pane that is sitting idle at its prompt.
+	var members []procInfo
 	var waitingForInput bool
 
 	for _, p := range allProcs {
@@ -55,16 +57,14 @@ func fillPaneState(_ context.Context, state *PaneState) error {
 		if pStat.PGRP != tpgid {
 			continue
 		}
-		// Track the most recently spawned process in the fg group as the "active" one.
-		if p.PID > fgPID {
-			fgPID = p.PID
-			fgCmd = pStat.Comm
-		}
+		members = append(members, procInfo{PID: p.PID, Comm: pStat.Comm})
 		// Check if any process in the fg group is waiting for input.
 		if isWaitingForInputLinux(p.PID) {
 			waitingForInput = true
 		}
 	}
+
+	fgPID, fgCmd := foregroundOfGroup(members, tpgid)
 
 	if fgPID == 0 {
 		// No foreground group found — fall back to pane PID.

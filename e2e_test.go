@@ -27,7 +27,6 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(dir)
 
 	binary := filepath.Join(dir, "tmux-mcp")
 	if runtime.GOOS == "windows" {
@@ -41,11 +40,88 @@ func TestMain(m *testing.M) {
 	out, err := exec.Command("go", "build", "-o", binary, moduleDir).CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build binary: %v\n%s\n", err, out)
+		os.RemoveAll(dir)
 		os.Exit(1)
 	}
 	testBinaryPath = binary
 
-	os.Exit(m.Run())
+	cleanupTmux, err := isolateTmux()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to isolate tmux: %v\n", err)
+		os.RemoveAll(dir)
+		os.Exit(1)
+	}
+
+	code := m.Run()
+
+	// Run cleanup explicitly — os.Exit does not honour defers.
+	cleanupTmux()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// isolateTmux points every tmux interaction in the suite — both the MCP server
+// subprocess and the tests' own direct tmux calls — at a private server that we
+// start with a known-clean configuration, and returns a cleanup func.
+//
+// Without this, the suite runs against whatever tmux server the developer is
+// attached to, and inherits its environment: on a machine with a rich zsh setup
+// (powerlevel10k), test panes get a right-aligned live clock and asynchronous
+// prompt hooks (git status runs as its own job). Both leak into what the server
+// observes — the clock churns the screen so idle is never detected, and a
+// transient hook makes an idle pane briefly look busy — so tests that are
+// deterministic in CI's bare shell fail intermittently locally. This makes local
+// runs match CI by construction rather than by luck.
+//
+// Three levers, and all three are needed:
+//   - TMUX_TMPDIR relocates the default socket into a temp dir, so we get a fresh
+//     server instead of the user's, isolated from their real sessions.
+//   - Starting that server with `-f /dev/null` means it loads no tmux config, so
+//     tmux-resurrect/continuum cannot restore the user's workspace into it.
+//   - An empty ZDOTDIR makes the zsh that tmux spawns in each pane load no user
+//     rc, which is what actually removes powerlevel10k, the clock, and the hooks.
+//
+// TMUX and TMUX_PANE are cleared so that neither the tests nor the server, when
+// run from inside the developer's own tmux, fall back to that server.
+func isolateTmux() (func(), error) {
+	// Keep this path short. tmux appends "/tmux-<uid>/<socket>" and binds a Unix
+	// domain socket there, whose path is capped near 104 bytes (sun_path). The
+	// system temp dir on macOS ("/var/folders/…/T") is long enough on its own to
+	// blow that budget for the longer socket names, so anchor under /tmp instead.
+	tmuxTmp, err := os.MkdirTemp("/tmp", "mcp")
+	if err != nil {
+		return nil, fmt.Errorf("create TMUX_TMPDIR: %w", err)
+	}
+	// An empty ZDOTDIR — an empty directory with no .zshrc — is precisely what
+	// suppresses the user's zsh configuration.
+	zdotDir, err := os.MkdirTemp("", "tmux-mcp-zdot-*")
+	if err != nil {
+		os.RemoveAll(tmuxTmp)
+		return nil, fmt.Errorf("create ZDOTDIR: %w", err)
+	}
+
+	os.Setenv("TMUX_TMPDIR", tmuxTmp)
+	os.Setenv("ZDOTDIR", zdotDir)
+	os.Unsetenv("TMUX")
+	os.Unsetenv("TMUX_PANE")
+
+	// Start the private server with no config, via a keepalive session that holds
+	// it open for the whole run. Config is read once, at server start, so every
+	// later command on this socket inherits the clean server; killing this session
+	// at the end drops the last session and the server exits on its own.
+	const keepalive = "mcp-test-keepalive"
+	if out, err := exec.Command("tmux", "-f", os.DevNull, "new-session", "-d", "-s", keepalive).CombinedOutput(); err != nil {
+		os.RemoveAll(tmuxTmp)
+		os.RemoveAll(zdotDir)
+		return nil, fmt.Errorf("start clean tmux server: %w: %s", err, out)
+	}
+
+	cleanup := func() {
+		_ = exec.Command("tmux", "kill-session", "-t", keepalive).Run()
+		os.RemoveAll(tmuxTmp)
+		os.RemoveAll(zdotDir)
+	}
+	return cleanup, nil
 }
 
 // ---- JSON-RPC request/response types ----
