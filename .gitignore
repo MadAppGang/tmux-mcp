@@ -54,3 +54,7 @@ gtd/sessions/
 .claude/_profiles/
 # Local claudemem indexes are generated from the repo and should not be committed.
 /.claude/claudish-usage.log
+
+# Added by claudeup
+# Local claudemem indexes are generated from the repo and should not be committed.
+.claudemem/
