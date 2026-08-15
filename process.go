@@ -2,10 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 )
+
+// errUIDUnsupported is what processUIDs returns on a platform where we cannot
+// resolve a process's owner. See process_other.go for why that is an error and
+// not a value — it is the difference between a guard and the appearance of one.
+var errUIDUnsupported = errors.New("process uid lookup is unsupported on this platform")
 
 // PaneState captures the OS-level state of a tmux pane's process.
 type PaneState struct {

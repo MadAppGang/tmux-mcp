@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -433,6 +434,100 @@ func TestReuseStillWorksForOurOwnPanes(t *testing.T) {
 	}
 	if reused, _ := second["reused"].(bool); !reused {
 		t.Error("split-pane should have reported reused=true")
+	}
+}
+
+// TestSplitPaneDefaultsToOwnPane covers the self-location default: split-pane
+// with no paneId splits the pane the server itself runs in.
+//
+// The fixture is built with raw tmux rather than through the server because the
+// pane has to exist *before* the server starts — TMUX_PANE is read from the
+// environment at spawn, exactly as it is in production, and a pane the server
+// created for itself would not be the situation this default exists for.
+//
+// Two assertions, and the first is the safety one. The returned pane must not be
+// the server's own: the agent's whole session lives in that pane, and a tool
+// that answered with it would hand every later send-keys a licence to type into
+// the conversation the user is having. It cannot happen here — a split never
+// returns the pane it split — and that is precisely the property being pinned,
+// because it is what makes "defaults to my own pane" safe at all. The second
+// says the new pane landed in the user's window rather than in some session of
+// the server's own making, which is the behaviour that makes the default useful.
+func TestSplitPaneDefaultsToOwnPane(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+
+	name := uniqueSession(t)
+	tmuxExec(t, "new-session", "-d", "-s", name)
+	defer exec.Command("tmux", "kill-session", "-t", name).Run() //nolint:errcheck
+
+	self := tmuxExec(t, "display-message", "-p", "-t", name, "#{pane_id}")
+	wantWindow := tmuxExec(t, "display-message", "-p", "-t", self, "#{window_id}")
+
+	c := newMCPClientInPane(t, self)
+
+	var split map[string]any
+	c.callToolJSON(t, "split-pane", map[string]any{}, &split)
+
+	got, _ := split["paneId"].(string)
+	if got == "" {
+		t.Fatalf("split-pane with no paneId returned no pane: %v", split)
+	}
+	if got == self {
+		t.Fatalf("split-pane returned the server's own pane %s; the pane it splits must never be the pane it returns", got)
+	}
+	if gotWindow, _ := split["windowId"].(string); gotWindow != wantWindow {
+		t.Errorf("split-pane put the new pane in window %s, want %s — the window the server's own pane lives in", gotWindow, wantWindow)
+	}
+	if panes := tmuxExec(t, "list-panes", "-t", wantWindow, "-F", "#{pane_id}"); !strings.Contains(panes, got) {
+		t.Errorf("pane %s is not in window %s (window holds %q)", got, wantWindow, panes)
+	}
+}
+
+// TestSplitPaneOutsideTmuxNamesHeadless pins what happens when there is no self
+// pane to default to.
+//
+// isolateTmux clears TMUX_PANE for the whole test process and newMCPClient does
+// not put it back, so this server genuinely has no pane — the same position a
+// server started by a launcher outside tmux is in.
+//
+// The assertion is on the error *text*, not merely on isError, and that is the
+// point of the test. The incident this feature comes from began with an agent
+// that could not distinguish "I am not in tmux" from "I passed a bad argument",
+// and started shelling out to raw tmux to work out which. A message that names
+// the way forward — headless — is what ends that guessing, so the wording is
+// part of the contract rather than decoration.
+func TestSplitPaneOutsideTmuxNamesHeadless(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+
+	c := newMCPClient(t)
+
+	raw := c.callToolRaw(t, "split-pane", map[string]any{})
+
+	var result struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("unmarshal split-pane result: %v\nraw: %s", err, raw)
+	}
+	if !result.IsError {
+		t.Fatalf("split-pane with no paneId and no TMUX_PANE must be an error, got: %s", raw)
+	}
+	if len(result.Content) == 0 {
+		t.Fatalf("error result carried no message: %s", raw)
+	}
+	text := result.Content[0].Text
+	if !strings.Contains(text, "headless") {
+		t.Errorf("error message must name the headless alternative, got %q", text)
+	}
+	if !strings.Contains(text, "paneId") {
+		t.Errorf("error message must name the explicit-paneId alternative, got %q", text)
 	}
 }
 

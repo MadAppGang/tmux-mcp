@@ -261,6 +261,12 @@ func buildTrigger(name string, client *tmuxClient) *Trigger {
 }
 
 // WatchResult is the structured result returned by watch-pane and start-and-watch.
+//
+// Slot and Created are appended rather than embedded via paneResolution because
+// this struct already has a PaneID field with the right name and every existing
+// consumer reads it; embedding would have meant deleting that field and hoping
+// the promotion produced the same key. Both new fields are omitempty, so a call
+// that named a paneId is answered exactly as before.
 type WatchResult struct {
 	PaneID    string     `json:"paneId"`
 	Event     string     `json:"event"`               // trigger name or "timeout"
@@ -268,6 +274,8 @@ type WatchResult struct {
 	Elapsed   float64    `json:"elapsed"`             // seconds
 	Output    string     `json:"output"`              // all new content accumulated
 	PaneState *PaneState `json:"paneState,omitempty"` // final process state
+	Slot      int        `json:"slot,omitempty"`      // helper slot, when the server chose the pane
+	Created   bool       `json:"created,omitempty"`   // the pane is new to that slot
 }
 
 // dropEcho removes the shell's echo of a command we just typed from the front of

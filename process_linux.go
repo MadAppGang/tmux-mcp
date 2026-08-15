@@ -79,6 +79,34 @@ func fillPaneState(_ context.Context, state *PaneState) error {
 	return nil
 }
 
+// processUIDs reads /proc/<pid>/status, whose "Uid:" line carries four values —
+// real, effective, saved-set and filesystem uid, in that order. We return the
+// first two; the caller is expected to require both to match its own uid,
+// because a process that dropped one but not the other is not one we may type
+// into.
+//
+// The tempting shortcut — stat()ing the /proc/<pid> directory and reading its
+// owner — is wrong for precisely the case this guard exists to catch: the kernel
+// reassigns /proc/<pid> to root:root when a process changes credentials, so the
+// directory's owner stops matching the process's uid exactly when the process
+// has done something interesting with its uid. The cheap check is unreliable
+// only in the situation that matters, which is the worst property a security
+// check can have.
+//
+// -1 is returned with the error rather than 0 so that a caller which ignores the
+// error cannot accidentally match root. See process_other.go.
+func processUIDs(pid int) (real, effective int, err error) {
+	proc, err := procfs.NewProc(pid)
+	if err != nil {
+		return -1, -1, fmt.Errorf("open proc %d: %w", pid, err)
+	}
+	status, err := proc.NewStatus()
+	if err != nil {
+		return -1, -1, fmt.Errorf("read proc status %d: %w", pid, err)
+	}
+	return int(status.UIDs[0]), int(status.UIDs[1]), nil
+}
+
 // isWaitingForInputLinux checks /proc/<pid>/wchan and /proc/<pid>/syscall to
 // determine if the process is blocked reading from stdin.
 func isWaitingForInputLinux(pid int) bool {

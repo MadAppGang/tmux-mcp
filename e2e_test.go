@@ -169,8 +169,34 @@ type mcpClient struct {
 }
 
 // newMCPClient starts a fresh tmux-mcp process, performs the initialize
-// handshake, and returns a ready-to-use client.
+// handshake, and returns a ready-to-use client. The child inherits the test
+// process's environment, in which isolateTmux has cleared TMUX_PANE — so the
+// server believes it is not running inside tmux.
 func newMCPClient(t *testing.T, extraArgs ...string) *mcpClient {
+	t.Helper()
+	return startMCPClient(t, nil, extraArgs...)
+}
+
+// newMCPClientInPane starts a server that believes it is running in paneID.
+//
+// isolateTmux clears TMUX_PANE for the whole test process, so that a developer
+// running the suite from inside their own tmux does not have the server latch
+// onto their real pane. Every self-location test therefore has to put the
+// variable back for one child process only — t.Setenv would leak the value into
+// every other server this test file starts, and os.Setenv would leak it across
+// tests entirely.
+//
+// The failure mode when a test forgets is loud rather than silent: the server
+// answers errNotInTmux instead of quietly picking some other pane, so a test
+// that omits the injection cannot pass by accident.
+func newMCPClientInPane(t *testing.T, paneID string, extraArgs ...string) *mcpClient {
+	t.Helper()
+	return startMCPClient(t, []string{"TMUX_PANE=" + paneID}, extraArgs...)
+}
+
+// startMCPClient is the shared body of the two constructors above. extraEnv, if
+// non-empty, is appended to the inherited environment of the child only.
+func startMCPClient(t *testing.T, extraEnv []string, extraArgs ...string) *mcpClient {
 	t.Helper()
 
 	shellType := "zsh"
@@ -182,6 +208,9 @@ func newMCPClient(t *testing.T, extraArgs ...string) *mcpClient {
 
 	args := append([]string{"--shell-type=" + shellType, "--scope=all"}, extraArgs...)
 	cmd := exec.Command(testBinaryPath, args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatalf("stdin pipe: %v", err)
