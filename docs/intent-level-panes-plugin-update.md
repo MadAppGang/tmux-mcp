@@ -79,6 +79,15 @@ Explicit-`paneId` responses are **byte-identical** to v1.6.3, pinned by test
 (`TestExplicitPaneIdResponsesAreUnchanged`). One additive exception: `pane-state` gains a `paneId`
 key it never had. Nothing else changes shape, and `paneId` keeps working on every tool.
 
+`capture-pane` and `screenshot-pane` are the two whose bodies are not JSON — text and an image —
+so a resolved call reports its pane in `structuredContent` instead. That key is attached **only
+when a slot was actually resolved**: `paneResolution.paneId` has no `omitempty` and cannot have
+one, so attaching it unconditionally would give an explicit-`paneId` call a top-level key these
+two tools never had, containing the id the caller had just passed in. v1.7.0 shipped it
+unconditionally, which made the paragraph above false for those two tools; both are now covered by
+`TestExplicitPaneIdResponsesAreUnchanged`, with the resolved path pinned separately so the fix
+cannot be mistaken for "delete the metadata".
+
 ---
 
 ## What the plugin needs to do

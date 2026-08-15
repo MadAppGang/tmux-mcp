@@ -145,11 +145,28 @@ func slotArgError(raw any) error {
 
 // paneTarget is the outcome of the single resolution path shared by every
 // pane-taking tool.
+//
+// Owner is the only field a handler cannot obtain for itself, and that is the
+// reason it is carried here rather than looked up when needed. It is the
+// registry's answer as resolveHelper read it under slotMu, in the same hold that
+// chose the pane; a handler asking the same question afterwards asks it of a
+// registry that a concurrent close-pane may already have erased, and gets "no
+// record" for a pane that was ours a millisecond ago and is now the user's
+// again. clearForDisplay is the consumer, and there the difference between those
+// two answers is whether the user's half-typed command line survives.
+//
+// It is empty on the explicit-paneId path, where nothing was resolved and so
+// nothing was read. Slot is what tells the two apart — 0 means the caller named
+// the pane — and a consumer must branch on that rather than on Owner being
+// empty, because "we did not look" and "we looked and found nothing" are
+// different facts.
 type paneTarget struct {
-	PaneID   string // concrete and non-empty on success, unless Headless
-	Slot     int    // 0 when the caller named a pane explicitly
-	Created  bool   // this call created or adopted the pane
-	Headless bool   // caller asked for a headless pane and named none;
+	PaneID  string // concrete and non-empty on success, unless Headless
+	Slot    int    // 0 when the caller named a pane explicitly
+	Created bool   // this call created or adopted the pane
+	Owner   string // ownerAgent or ownerAcquired as read under slotMu during slot
+	// resolution; empty when the caller named the pane
+	Headless bool // caller asked for a headless pane and named none;
 	// only ever set for tools that declare AllowHeadless
 }
 
@@ -292,6 +309,13 @@ func (t *tmuxClient) resolvePaneArg(
 	}
 
 	if paneID := req.GetString("paneId", ""); paneID != "" {
+		// No Owner, and no lookup to obtain one. Nothing was resolved, so the
+		// registry was never consulted and there is no locked answer to carry —
+		// the caller named a pane and took the safety burden for it, which is the
+		// same trade this function's doc comment makes for every other rule. A
+		// consumer that needs an owner on this path reads it itself, knowing it is
+		// reading it now rather than at resolution time; clearForDisplay does
+		// exactly that, and says why it is safe there.
 		return paneTarget{PaneID: paneID}, nil
 	}
 	if headless {
@@ -301,9 +325,9 @@ func (t *tmuxClient) resolvePaneArg(
 	if !hasSlot {
 		slot = slotDefault
 	}
-	paneID, resolved, created, err := t.resolveHelper(ctx, slot)
+	paneID, resolved, created, owner, err := t.resolveHelper(ctx, slot)
 	if err != nil {
 		return paneTarget{}, err
 	}
-	return paneTarget{PaneID: paneID, Slot: resolved, Created: created}, nil
+	return paneTarget{PaneID: paneID, Slot: resolved, Created: created, Owner: owner}, nil
 }

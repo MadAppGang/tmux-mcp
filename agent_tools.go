@@ -386,7 +386,10 @@ func registerWriteToDisplay(s *server.MCPServer, client *tmuxClient) {
 		}
 
 		if req.GetBool("clear", false) {
-			if err := client.clearForDisplay(ctx, tgt.PaneID); err != nil {
+			// The whole target goes in, not the pane id. What the clear has to
+			// know is whose pane this is, and the only trustworthy answer is the
+			// one resolution already read under the lock — see clearForDisplay.
+			if err := client.clearForDisplay(ctx, tgt); err != nil {
 				return mcp.NewToolResultErrorFromErr("failed to clear pane", err), nil
 			}
 		}
@@ -446,29 +449,74 @@ func registerWriteToDisplay(s *server.MCPServer, client *tmuxClient) {
 // # Deciding whose pane it is
 //
 // The registry is the only thing that knows, and ownerAcquired is the one owner
-// kind that means "the user opened this". paneTarget carries which pane, not
-// whose, and extending it would mean editing the resolution path — so this is a
-// second, read-only display-message, which is also why it takes no lock: it
-// mutates nothing that slot resolution reads.
+// kind that means "the user opened this". The question is WHEN that answer is
+// read, and this function used to get it wrong.
+//
+// On the slot path the answer is carried in, not looked up. resolvePaneArg
+// resolved this pane under slotMu from a registry read taken inside that hold,
+// and paneTarget.Owner is that read. Asking again here — one lock-free
+// paneRecordFor, after the lock was released — reopens the exact race the lock
+// exists to close. A concurrent close-pane on the same slot runs
+// releaseAcquiredLocked, which wipes all three markers and leaves the pane
+// ALIVE, handed back to the user. Land that between the resolution and the
+// re-read and this function sees "no record", reads that as a pane the caller
+// named explicitly, and sends C-u + `clear` + Enter into a shell the user is
+// once again typing in — destroying their line and pressing Enter on it. That is
+// the cardinal failure this design exists to prevent, reached through the one
+// tool whose entire purpose is to be helpful.
+//
+// Carrying the locked answer forward is sound, not merely better, because it
+// removes the only dangerous direction and leaves harmless ones:
+//
+//   - Captured "acquired" → C-l, which is safe whatever has happened since. The
+//     line editor repaints and executes nothing, and against a pane that has
+//     since died the send simply fails.
+//   - Captured "agent" → the pane was one this server created, and the only
+//     thing a concurrent close-pane does to one of those is KILL it. Release —
+//     the path that hands a pane back to the user — runs for acquired records
+//     only, so an agent-owned pane never becomes the user's between our two
+//     statements. The worst case is keystrokes sent at a pane that is gone,
+//     which fails and is reported.
+//
+// The dangerous direction is only ever "thought it was ours, it is actually
+// theirs", and a value read while the slot was held cannot produce it.
+//
+// # The explicit-paneId path reads here, deliberately
+//
+// A caller that names a pane has taken the safety burden for it, there is no
+// slot resolution to carry anything forward from, and there is no race of this
+// shape either: nothing in the server releases a slot that was never resolved.
+// So that path reads the registry now, and the distinction is written into the
+// code — the branch is on Slot, the field that means "this came from
+// resolution" — rather than being an accident of which value happens to be set.
 //
 // A registry read that FAILS is treated as the user's pane, not as ours. The
 // conservative direction here is the one that declines to destroy something, and
 // it costs nothing real: the read only fails when the pane is unreachable, in
 // which case the write that follows is about to fail anyway.
 //
-// A pane with no record at all keeps the old behaviour. It can only be reached
-// by naming it explicitly, which is the caller taking the safety burden — the
-// same rule resolvePaneArg applies — and it is the behaviour every pre-slot
-// caller of this tool already relies on.
-func (t *tmuxClient) clearForDisplay(ctx context.Context, paneID string) error {
-	rec, found, err := t.paneRecordFor(ctx, paneID)
-	if err != nil || (found && rec.Owner == ownerAcquired) {
-		return t.SendKeys(ctx, paneID, "C-l", false, false)
+// A pane with no record at all keeps the old behaviour, and can now only be
+// reached by naming it — which is the behaviour every pre-slot caller of this
+// tool already relies on.
+func (t *tmuxClient) clearForDisplay(ctx context.Context, tgt paneTarget) error {
+	owner, bySlot := tgt.Owner, tgt.Slot != 0
+	if !bySlot {
+		rec, found, err := t.paneRecordFor(ctx, tgt.PaneID)
+		if err != nil {
+			return t.SendKeys(ctx, tgt.PaneID, "C-l", false, false)
+		}
+		owner = ""
+		if found {
+			owner = rec.Owner
+		}
 	}
-	if err := t.SendKeys(ctx, paneID, "C-u", false, false); err != nil {
+	if !clearKillsTheLine(owner, bySlot) {
+		return t.SendKeys(ctx, tgt.PaneID, "C-l", false, false)
+	}
+	if err := t.SendKeys(ctx, tgt.PaneID, "C-u", false, false); err != nil {
 		return err
 	}
-	if err := t.SendKeys(ctx, paneID, "clear", false, true); err != nil {
+	if err := t.SendKeys(ctx, tgt.PaneID, "clear", false, true); err != nil {
 		return err
 	}
 	// Brief pause so the clear completes before we write. Only the shell-command
@@ -477,6 +525,32 @@ func (t *tmuxClient) clearForDisplay(ctx context.Context, paneID string) error {
 	// stream and cannot be overtaken by what we send next.
 	time.Sleep(150 * time.Millisecond)
 	return nil
+}
+
+// clearKillsTheLine is the whole decision above, as a function of what is known
+// about the pane and of how that knowledge was obtained. It is separated from
+// the keystrokes so the rule can be tested for what it CHOOSES rather than
+// through a real pane and a real race — see
+// TestClearDecisionNeverKillsALineOnEvidenceItDoesNotHave.
+//
+// bySlot is not decoration: the two paths answer an empty owner differently, and
+// each answer is right for its path.
+//
+//   - Resolved by slot: destructive only on positive knowledge that this server
+//     made the pane. Acquired gets the redraw, and so does anything else —
+//     an owner kind this binary does not recognise, or an empty value some
+//     future resolution path forgot to fill in. Sending C-l to a pane we own
+//     costs a repaint. Sending C-u to a pane the user owns costs their work, so
+//     the default when we are unsure has to be the repaint.
+//   - Named explicitly: the pre-slot behaviour. No record means "a display pane
+//     the caller split off and pointed us at", which is what this tool was built
+//     for and what its existing callers rely on; only a record that positively
+//     says "acquired" withholds the kill.
+func clearKillsTheLine(owner string, bySlot bool) bool {
+	if bySlot {
+		return owner == ownerAgent
+	}
+	return owner != ownerAcquired
 }
 
 // ---- close-pane ----

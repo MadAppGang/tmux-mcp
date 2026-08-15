@@ -329,8 +329,19 @@ func registerCapturePane(s *server.MCPServer, client *tmuxClient) {
 		// written against it. The metadata rides alongside in structuredContent,
 		// which costs the text nothing; clients that ignore it lose only the
 		// pane id, which the design says the agent should never need.
+		//
+		// And it rides there ONLY when a slot was resolved. paneResolution.PaneID
+		// has no omitempty — it cannot have one, because the resolved case must
+		// always report which pane it picked — so an unconditional assignment gives
+		// an explicit-paneId call a structuredContent key this tool never had,
+		// telling the caller the id it just passed in. Explicit paneId answers
+		// exactly as it did before slots existed, on every tool; that is a wire
+		// promise, and one that a top-level key silently added to two of them
+		// breaks. See TestExplicitPaneIdResponsesAreUnchanged.
 		res := mcp.NewToolResultText(content)
-		res.StructuredContent = tgt.resolution()
+		if tgt.Slot != 0 {
+			res.StructuredContent = tgt.resolution()
+		}
 		return res, nil
 	})
 }
@@ -377,7 +388,7 @@ func registerCreateWindow(s *server.MCPServer, client *tmuxClient) {
 
 func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("split-pane",
-		mcp.WithDescription("Get a pane to work in, beside the agent, in the window the user is already looking at. With no arguments it returns helper slot 1, creating it if needed; slot:2, slot:3 … give further panes, and slot:\"new\" allocates one nobody else will use. Repeated calls for the same slot return the SAME pane (\"reused\": true), so a process started there is still there next time. Pass paneId only to split a specific pane, in which case direction and size apply and the new pane is unslotted."),
+		mcp.WithDescription("Get a pane to work in, beside the agent, in the window the user is already looking at. With no arguments it returns helper slot 1, creating it if needed; slot:2, slot:3 … give further panes. Repeated calls for the same slot return the SAME pane (\"reused\": true), so a process started there is still there next time. Pass paneId only to split a specific pane, in which case direction and size apply and the new pane is unslotted."),
 		mcp.WithString("paneId",
 			mcp.Description("Pane ID to split (optional; defaults to the pane this server runs in)"),
 		),
@@ -736,10 +747,11 @@ func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
 		if err != nil {
 			return res, err
 		}
-		// Same reasoning as capture-pane: the content is an image (or the HTML
-		// fallback) and must stay exactly that, so the resolution rides in
-		// structuredContent instead of being written into the picture.
-		if res != nil {
+		// Same reasoning as capture-pane, including the condition: the content is
+		// an image (or the HTML fallback) and must stay exactly that, so the
+		// resolution rides in structuredContent — and only when there was a
+		// resolution. A call that named its pane gets back what it always got.
+		if res != nil && tgt.Slot != 0 {
 			res.StructuredContent = tgt.resolution()
 		}
 		return res, nil
