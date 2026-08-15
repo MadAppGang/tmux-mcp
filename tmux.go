@@ -629,7 +629,20 @@ func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, si
 		args = append(args, "-h")
 	}
 	if size > 0 {
-		args = append(args, "-p", strconv.Itoa(size))
+		// "-l N%" and not "-p N". They mean the same thing, but -p is the
+		// deprecated spelling and modern tmux has dropped it: on tmux 3.4
+		// (Ubuntu 24.04, and so CI) "split-window -p 50" fails with "size
+		// missing", because the flag no longer takes a value and 50 is then
+		// parsed as the shell command to run. -l accepts a percentage suffix
+		// and has done since tmux 3.1, so it is the spelling that works on both.
+		//
+		// This was survivable while size was an argument callers rarely passed —
+		// split-pane defaults it to 0, which appends neither flag. It stopped
+		// being survivable when helper placement started requesting 50% for
+		// every slot, which put the deprecated flag on the default path of every
+		// resolution. Local tmux was new enough to accept it and CI was not,
+		// which is exactly the split a version-sensitive flag produces.
+		args = append(args, "-l", strconv.Itoa(size)+"%")
 	}
 	out, err := t.runWithSocket(ctx, socket, args...)
 	if err != nil {
