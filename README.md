@@ -81,6 +81,7 @@ This project solves those four problems directly.
 Layer 2: Agent Workflows
   start-and-watch   watch-pane    run-in-repl
   pane-state        write-to-display   display-message
+  close-pane
 
 Layer 1: Tmux Primitives
   create-session  create-window  split-pane
@@ -92,7 +93,48 @@ Layer 1: Tmux Primitives
 
 **Layer 1** gives you full tmux control. Every response includes structured JSON with IDs so you never need a separate lookup call to chain operations.
 
-**Layer 2** provides tools designed around agent workflows: starting a process and waiting for readiness, monitoring a pane for errors asynchronously, interacting with a running REPL, writing coaching text to a display pane.
+**Layer 2** provides tools designed around agent workflows: starting a process and waiting for readiness, monitoring a pane for errors asynchronously, interacting with a running REPL, writing coaching text to a display pane, and releasing the panes the agent used.
+
+### Helper slots: naming a pane without knowing its ID
+
+Every tool that takes a `paneId` also accepts a `slot`, and needs neither. Omit both and
+the call goes to **slot 1**: a pane beside the agent, in the window the user is already
+looking at, created on first use and reused by every later call.
+
+```json
+{"tool": "execute-command", "params": {"command": "npm test"}}
+{"tool": "capture-pane",    "params": {}}
+{"tool": "close-pane",      "params": {"slot": "all"}}
+```
+
+| `slot` | Meaning |
+|---|---|
+| omitted | Slot 1 — the default helper pane |
+| `2`, `3`, … | A second, third, … helper pane, for running things side by side |
+| `"all"` | close-pane only: release every helper pane in this window |
+
+Slots are plain numbers you choose. There is no "allocate me a free one" form: a caller
+that needs more than one pane already knows how many, and picking the numbers itself is
+what lets it address the same pane again on the next call.
+
+Three properties are worth knowing:
+
+- **A slot is never the agent's own pane.** Resolution can create a pane, reuse one, or
+  adopt an idle unused shell already open in the window — but the pane the server itself
+  runs in is excluded from all three, so a tool call can never type into the conversation.
+- **Responses tell you what you got.** A resolved call answers with `paneId`, `slot`, and
+  `created`. `created: true` means the pane is new *to that slot* — which is how you learn
+  that the process you started there earlier is gone.
+- **Explicit `paneId` still wins, and still answers exactly as it always did.** Naming a
+  pane bypasses slot resolution entirely; `slot` and `created` are omitted from the
+  response.
+
+`close-pane` is the inverse: it kills panes the server created and merely interrupts and
+releases panes it adopted from the user. It refuses any `paneId` it does not recognise as
+its own, and it refuses the pane the server is running in even when that pane carries a
+valid agent-owned record — which is what a subagent started into an outer agent's split
+looks like, and closing it would destroy the session the request arrived through.
+`kill-pane` remains the blunt instrument for everything else, including that one.
 
 ## Tool reference
 
@@ -103,13 +145,13 @@ Layer 1: Tmux Primitives
 | `list-sessions` | List all tmux sessions | — | `[{id, name, windows, attached}]` |
 | `list-windows` | List windows in a session | `sessionId` | `[{id, name, active, panes}]` |
 | `list-panes` | List panes with dimensions and current path | `windowId` | `[{id, title, active, width, height, currentCommand, currentPath}]` |
-| `capture-pane` | Read terminal content | `paneId`, `lines`, `colors` | raw text |
-| `screenshot-pane` | Visual screenshot opened in browser | `paneId`, `theme`, `output` | file path or HTML |
+| `capture-pane` | Read terminal content | `slot`, `paneId`, `lines`, `colors` | raw text (+ `structuredContent`) |
+| `screenshot-pane` | Visual screenshot opened in browser | `slot`, `paneId`, `theme`, `output` | image, file path, or HTML |
 | `create-session` | Create a detached session | `name` (optional) | `{sessionId, sessionName, windowId, paneId}` |
 | `create-window` | Add a window to a session | `sessionId`, `name` | `{windowId, windowName, paneId}` |
-| `split-pane` | Split a pane horizontally or vertically. Reuses an existing idle pane in the same window if one is available | `paneId`, `direction`, `size` | `{paneId, windowId, reused?}` |
-| `send-keys` | Send keystrokes or text to a pane | `paneId`, `keys`, `literal`, `enter` | `{paneId}` |
-| `execute-command` | Run a command and wait for completion | `paneId`, `command` | `{paneId, output, exitCode}` |
+| `split-pane` | Get a pane to work in beside the agent. With no arguments returns helper slot 1, creating or reusing it; `paneId` splits a specific pane instead | `slot`, `paneId`, `direction`, `size` | `{paneId, windowId, reused?, slot?, created?}` |
+| `send-keys` | Send keystrokes or text to a pane | `keys`, `slot`, `paneId`, `literal`, `enter` | `{paneId, slot?, created?}` |
+| `execute-command` | Run a command and wait for completion | `command`, `slot`, `paneId`, `headless` | `{paneId, output, exitCode, slot?, created?}` |
 | `resize-pane` | Resize absolutely or relatively | `paneId`, `width`+`height` or `direction`+`amount` | `{paneId}` |
 | `rename-session` | Rename a session | `sessionId`, `newName` | `{sessionId, name}` |
 | `kill-session` | Kill a session and all its windows | `sessionId` | `{killed}` |
@@ -128,12 +170,13 @@ Layer 1: Tmux Primitives
 
 | Tool | Purpose | Key params | Returns |
 |---|---|---|---|
-| `start-and-watch` | Start a command and monitor until a readiness pattern matches | `paneId`, `command`, `pattern`, `mode`, `triggers`, `timeout` | `WatchResult` |
-| `watch-pane` | Monitor an existing pane until a trigger fires | `paneId`, `mode`, `triggers`, `timeout` | `WatchResult` |
-| `pane-state` | Get OS-level process state | `paneId` | `{panePid, foregroundPid, foregroundCmd, isAlive, waitingForInput, exitCode}` |
-| `run-in-repl` | Send input to a running REPL and wait for the prompt | `paneId`, `input`, `promptPattern`, `timeout` | `{paneId, output}` |
-| `write-to-display` | Write coaching text to a side pane without entering agent context | `paneId`, `text`, `clear` | `{paneId}` |
-| `display-message` | Show a transient notification in the tmux status bar | `message`, `duration` | text |
+| `start-and-watch` | Start a command and monitor until a readiness pattern matches | `command`, `pattern`, `slot`, `paneId`, `headless`, `mode`, `triggers`, `timeout` | `WatchResult` |
+| `watch-pane` | Monitor an existing pane until a trigger fires | `slot`, `paneId`, `mode`, `triggers`, `timeout` | `WatchResult` |
+| `pane-state` | Get OS-level process state | `slot`, `paneId` | `{paneId, panePid, foregroundPid, foregroundCmd, isAlive, waitingForInput, exitCode}` |
+| `run-in-repl` | Send input to a running REPL and wait for the prompt | `input`, `promptPattern`, `slot`, `paneId`, `timeout` | `{paneId, output, slot?, created?}` |
+| `write-to-display` | Write coaching text to a side pane without entering agent context. `clear` wipes the line buffer on a pane the server created, and never on one adopted from the user | `text`, `slot`, `paneId`, `clear` | `{paneId, slot?, created?}` |
+| `display-message` | Show a one-way notification in the user's status bar. Not a query — it cannot report anything about the terminal | `message`, `duration` | text |
+| `close-pane` | Close a helper pane: kills panes the server created, releases panes it adopted | `slot`, `paneId` | `{closed: [{paneId?, slot?, action}]}` |
 
 `start-and-watch` and `watch-pane` block until a trigger fires or the timeout expires, then return the result directly. Progress notifications are sent while monitoring.
 
@@ -377,7 +420,7 @@ Match this to the shell running inside your tmux panes. A mismatch causes `execu
 
 | Value | Tools registered |
 |---|---|
-| `agentic` (default) | 6 Layer 2 tools + 13 essential Layer 1 tools |
+| `agentic` (default) | 7 Layer 2 tools + 13 essential Layer 1 tools |
 | `primitives` | All 17 Layer 1 tools only |
 | `all` | All Layer 1 and Layer 2 tools |
 
@@ -440,7 +483,9 @@ go test ./...          # full suite (tmux must be running)
 |---|---|
 | `main.go` | MCP server setup, Layer 1 tool and resource registration |
 | `tmux.go` | `tmuxClient`: tmux CLI wrappers, data types, `ExecuteCommand` with wait-for |
-| `agent_tools.go` | Layer 2 tool registration: `start-and-watch`, `watch-pane`, `pane-state`, `run-in-repl`, `write-to-display`, `display-message` |
+| `agent_tools.go` | Layer 2 tool registration: `start-and-watch`, `watch-pane`, `pane-state`, `run-in-repl`, `write-to-display`, `display-message`, `close-pane` |
+| `helper_panes.go` | Helper-pane policy: slot resolution, placement, acquisition, teardown |
+| `pane_arg.go` | The single `paneId`/`slot`/`headless` argument parser every pane-taking tool uses |
 | `channel.go` | Channel mode: `ChannelEmitter`, notifications, instructions |
 | `triggers.go` | `NotificationMode`, `Trigger`, `monitorPane` loop, `parseTriggers`, `WatchResult` |
 | `process.go` | `PaneState` struct, `GetPaneState` (tmux query + OS dispatch) |

@@ -91,6 +91,29 @@ func fillPaneState(_ context.Context, state *PaneState) error {
 	return nil
 }
 
+// processUIDs returns the real and effective uid of pid.
+//
+// macOS has no /proc, so the route is the same sysctl this file already uses for
+// process state: kern.proc.pid yields a kinfo_proc whose Eproc carries both
+// credentials. Pcred.P_ruid is the REAL uid — the login identity, which a setuid
+// binary does not change — and Ucred.Uid is the EFFECTIVE one, which is what the
+// kernel actually tests on an access check.
+//
+// Both are returned, and the caller is expected to require both to match,
+// because a process that dropped one but not the other is not a process we may
+// type into: our keystrokes would execute under whichever identity the shell
+// restores, and that is not a coin the server gets to flip on the user's behalf.
+//
+// -1 is returned with the error rather than 0 so that a caller which ignores the
+// error cannot accidentally match root. See process_other.go.
+func processUIDs(pid int) (real, effective int, err error) {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return -1, -1, fmt.Errorf("sysctl kern.proc.pid %d: %w", pid, err)
+	}
+	return int(kp.Eproc.Pcred.P_ruid), int(kp.Eproc.Ucred.Uid), nil
+}
+
 // commFromKP extracts the command name from a kinfo_proc.
 func commFromKP(kp *unix.KinfoProc) string {
 	// P_comm is [MAXCOMLEN+1]int8 — convert to string.

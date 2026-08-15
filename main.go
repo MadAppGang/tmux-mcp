@@ -120,7 +120,7 @@ func main() {
 
 // ---- Tool registration ----
 
-// registerTools registers all 15 Layer 1 (primitive) tools.
+// registerTools registers all 17 Layer 1 (primitive) tools.
 func registerTools(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
 	registerListSessions(s, client)
 	registerCreateHeadless(s, client)
@@ -141,7 +141,7 @@ func registerTools(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmit
 	registerScreenshotPane(s, client)
 }
 
-// registerAgenticScope registers the 6 Layer 2 tools plus essential Layer 1
+// registerAgenticScope registers the 7 Layer 2 tools plus essential Layer 1
 // tools. This is the default scope.
 func registerAgenticScope(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
 	// Essential Layer 1 tools
@@ -285,10 +285,9 @@ func registerListPanes(s *server.MCPServer, client *tmuxClient) {
 
 func registerCapturePane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("capture-pane",
-		mcp.WithDescription("Capture terminal text content from a pane as plain text. Preferred tool for reading command output, logs, and text-based terminal content. Use screenshot-pane only when visual rendering (colors, layout, TUI graphics) matters."),
+		mcp.WithDescription("Capture terminal text content from a pane as plain text. Preferred tool for reading command output, logs, and text-based terminal content. Use screenshot-pane only when visual rendering (colors, layout, TUI graphics) matters. paneId is optional: with no paneId it reads helper slot 1, the pane this agent runs commands in."),
 		mcp.WithString("paneId",
-			mcp.Required(),
-			mcp.Description("Pane ID (e.g. %0) or target"),
+			mcp.Description("Pane ID (e.g. %0) or target (optional; defaults to helper slot 1)"),
 		),
 		mcp.WithNumber("lines",
 			mcp.Description("Number of lines of history to include (default: pane height)"),
@@ -296,19 +295,43 @@ func registerCapturePane(s *server.MCPServer, client *tmuxClient) {
 		mcp.WithBoolean("colors",
 			mcp.Description("Preserve ANSI color escape sequences"),
 		),
-		mcp.WithReadOnlyHintAnnotation(true),
+		slotProperty(),
+		// No readOnlyHint, deliberately, and this is the one place the reason is
+		// written out in full — screenshot-pane and pane-state point here.
+		//
+		// The annotation was correct while paneId was required: the tool read a
+		// pane the caller named and changed nothing. On the no-paneId path it now
+		// goes through resolveHelper first, and resolution SPLITS the user's
+		// window, may adopt one of their idle shells (writing three tmux options
+		// into it), and renames the pane it settles on. readOnlyHint is a licence
+		// for a client to skip confirmation, to prefetch, or to batch — so an
+		// auto-approving client would silently rearrange the user's terminal in
+		// order to answer a question about it, which is the one thing the hint
+		// promises cannot happen.
+		//
+		// Do not restore it by pattern-matching list-panes and list-windows. Those
+		// take an explicit target, create nothing, and keep the annotation
+		// honestly; the difference is the default, not the verb in the name.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		paneID, err := req.RequireString("paneId")
+		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		lines := req.GetInt("lines", 0)
 		colors := req.GetBool("colors", false)
-		content, err := client.CapturePane(ctx, paneID, lines, colors)
+		content, err := client.CapturePane(ctx, tgt.PaneID, lines, colors)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to capture pane", err), nil
 		}
-		return mcp.NewToolResultText(content), nil
+		// The text body is returned untouched. This is the one tool whose entire
+		// contract is "the pane's exact content", so prepending a resolution
+		// header would corrupt the answer and break every assertion anyone has
+		// written against it. The metadata rides alongside in structuredContent,
+		// which costs the text nothing; clients that ignore it lose only the
+		// pane id, which the design says the agent should never need.
+		res := mcp.NewToolResultText(content)
+		res.StructuredContent = tgt.resolution()
+		return res, nil
 	})
 }
 
@@ -354,23 +377,44 @@ func registerCreateWindow(s *server.MCPServer, client *tmuxClient) {
 
 func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("split-pane",
-		mcp.WithDescription("Split a tmux pane horizontally or vertically. If an idle pane already exists in the same window, it will be reused instead of creating a new split (the response will include \"reused\": true)"),
+		mcp.WithDescription("Get a pane to work in, beside the agent, in the window the user is already looking at. With no arguments it returns helper slot 1, creating it if needed; slot:2, slot:3 … give further panes, and slot:\"new\" allocates one nobody else will use. Repeated calls for the same slot return the SAME pane (\"reused\": true), so a process started there is still there next time. Pass paneId only to split a specific pane, in which case direction and size apply and the new pane is unslotted."),
 		mcp.WithString("paneId",
-			mcp.Required(),
-			mcp.Description("Pane ID to split"),
+			mcp.Description("Pane ID to split (optional; defaults to the pane this server runs in)"),
 		),
 		mcp.WithString("direction",
 			mcp.Description(`Split direction: "horizontal" (side-by-side) or "vertical" (top-bottom, default)`),
 			mcp.Enum("horizontal", "vertical"),
 		),
 		mcp.WithNumber("size",
-			mcp.Description("Size of the new pane as a percentage (1-99, default 50)"),
+			mcp.Description("Size of the new pane as a percentage (1-99, default 50). Only applies when paneId is given; on the slot path the server chooses the placement."),
 		),
+		slotProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		paneID, err := req.RequireString("paneId")
+		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+
+		// Slot path: the resolver has already produced the pane, placed by the
+		// server's own rules. Reused is set from Created so a consumer that
+		// predates slots and keys on "reused" keeps reading a true answer.
+		if tgt.Slot != 0 {
+			windowID, _ := client.getWindowIDForPane(ctx, tgt.PaneID)
+			return jsonResult(&CreatedPane{
+				PaneID:   tgt.PaneID,
+				WindowID: windowID,
+				Reused:   !tgt.Created,
+				Slot:     tgt.Slot,
+				Created:  tgt.Created,
+			})
+		}
+
+		// Explicit-paneId path, unchanged. Note that paneId means something
+		// different on this tool than on every other one: it is the pane to
+		// SPLIT — an anchor — not the pane the caller wants back. That is why
+		// direction and size exist here and nowhere else, and why this branch
+		// does its own work instead of using tgt.PaneID as a destination.
+		paneID := tgt.PaneID
 		direction := req.GetString("direction", "vertical")
 		size := req.GetInt("size", 0)
 
@@ -394,10 +438,16 @@ func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 
 func registerSendKeys(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("send-keys",
-		mcp.WithDescription("Send keystrokes to a pane. By default treats input as literal text. Set literal=false to interpret tmux key names (e.g. C-c, Enter, Escape)"),
+		// Three facts an agent needs before its first bare send-keys, and the
+		// last of them is the one nobody expects: with no paneId this call can
+		// ADOPT a pane the user opened. The adoption rules refuse anything that
+		// is not an idle same-user shell, but "idle" is judged from the outside
+		// and cannot see text the user typed without pressing Enter — see
+		// canAcquire. Saying so here is the difference between a documented
+		// trade-off and a surprise.
+		mcp.WithDescription("Send keystrokes to a pane. By default treats input as literal text. Set literal=false to interpret tmux key names (e.g. C-c, Enter, Escape). paneId is optional: with no paneId the keys go to helper slot 1, which is CREATED beside the agent if it does not exist yet, or ADOPTED from an idle unused shell already open in the same window. It is never the agent's own pane. Pass an explicit paneId whenever you already know the pane."),
 		mcp.WithString("paneId",
-			mcp.Required(),
-			mcp.Description("Pane ID to send keys to"),
+			mcp.Description("Pane ID to send keys to (optional; defaults to helper slot 1)"),
 		),
 		mcp.WithString("keys",
 			mcp.Required(),
@@ -409,31 +459,33 @@ func registerSendKeys(s *server.MCPServer, client *tmuxClient) {
 		mcp.WithBoolean("enter",
 			mcp.Description("Append an Enter keystroke after the keys (default false)"),
 		),
+		slotProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		paneID, err := req.RequireString("paneId")
+		// keys is validated before the pane is resolved, and the order matters:
+		// resolution can CREATE a pane, and a call that is going to be rejected
+		// for a missing argument must not leave a new split behind.
+		keys, err := req.RequireString("keys")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		keys, err := req.RequireString("keys")
+		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		literal := req.GetBool("literal", true)
 		enter := req.GetBool("enter", false)
-		if err := client.SendKeys(ctx, paneID, keys, literal, enter); err != nil {
+		if err := client.SendKeys(ctx, tgt.PaneID, keys, literal, enter); err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to send keys", err), nil
 		}
-		return jsonResult(struct {
-			PaneID string `json:"paneId"`
-		}{PaneID: paneID})
+		return jsonResult(tgt.resolution())
 	})
 }
 
 func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("execute-command",
-		mcp.WithDescription("Run a shell command in a pane and wait for it to complete. Returns the full output and exit code. When headless=true and no paneId is provided, a temporary isolated session is created, the command runs, and the session is cleaned up automatically (no paneId in response)."),
+		mcp.WithDescription("Run a shell command in a pane and wait for it to complete. Returns the full output and exit code. paneId is optional: with no paneId the command runs in helper slot 1, a pane beside the agent that is created or adopted on first use and reused after that — never the agent's own pane. When headless=true and no paneId is provided, a temporary isolated session is created instead, the command runs, and the session is cleaned up automatically (no paneId in response)."),
 		mcp.WithString("paneId",
-			mcp.Description("Pane ID to run the command in. Required when headless=false."),
+			mcp.Description("Pane ID to run the command in (optional; defaults to helper slot 1)"),
 		),
 		mcp.WithString("command",
 			mcp.Required(),
@@ -445,15 +497,27 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 		mcp.WithNumber("timeoutSeconds",
 			mcp.Description("Maximum seconds to wait for the command to complete before returning with timedOut:true and partial output (default: no timeout)"),
 		),
+		slotProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// command first: resolution can create a pane, and a call that will be
+		// rejected for a missing argument must not leave a split behind.
 		command, err := req.RequireString("command")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		headless := req.GetBool("headless", false)
-		paneID := req.GetString("paneId", "")
+		// This tool used to answer "paneId is required when headless=false", and
+		// that refusal is exactly the incident this design comes from: an agent
+		// told it may not run a command without naming a pane goes looking for
+		// $TMUX_PANE and starts driving raw tmux. It delivers keystrokes like
+		// send-keys does, so it resolves like send-keys does.
+		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{AllowHeadless: true})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 
-		// Apply per-call timeout if provided.
+		// Apply per-call timeout if provided. It is applied after resolution so
+		// that it bounds the command, as it always has, rather than the pane
+		// creation that may precede it.
 		timeoutSecs := req.GetInt("timeoutSeconds", 0)
 		if timeoutSecs > 0 {
 			var cancel context.CancelFunc
@@ -461,7 +525,7 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 			defer cancel()
 		}
 
-		if headless && paneID == "" {
+		if tgt.Headless {
 			// One-shot headless execution: create session, run, destroy.
 			created, err := client.CreateHeadlessSession(ctx, "", "")
 			if err != nil {
@@ -482,13 +546,11 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 			}{Output: result.Output, ExitCode: result.ExitCode, TimedOut: result.TimedOut})
 		}
 
-		if paneID == "" {
-			return mcp.NewToolResultError("paneId is required when headless=false"), nil
-		}
-		result, err := client.ExecuteCommand(ctx, paneID, command)
+		result, err := client.ExecuteCommand(ctx, tgt.PaneID, command)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
 		}
+		result.Slot, result.Created = tgt.Slot, tgt.Created
 		return jsonResult(result)
 	})
 }
@@ -646,10 +708,9 @@ func registerKillPane(s *server.MCPServer, client *tmuxClient) {
 
 func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("screenshot-pane",
-		mcp.WithDescription("Render a visual PNG screenshot of a terminal pane with full ANSI colors, styles, and layout via xterm.js. Returns an image the model can see. Use ONLY when visual appearance matters (TUI layouts, color-coded output, ANSI art). For reading text content, prefer capture-pane instead."),
+		mcp.WithDescription("Render a visual PNG screenshot of a terminal pane with full ANSI colors, styles, and layout via xterm.js. Returns an image the model can see. Use ONLY when visual appearance matters (TUI layouts, color-coded output, ANSI art). For reading text content, prefer capture-pane instead. paneId is optional: with no paneId it renders helper slot 1."),
 		mcp.WithString("paneId",
-			mcp.Required(),
-			mcp.Description("Pane ID (e.g. %0) or target"),
+			mcp.Description("Pane ID (e.g. %0) or target (optional; defaults to helper slot 1)"),
 		),
 		mcp.WithString("theme",
 			mcp.Description(`Color theme: "dark" (default) or "light"`),
@@ -659,16 +720,29 @@ func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
 			mcp.Description(`Output mode: default returns a PNG image; "browser" opens in system browser; "html" returns raw HTML as text`),
 			mcp.Enum("browser", "html"),
 		),
-		mcp.WithReadOnlyHintAnnotation(true),
+		slotProperty(),
+		// No readOnlyHint: with no paneId this renders whatever resolution hands
+		// back, and resolution can split the user's window, adopt one of their
+		// shells and rename a pane. See capture-pane for the full reason.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		paneID, err := req.RequireString("paneId")
+		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		theme := req.GetString("theme", "dark")
 		output := req.GetString("output", "")
 
-		return handleScreenshotPane(ctx, client, paneID, theme, output)
+		res, err := handleScreenshotPane(ctx, client, tgt.PaneID, theme, output)
+		if err != nil {
+			return res, err
+		}
+		// Same reasoning as capture-pane: the content is an image (or the HTML
+		// fallback) and must stay exactly that, so the resolution rides in
+		// structuredContent instead of being written into the picture.
+		if res != nil {
+			res.StructuredContent = tgt.resolution()
+		}
+		return res, nil
 	})
 }
 

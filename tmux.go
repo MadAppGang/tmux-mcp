@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,11 +41,17 @@ type Pane struct {
 }
 
 // CommandResult holds the output and exit code of a completed command.
+//
+// Slot and Created are set only when the caller let the server choose the pane;
+// both are omitempty, so a call that named a paneId gets exactly the object it
+// always got.
 type CommandResult struct {
 	PaneID   string `json:"paneId"`
 	Output   string `json:"output"`
 	ExitCode int    `json:"exitCode"`
 	TimedOut bool   `json:"timedOut,omitempty"`
+	Slot     int    `json:"slot,omitempty"`
+	Created  bool   `json:"created,omitempty"`
 }
 
 // CreatedSession holds the IDs returned when a new session is created.
@@ -63,10 +70,18 @@ type CreatedWindow struct {
 }
 
 // CreatedPane holds the IDs returned when a new pane is created.
+//
+// Reused and Created say almost the same thing from opposite ends, and both are
+// kept on purpose. Reused predates slots and some consumer somewhere keys on it,
+// so the slot path sets Reused = !Created rather than leaving it absent; Created
+// is the field the rest of the slot-aware tools use, and it means "new to this
+// slot", which on this tool is also "new pane".
 type CreatedPane struct {
 	PaneID   string `json:"paneId"`
 	WindowID string `json:"windowId"`
 	Reused   bool   `json:"reused,omitempty"`
+	Slot     int    `json:"slot,omitempty"`
+	Created  bool   `json:"created,omitempty"`
 }
 
 // headlessSocket is the tmux socket name used for isolated headless sessions.
@@ -113,15 +128,43 @@ const headlessPrefix = "headless:"
 // panes look agent-owned, and pane reuse would then run commands in their
 // shell. A single option value can equal only one pane's ID, so the witness
 // makes that failure structurally impossible rather than merely unlikely.
+//
+// The same hazard applies verbatim to paneOptSlot, and with a sharper edge. A
+// slot marker leaked to session scope would make *every* pane in the user's
+// session answer to slot 1, so the next resolution would hand the agent one of
+// the user's shells and call it "the helper pane" — the witness failure of the
+// original bug, now on a path that types into the pane rather than merely
+// listing it. That is why the slot is never read on its own: every read of
+// paneOptSlot or paneOptOwner goes through paneRegistryInWindow (a window) or
+// paneRecordFor (a single pane), and both fetch paneOptWitness in the *same*
+// tmux call and reject the record unless it equals the pane's own ID. Two
+// readers, both here, both next to this comment — so "did this new read keep
+// the witness?" is a question with only two places to look rather than one per
+// caller.
+//
+// There is exactly one further reader, paneOwnerMark, and it deliberately does
+// not apply the witness. It asks the opposite question — "is this pane wholly
+// unclaimed?" — where a leaked or unrecognised value must mean "hands off". The
+// witness exists to stop a leak making a pane look OURS; there it would make a
+// leak look like permission. See that function for why the inversion is safe.
 const (
 	paneOptWitness = "@mcp_pane"
 	paneOptOwner   = "@mcp_owner"
+	paneOptSlot    = "@mcp_slot" // "1", "2", … — the default helper is slot 1
 	ownerAgent     = "agent"
+	ownerAcquired  = "acquired" // the user opened the pane; we adopted it
 )
 
 // tmuxClient wraps tmux CLI interactions.
 type tmuxClient struct {
 	shellType string
+
+	// slotMu serialises helper-pane slot resolution inside this process. It
+	// lives on the client rather than in a package-level var because the server
+	// builds exactly one client (main.go) and the tests that construct their own
+	// are single-threaded; see resolveHelper for what the lock does and does not
+	// protect against.
+	slotMu sync.Mutex
 }
 
 func newTmuxClient(shellType string) *tmuxClient {
@@ -402,12 +445,115 @@ func (t *tmuxClient) createSessionOnSocket(ctx context.Context, socket, name, co
 // paneID must be a bare tmux ID (no "headless:" prefix), because it is compared
 // against #{pane_id}, which tmux always reports bare.
 func (t *tmuxClient) markPaneOwned(ctx context.Context, socket, paneID string) error {
+	return t.markPaneOwnedAs(ctx, socket, paneID, ownerAgent, 0)
+}
+
+// markPaneOwnedAs records a pane in the registry under a given owner and slot.
+//
+// The write order is witness → owner → slot, and it is not arbitrary. tmux gives
+// no way to set several options atomically, so any *prefix* of this sequence is
+// a state a crashed or cancelled process can leave behind, and the order is
+// chosen so that every prefix is inert. Witness-only, and witness+owner, are
+// both rejected by slot resolution — which requires all three — so neither can
+// steer a later call towards a pane that is only half claimed. The reverse order
+// would publish a slot marker on a pane with no recorded owner, and the teardown
+// rule keys off exactly that owner value to decide whether a pane may be killed
+// or must merely be released: a slotted pane of unknown ownership is the one
+// record we must never produce.
+//
+// slot <= 0 writes no slot marker at all rather than clearing one. A pane being
+// claimed for the first time has nothing to clear, and adding an unconditional
+// unset would put a third tmux call on every pane creation for no gain;
+// setPaneSlot(id, 0) is the explicit way to remove a marker from a pane that has
+// one.
+//
+// paneID must be a bare tmux ID (no "headless:" prefix). This differs from
+// setPaneSlot, clearPaneRegistration and setPaneTitle, which take the prefixed
+// ID and call parseTarget themselves — the split exists because this function's
+// callers are mid-creation and already hold both halves, while the others are
+// handed an ID from a response. It is a latent trap (a prefixed ID here would be
+// written as a witness that can never equal #{pane_id}, producing a pane that is
+// permanently invisible to the registry), which is why it is restated on all
+// five functions rather than assumed.
+func (t *tmuxClient) markPaneOwnedAs(ctx context.Context, socket, paneID, owner string, slot int) error {
 	if _, err := t.runWithSocket(ctx, socket,
 		"set-option", "-p", "-t", paneID, paneOptWitness, paneID); err != nil {
 		return err
 	}
+	if _, err := t.runWithSocket(ctx, socket,
+		"set-option", "-p", "-t", paneID, paneOptOwner, owner); err != nil {
+		return err
+	}
+	if slot <= 0 {
+		return nil
+	}
 	_, err := t.runWithSocket(ctx, socket,
-		"set-option", "-p", "-t", paneID, paneOptOwner, ownerAgent)
+		"set-option", "-p", "-t", paneID, paneOptSlot, strconv.Itoa(slot))
+	return err
+}
+
+// setPaneSlot sets or (slot <= 0) unsets the slot marker on an already-owned
+// pane. It is the healing half of slot resolution — clearing the marker from the
+// losers of a duplicate-slot race, and from a pane being released — and so it
+// deliberately does not touch the witness or the owner: the pane stays ours, it
+// just stops answering to a slot.
+//
+// set-option -p -u is idempotent (rc=0 even when the option was never set,
+// verified on tmux 3.7b), which is what lets callers clear a marker without
+// first reading whether there is one.
+//
+// paneID is the prefixed ID as responses report it; parseTarget routes it.
+func (t *tmuxClient) setPaneSlot(ctx context.Context, paneID string, slot int) error {
+	socket, bareID := parseTarget(paneID)
+	if slot <= 0 {
+		_, err := t.runWithSocket(ctx, socket,
+			"set-option", "-p", "-u", "-t", bareID, paneOptSlot)
+		return err
+	}
+	_, err := t.runWithSocket(ctx, socket,
+		"set-option", "-p", "-t", bareID, paneOptSlot, strconv.Itoa(slot))
+	return err
+}
+
+// clearPaneRegistration removes all three markers, in the reverse of the write
+// order — slot, then owner, then witness — for the same reason markPaneOwnedAs
+// writes them forwards: every prefix of the teardown leaves the pane less
+// claimed than before, never more. Stopping halfway can only ever produce a pane
+// we have given up on, never one we still steer.
+//
+// It is used when releasing an acquired pane. Clearing all three, rather than
+// only the slot, is the truthful state: we no longer own the pane. Leaving
+// @mcp_owner=acquired behind would retire the pane forever, because the
+// acquisition predicate requires the owner option to be *unset* — the pane would
+// be both unusable by us and, to the user, an ordinary shell that the agent
+// mysteriously refuses to touch again.
+//
+// paneID is the prefixed ID as responses report it; parseTarget routes it.
+func (t *tmuxClient) clearPaneRegistration(ctx context.Context, paneID string) error {
+	socket, bareID := parseTarget(paneID)
+	for _, opt := range []string{paneOptSlot, paneOptOwner, paneOptWitness} {
+		if _, err := t.runWithSocket(ctx, socket,
+			"set-option", "-p", "-u", "-t", bareID, opt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// setPaneTitle labels a helper pane so the user can see which panes are the
+// agent's ("agent", "agent:2", …).
+//
+// select-pane -T sets the title and returns without selecting: verified on tmux
+// 3.7b, where the active pane was unchanged after titling an inactive one. That
+// check matters as much as the -d flag on split-window above — stealing focus in
+// order to write a label would move the user's cursor out of whatever they were
+// typing, which is the precise interruption -d exists to prevent, and it would
+// arrive from a purely cosmetic operation.
+//
+// paneID is the prefixed ID as responses report it; parseTarget routes it.
+func (t *tmuxClient) setPaneTitle(ctx context.Context, paneID, title string) error {
+	socket, bareID := parseTarget(paneID)
+	_, err := t.runWithSocket(ctx, socket, "select-pane", "-t", bareID, "-T", title)
 	return err
 }
 
@@ -483,7 +629,20 @@ func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, si
 		args = append(args, "-h")
 	}
 	if size > 0 {
-		args = append(args, "-p", strconv.Itoa(size))
+		// "-l N%" and not "-p N". They mean the same thing, but -p is the
+		// deprecated spelling and modern tmux has dropped it: on tmux 3.4
+		// (Ubuntu 24.04, and so CI) "split-window -p 50" fails with "size
+		// missing", because the flag no longer takes a value and 50 is then
+		// parsed as the shell command to run. -l accepts a percentage suffix
+		// and has done since tmux 3.1, so it is the spelling that works on both.
+		//
+		// This was survivable while size was an argument callers rarely passed —
+		// split-pane defaults it to 0, which appends neither flag. It stopped
+		// being survivable when helper placement started requesting 50% for
+		// every slot, which put the deprecated flag on the default path of every
+		// resolution. Local tmux was new enough to accept it and CI was not,
+		// which is exactly the split a version-sensitive flag produces.
+		args = append(args, "-l", strconv.Itoa(size)+"%")
 	}
 	out, err := t.runWithSocket(ctx, socket, args...)
 	if err != nil {
@@ -493,9 +652,15 @@ func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, si
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("unexpected tmux output: %q", out)
 	}
-	if e := t.markPaneOwned(ctx, socket, parts[0]); e != nil {
-		fmt.Fprintf(os.Stderr, "DEBUG markPaneOwned(%q) FAILED: %v\n", parts[0], e)
-	}
+	// The mark's error is deliberately dropped: a split that worked must not be
+	// reported as a failure because its registry markers did not stick. The pane
+	// is real and usable either way; what it loses is its record, so slot
+	// resolution will not reuse it and close-pane will refuse to touch it — a
+	// pane the user has to close by hand, which is a smaller harm than no pane at
+	// all. It is not logged either: this server speaks JSON-RPC on stdout and
+	// shares the host agent's stderr, where a stray line is noise in someone
+	// else's log.
+	_ = t.markPaneOwned(ctx, socket, parts[0])
 
 	prefix := ""
 	if socket != "" {
@@ -785,16 +950,83 @@ func (t *tmuxClient) getWindowIDForPane(ctx context.Context, paneID string) (str
 	return id, nil
 }
 
-// ownedPanesInWindow returns the panes in the window that we created, keyed by
-// the same (possibly "headless:"-prefixed) ID that ListPanes reports.
+// paneRecord is one pane's registry entry, as read back from its tmux options.
+// A zero Slot means "no slot marker"; slots start at 1.
+type paneRecord struct {
+	PaneID string // as ListPanes reports it — "headless:" prefix preserved
+	Owner  string // ownerAgent or ownerAcquired; never empty in a valid record
+	Slot   int    // 0 when the pane carries no slot marker
+	Dead   bool   // #{pane_dead}: the pane exists but its process has exited
+}
+
+// registryFormat is the tmux format string both registry readers use. Keeping
+// it in one place is what makes the witness impossible to drop from one of
+// them: there is a single expression naming all three option variables, and it
+// always names paneOptWitness alongside the other two.
+func registryFormat() string {
+	return fmt.Sprintf("#{pane_id}\t#{%s}\t#{%s}\t#{%s}\t#{pane_dead}",
+		paneOptWitness, paneOptOwner, paneOptSlot)
+}
+
+// parseRegistryLine turns one line of registryFormat output into a record.
+// ok is false when the line is malformed or when the pane carries no valid
+// registry record. prefix is "headless:" for panes on the headless socket.
 //
-// A pane counts as ours only when its witness equals its own ID *and* it is
-// marked as agent-owned. Requiring the witness is what makes the check safe
-// against a session-scoped option leak — see paneOptWitness.
-func (t *tmuxClient) ownedPanesInWindow(ctx context.Context, windowID string) (map[string]bool, error) {
+// The witness test lives here rather than in each caller for the reason given
+// on paneOptWitness: a record is only a record when the pane says so about
+// itself, in the same read.
+//
+// An unrecognised owner is treated as "not ours" rather than as an error. A
+// later version may add owner kinds, and an old binary must never adopt, reuse
+// or kill a pane whose ownership semantics it does not implement — forward
+// compatibility here means doing nothing, not guessing.
+func parseRegistryLine(line, prefix string) (paneRecord, bool) {
+	// SplitN with the exact field count, not Split: an option that is unset
+	// renders as an empty field, so a valid line can have empty middles and
+	// must still parse. runWithSocket trims only "\n", never tabs, so the
+	// field count is stable.
+	parts := strings.SplitN(line, "\t", 5)
+	if len(parts) != 5 {
+		return paneRecord{}, false
+	}
+	paneID, witness, owner, slotField, dead := parts[0], parts[1], parts[2], parts[3], parts[4]
+	if paneID == "" || witness != paneID {
+		return paneRecord{}, false
+	}
+	if owner != ownerAgent && owner != ownerAcquired {
+		return paneRecord{}, false
+	}
+	// A garbage or negative slot marker degrades to "unslotted agent pane"
+	// rather than failing the read. Atoi's error is deliberately dropped: one
+	// unparseable option value must not take down every resolution in the
+	// window, and an owned pane with no usable slot is still a legitimate,
+	// safely handled state.
+	slot, _ := strconv.Atoi(strings.TrimSpace(slotField))
+	if slot < 0 {
+		slot = 0
+	}
+	return paneRecord{
+		PaneID: prefix + paneID,
+		Owner:  owner,
+		Slot:   slot,
+		Dead:   dead == "1",
+	}, true
+}
+
+// paneRegistryInWindow returns every pane in the window that carries a valid
+// registry record, keyed by the same (possibly "headless:"-prefixed) ID that
+// ListPanes reports. One tmux call, five format variables.
+//
+// A record counts only when the witness equals the pane's own ID and the owner
+// is a value this binary recognises — see parseRegistryLine.
+//
+// Dead is carried because a pane whose process has exited still appears in
+// list-panes when the user has remain-on-exit set. Such a pane accepts
+// send-keys and silently swallows every keystroke, which is the worst possible
+// failure for a helper pane: no error, no output, no clue.
+func (t *tmuxClient) paneRegistryInWindow(ctx context.Context, windowID string) (map[string]paneRecord, error) {
 	socket, bareID := parseTarget(windowID)
-	out, err := t.runWithSocket(ctx, socket, "list-panes", "-t", bareID,
-		"-F", fmt.Sprintf("#{pane_id}\t#{%s}\t#{%s}", paneOptWitness, paneOptOwner))
+	out, err := t.runWithSocket(ctx, socket, "list-panes", "-t", bareID, "-F", registryFormat())
 	if err != nil {
 		return nil, err
 	}
@@ -802,15 +1034,98 @@ func (t *tmuxClient) ownedPanesInWindow(ctx context.Context, windowID string) (m
 	if socket != "" {
 		prefix = headlessPrefix
 	}
-	owned := make(map[string]bool)
+	reg := make(map[string]paneRecord)
 	for _, line := range strings.Split(out, "\n") {
-		parts := strings.Split(line, "\t")
-		if len(parts) != 3 {
+		rec, ok := parseRegistryLine(line, prefix)
+		if !ok {
 			continue
 		}
-		paneID, witness, owner := parts[0], parts[1], parts[2]
-		if witness == paneID && owner == ownerAgent {
-			owned[prefix+paneID] = true
+		reg[rec.PaneID] = rec
+	}
+	return reg, nil
+}
+
+// paneRecordFor returns the registry record for a single pane. found is false
+// when the pane carries no valid record — which is the normal answer for one of
+// the user's own panes, and the reason close-pane refuses to touch it.
+//
+// display-message -p evaluates the format in the target pane's context, so
+// #{@mcp_pane} resolves exactly as it does inside list-panes and the witness
+// comparison is the same comparison.
+func (t *tmuxClient) paneRecordFor(ctx context.Context, paneID string) (paneRecord, bool, error) {
+	socket, bareID := parseTarget(paneID)
+	out, err := t.runWithSocket(ctx, socket, "display-message", "-t", bareID, "-p", registryFormat())
+	if err != nil {
+		return paneRecord{}, false, err
+	}
+	prefix := ""
+	if socket != "" {
+		prefix = headlessPrefix
+	}
+	rec, ok := parseRegistryLine(out, prefix)
+	if !ok {
+		return paneRecord{}, false, nil
+	}
+	return rec, true, nil
+}
+
+// paneOwnerMark returns the raw @mcp_owner value a pane renders, whatever it is.
+//
+// This is deliberately NOT a registry read, and it is the one place in the file
+// that is allowed not to be. Its question is the opposite of the registry's: not
+// "is this pane ours?" — which requires the witness, because a leaked option
+// could otherwise make the user's shells look like ours — but "is this pane
+// completely unclaimed?", where every answer other than the empty string means
+// "leave it alone".
+//
+// Reading it without the witness is therefore the conservative direction, and
+// closes two holes the witnessed read cannot. A pane marked by a NEWER version
+// of this binary carries an owner kind parseRegistryLine does not recognise, so
+// it is absent from the registry and would otherwise look unclaimed and be
+// adopted — exactly the forward-compatibility failure the registry comment warns
+// against. And an @mcp_owner leaked to session scope makes every pane in the
+// session answer here, which stops acquisition dead rather than enabling it:
+// wrong in the direction of doing nothing.
+func (t *tmuxClient) paneOwnerMark(ctx context.Context, paneID string) (string, error) {
+	socket, bareID := parseTarget(paneID)
+	out, err := t.runWithSocket(ctx, socket, "display-message", "-t", bareID, "-p",
+		fmt.Sprintf("#{%s}", paneOptOwner))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// ownedPanesInWindow returns the panes in the window that we *created*, keyed by
+// the same (possibly "headless:"-prefixed) ID that ListPanes reports.
+//
+// This is deliberately narrower than paneRegistryInWindow: it excludes panes
+// with owner ownerAcquired. Its only caller is findIdlePaneInWindow, which backs
+// split-pane's reuse, and split-pane's contract is that a pane reported
+// "reused": true was created by the server and is therefore safe to kill. An
+// acquired pane is one the *user* opened; widening this set would silently
+// convert "reused": true into a licence to kill a pane the user is using, which
+// is the one unrecoverable half of the whole hazard.
+//
+// Slot resolution needs both owner kinds and calls paneRegistryInWindow
+// directly. The two callers want genuinely different sets, so they get two
+// functions rather than one function with a flag.
+//
+// Dead panes are deliberately NOT filtered here even though the record now
+// carries the flag. A dead pane reaches GetPaneState today, which reports
+// IsAlive: false, and paneIsIdleShell rejects it; filtering earlier would be
+// equivalent *today* but is still a behaviour change to a path with existing
+// tests. The Dead flag is for the new resolver, which has no GetPaneState call
+// to lean on.
+func (t *tmuxClient) ownedPanesInWindow(ctx context.Context, windowID string) (map[string]bool, error) {
+	reg, err := t.paneRegistryInWindow(ctx, windowID)
+	if err != nil {
+		return nil, err
+	}
+	owned := make(map[string]bool, len(reg))
+	for id, rec := range reg {
+		if rec.Owner == ownerAgent {
+			owned[id] = true
 		}
 	}
 	return owned, nil

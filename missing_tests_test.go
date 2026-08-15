@@ -246,13 +246,18 @@ func TestScopeAgentic(t *testing.T) {
 		"kill-headless-server",
 		"kill-pane",
 		"screenshot-pane",
-		// Layer 2 (6 agent workflow tools)
+		// Layer 2 (7 agent workflow tools)
 		"start-and-watch",
 		"watch-pane",
 		"pane-state",
 		"run-in-repl",
 		"write-to-display",
 		"display-message",
+		// close-pane is the owner-aware inverse of slot resolution, and belongs
+		// in Layer 2 rather than beside kill-pane: it is a workflow tool that
+		// knows which panes are the agent's, not a primitive that destroys what
+		// it is pointed at.
+		"close-pane",
 	}
 	for _, tool := range agenticRequired {
 		if !names[tool] {
@@ -366,6 +371,7 @@ func TestScopePrimitives(t *testing.T) {
 	agenticOnly := []string{
 		"start-and-watch",
 		"watch-pane",
+		"close-pane",
 	}
 	for _, tool := range agenticOnly {
 		if names[tool] {
