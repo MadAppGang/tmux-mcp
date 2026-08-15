@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -146,6 +148,95 @@ func TestSlotAndHeadlessAlwaysConflict(t *testing.T) {
 	}
 }
 
+// slotLiteral matches the form a description uses to show a slot value —
+// slot:2, slot:"all" — which is also the form an agent copies verbatim into its
+// next call. Prose like "helper slot 1" is not matched, and does not need to be:
+// nothing has ever been steered wrong by a sentence, only by an example.
+var slotLiteral = regexp.MustCompile(`slot:\s*"?([A-Za-z0-9_-]+)"?`)
+
+// TestDescriptionsAdvertiseOnlySlotsThatParse is the guard for the failure this
+// whole server exists to eliminate: a description that tells an agent to do
+// something the code refuses.
+//
+// The concrete case was split-pane, which went on advertising `slot:"new"` for a
+// release after parseSlotArg started rejecting it with "slot must be an integer
+// from 1 to 64". An agent that read that description and followed it failed on
+// every single call, and the only signal was an error message contradicting the
+// documentation it had just been given — which is exactly when an agent goes
+// looking for another route into the terminal, and finds raw tmux.
+//
+// So the rule is checked rather than remembered, and checked against the parser
+// itself rather than a list of forbidden words. Every slot literal any tool
+// shows, in its own description or in its arguments', is fed to the parser that
+// tool actually uses. A value that survives the round trip is one an agent can
+// copy; a value that does not is a lie, whatever it happens to be. That covers
+// the next removed form as well as this one, and it costs nothing when a value
+// is added: make it parse and the test goes green by itself.
+//
+// The descriptions are read from tools/list rather than from the source, because
+// tools/list is what the agent is shown.
+func TestDescriptionsAdvertiseOnlySlotsThatParse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	c := newMCPClient(t)
+
+	raw := c.call(t, "tools/list", map[string]any{})
+	var list struct {
+		Tools []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			InputSchema struct {
+				Properties map[string]struct {
+					Description string `json:"description"`
+				} `json:"properties"`
+			} `json:"inputSchema"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		t.Fatalf("unmarshal tools/list: %v", err)
+	}
+
+	checked := 0
+	for _, tool := range list.Tools {
+		texts := []string{tool.Description}
+		for _, prop := range tool.InputSchema.Properties {
+			texts = append(texts, prop.Description)
+		}
+		for _, text := range texts {
+			for _, m := range slotLiteral.FindAllStringSubmatch(text, -1) {
+				value := m[1]
+				checked++
+				// close-pane parses its own argument, because it is the one tool
+				// whose slot is an integer-or-"all" union. Every other tool goes
+				// through parseSlotArg, so "all" advertised anywhere else is as
+				// wrong as "new" is here.
+				var err error
+				if tool.Name == "close-pane" {
+					_, _, _, err = parseCloseSlotArg(slotRequest(value))
+				} else {
+					_, _, err = parseSlotArg(slotRequest(value))
+				}
+				if err != nil {
+					t.Errorf("%s advertises %s, and its own parser refuses it: %v\n"+
+						"An agent that reads this description and follows it fails every call, and a "+
+						"tool that contradicts its own documentation is what sends agents to raw tmux.",
+						tool.Name, m[0], err)
+				}
+			}
+		}
+	}
+
+	// The lower bound is what stops this passing by finding nothing — a regex
+	// that stopped matching, or a schema that stopped carrying descriptions,
+	// would otherwise look like a clean run. split-pane alone shows two.
+	if checked < 3 {
+		t.Errorf("only %d slot literals were found in any tool description; the descriptions that "+
+			"teach an agent how to name a pane have gone missing, or this test has stopped "+
+			"recognising them", checked)
+	}
+}
+
 // ---- No consumer breaks ----
 
 // TestExplicitPaneIdResponsesAreUnchanged is the evidence for "paneId keeps
@@ -214,6 +305,38 @@ func TestExplicitPaneIdResponsesAreUnchanged(t *testing.T) {
 				t.Errorf("%s with an explicit paneId returned a %q key (%v); the resolution fields "+
 					"must be omitted when the caller named the pane", tc.tool, key, out)
 			}
+		}
+	}
+
+	// The two tools whose body is not JSON. capture-pane answers with the pane's
+	// exact text and screenshot-pane with an image, so neither can carry the
+	// resolution in its content and both put it in structuredContent instead —
+	// which is a TOP-LEVEL key of the tool result, and one that neither tool had
+	// before slots existed. paneResolution.PaneID has no omitempty and cannot
+	// have one (a resolved call must always say which pane it picked), so an
+	// unconditional assignment hands a caller that named its own pane a new key
+	// containing the id it just passed in. That is not additive metadata, it is a
+	// changed response shape, and it shipped because this test watched neither
+	// tool.
+	//
+	// screenshot-pane is asked for html rather than its default PNG so the
+	// assertion cannot be skipped on a machine without headless Chrome — the
+	// resolution is attached the same way in every output mode.
+	for _, tc := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"capture-pane", map[string]any{"paneId": paneID}},
+		{"screenshot-pane", map[string]any{"paneId": paneID, "output": "html"}},
+	} {
+		res := callTool(t, c, tc.tool, tc.args)
+		if res.IsError {
+			t.Fatalf("%s errored: %s", tc.tool, res.text(t, tc.tool))
+		}
+		if res.StructuredContent != nil {
+			t.Errorf("%s with an explicit paneId answered with structuredContent %v; this tool had "+
+				"no such key before slots existed, and a call that names its pane must get back "+
+				"exactly what it always got", tc.tool, res.StructuredContent)
 		}
 	}
 
@@ -730,6 +853,143 @@ func TestWriteToDisplayClearRespectsPaneOwnership(t *testing.T) {
 	})
 }
 
+// TestClearDecisionNeverKillsALineOnEvidenceItDoesNotHave is the clear decision
+// enumerated, away from panes and keystrokes.
+//
+// The table is small and every row is a claim about what happens to somebody's
+// unsubmitted command line, so the two paths are walked in full rather than
+// sampled. The rows that matter are the ones where nothing positive is known: an
+// empty owner, or an owner kind this binary does not recognise. On the slot path
+// those must be the REDRAW, because a resolution that reported no owner is a
+// resolution that told us nothing, and "no evidence" is not evidence that the
+// pane is ours. On the explicit path they must be the kill, because that is what
+// this tool did before slots existed and what every caller that split its own
+// display pane relies on — a pane with no record there means "the one I made and
+// pointed you at", and the caller took the safety burden by naming it.
+func TestClearDecisionNeverKillsALineOnEvidenceItDoesNotHave(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		owner  string
+		bySlot bool
+		want   bool
+		why    string
+	}{
+		{"slot resolved to a pane we made", ownerAgent, true, true,
+			"the display pane is ours; each write must replace the last, which needs the kill"},
+		{"slot resolved to a pane we adopted", ownerAcquired, true, false,
+			"the line in it is the user's half-typed command"},
+		{"slot resolved but reported no owner", "", true, false,
+			"a resolution that says nothing is not permission to destroy a line"},
+		{"slot resolved with an owner kind we do not know", "future-owner-kind", true, false,
+			"an unrecognised owner is a pane whose semantics this binary does not implement"},
+		{"explicit paneId with no record", "", false, true,
+			"the pre-slot behaviour: the caller named a display pane it owns"},
+		{"explicit paneId on an adopted pane", ownerAcquired, false, false,
+			"the record positively says the user opened it"},
+		{"explicit paneId on a pane we made", ownerAgent, false, true,
+			"our own pane, named directly"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clearKillsTheLine(tc.owner, tc.bySlot); got != tc.want {
+				verb := map[bool]string{true: "C-u + clear + Enter", false: "C-l (redraw)"}
+				t.Errorf("owner=%q bySlot=%v chose %s, want %s — %s",
+					tc.owner, tc.bySlot, verb[got], verb[tc.want], tc.why)
+			}
+		})
+	}
+}
+
+// TestClearForDisplayTrustsTheOwnerCapturedUnderTheLock is the race, reproduced
+// by its state rather than by its timing.
+//
+// # What is being reproduced
+//
+// resolvePaneArg resolves a slot under slotMu and RELEASES the lock before
+// returning. write-to-display({clear:true}) then acts on that pane with no lock
+// held. A concurrent close-pane on the same slot releases the adopted pane —
+// releaseAcquiredLocked wipes @mcp_pane/@mcp_owner/@mcp_slot and leaves the pane
+// alive, handed back to the user. Land it in that window and a clear which reads
+// the registry AGAIN sees no record at all, reads that as "a pane the caller
+// named explicitly", and sends C-u + `clear` + Enter into a shell the user is
+// typing in: their line destroyed, and Enter pressed on what is left.
+//
+// The state is what does the damage, so the state is what this test builds:
+// resolution really adopts the user's pane and hands back owner=acquired, the
+// registration is really wiped by the same call close-pane makes, and the user
+// really has an unsubmitted command in the pane. What is NOT reproduced is the
+// interleaving — no goroutine loses a race here, because a test that has to win
+// a microsecond-wide window to fail is a test that reports green on a bad day.
+// Everything after the wipe is exactly what the losing thread would do, and the
+// assertion is on what it does to the user's line.
+//
+// Against a clearForDisplay that re-reads the registry this is RED: the read
+// finds nothing, the kill runs, the line is gone and the sentinel file exists.
+// Against one that uses the owner captured during resolution it is GREEN, and it
+// is green for the reason that makes the fix sound rather than lucky — C-l is
+// safe whatever has happened to the pane since.
+func TestClearForDisplayTrustsTheOwnerCapturedUnderTheLock(t *testing.T) {
+	client, self := slotFixture(t)
+	ctx := context.Background()
+
+	// The user's own pane, in a scratch directory so that a line submitted by
+	// accident leaves its file there rather than in the repository.
+	dir := t.TempDir()
+	usersPane := tmuxExec(t, "split-window", "-d", "-c", dir, "-t", self, "-P", "-F", "#{pane_id}")
+	waitForClientPaneIdle(t, client, usersPane)
+
+	pane, slot, created, owner, err := client.resolveHelper(ctx, slotDefault)
+	if err != nil {
+		t.Fatalf("resolveHelper: %v", err)
+	}
+	if pane != usersPane || owner != ownerAcquired {
+		t.Fatalf("the fixture did not exercise adoption: slot 1 resolved to %s (owner %q), want the "+
+			"user's pane %s adopted as %q", pane, owner, usersPane, ownerAcquired)
+	}
+	// The target the handler is holding when the lock goes away.
+	tgt := paneTarget{PaneID: pane, Slot: slot, Created: created, Owner: owner}
+
+	// The concurrent close-pane lands. This is the mutation, verbatim: the
+	// registration is erased and the pane is left alive, which is what "released
+	// back to the user" means.
+	if err := client.clearPaneRegistration(ctx, usersPane); err != nil {
+		t.Fatalf("release the adopted pane: %v", err)
+	}
+	if _, found, err := client.paneRecordFor(ctx, usersPane); err != nil || found {
+		t.Fatalf("the pane still carries a registry record (found=%v err=%v); a re-read would find "+
+			"it and this test would not be reproducing the race at all", found, err)
+	}
+
+	// The pane is theirs again, and they start typing. The trailing space is
+	// load-bearing for the same reason it is in the test above: without it a
+	// "clear" appended to the line would run `touch <sentinel>clear` and create a
+	// different file, so a submitted line would leave the sentinel absent and the
+	// assertion below would report success.
+	sentinel := filepath.Join(dir, "submitted")
+	tmuxExec(t, "send-keys", "-t", usersPane, "-l", "touch "+sentinel+" ")
+	sleep(300 * time.Millisecond)
+
+	if err := client.clearForDisplay(ctx, tgt); err != nil {
+		t.Fatalf("clearForDisplay: %v", err)
+	}
+	sleep(300 * time.Millisecond)
+
+	content, err := client.CapturePane(ctx, usersPane, 0, false)
+	if err != nil {
+		t.Fatalf("capture the pane back: %v", err)
+	}
+	flat := flattenPane(content)
+	if !strings.Contains(flat, flattenPane("touch "+sentinel)) {
+		t.Errorf("the clear destroyed the user's half-typed line on a pane that had been released "+
+			"back to them between resolution and this call — the owner read under slotMu said "+
+			"%q and must have been believed; the pane holds:\n%s", ownerAcquired, flat)
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Errorf("the clear SUBMITTED the user's line — %s exists, so a command they had "+
+			"deliberately not run was run for them, by a tool whose only job was to print text",
+			sentinel)
+	}
+}
+
 // ---- close-pane ----
 
 // closedEntries calls close-pane and returns the entries it reported.
@@ -1126,6 +1386,42 @@ func TestCapturePaneKeepsItsTextBody(t *testing.T) {
 	}
 	if res.StructuredContent["paneId"] != pane {
 		t.Errorf("structuredContent paneId is %v, want %s", res.StructuredContent["paneId"], pane)
+	}
+	if slot, _ := res.StructuredContent["slot"].(float64); int(slot) != 1 {
+		t.Errorf("structuredContent slot is %v, want 1", res.StructuredContent["slot"])
+	}
+}
+
+// TestScreenshotPaneReportsItsResolvedPane is the positive half of the gate that
+// keeps structuredContent off the explicit-paneId path.
+//
+// Withholding the key from a call that named its pane is a compatibility fix;
+// withholding it from a call that resolved a slot would be a feature deleted,
+// and the two are one line apart. A rendered pane cannot say which pane it is —
+// that is the whole reason the resolution rides alongside the image — so a slot
+// call that answers with no structuredContent leaves the caller unable to tell
+// which of its panes it is looking at.
+//
+// html output rather than the default PNG: the assertion is about the metadata,
+// which is attached identically in every mode, and the PNG path needs headless
+// Chrome and would turn a compatibility check into a skip on half the machines
+// that run it.
+func TestScreenshotPaneReportsItsResolvedPane(t *testing.T) {
+	c, _ := agentPaneFixture(t)
+
+	var sent map[string]any
+	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo shot-marker", "enter": true}, &sent)
+	pane := sent["paneId"].(string)
+	waitForPaneIdle(t, c, pane)
+
+	res := callTool(t, c, "screenshot-pane", map[string]any{"output": "html"})
+	if res.IsError {
+		t.Fatalf("screenshot-pane errored: %s", res.text(t, "screenshot-pane"))
+	}
+	if res.StructuredContent["paneId"] != pane {
+		t.Errorf("structuredContent paneId is %v, want the slot-1 pane %s; a rendered pane cannot "+
+			"name itself, so this key is the only answer the caller gets",
+			res.StructuredContent["paneId"], pane)
 	}
 	if slot, _ := res.StructuredContent["slot"].(float64); int(slot) != 1 {
 		t.Errorf("structuredContent slot is %v, want 1", res.StructuredContent["slot"])

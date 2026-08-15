@@ -47,18 +47,39 @@ func slotFixture(t *testing.T) (*tmuxClient, string) {
 	return newTmuxClient("bash"), self
 }
 
+// paneSize returns a pane's width and height in cells, which is how a test sees
+// that a pane was NOT split: tmux takes the room for a new pane out of its
+// anchor, so an anchor's size before and after is the only direct evidence of
+// which pane was chosen.
+func paneSize(t *testing.T, paneID string) (width, height int) {
+	t.Helper()
+	return paneCells(t, paneID, "#{pane_width}\t#{pane_height}")
+}
+
 // paneOrigin returns a pane's top-left cell, used to prove which pane a split
 // was carved out of.
 func paneOrigin(t *testing.T, paneID string) (left, top int) {
 	t.Helper()
-	out := tmuxExec(t, "display-message", "-p", "-t", paneID, "#{pane_left}\t#{pane_top}")
+	return paneCells(t, paneID, "#{pane_left}\t#{pane_top}")
+}
+
+// paneCells reads a pair of integer cell coordinates from a tmux format string.
+//
+// Both callers want the same thing — ask tmux for two numbers about one pane,
+// fail the test if it answers with anything else — and differ only in which two
+// numbers. Keeping the named wrappers means the tests still read as paneSize and
+// paneOrigin rather than as format strings, while the parsing that would
+// otherwise be copied between them exists once.
+func paneCells(t *testing.T, paneID, format string) (int, int) {
+	t.Helper()
+	out := tmuxExec(t, "display-message", "-p", "-t", paneID, format)
 	parts := strings.Split(out, "\t")
 	if len(parts) != 2 {
-		t.Fatalf("unexpected geometry for pane %s: %q", paneID, out)
+		t.Fatalf("pane %s answered %q for format %q, want two tab-separated numbers", paneID, out, format)
 	}
-	left, _ = strconv.Atoi(parts[0])
-	top, _ = strconv.Atoi(parts[1])
-	return left, top
+	first, _ := strconv.Atoi(parts[0])
+	second, _ := strconv.Atoi(parts[1])
+	return first, second
 }
 
 // ---- Resolution ----
@@ -72,7 +93,7 @@ func TestResolveSlotIsIdempotent(t *testing.T) {
 	client, self := slotFixture(t)
 	ctx := context.Background()
 
-	first, slot, created, err := client.resolveHelper(ctx, slotDefault)
+	first, slot, created, owner, err := client.resolveHelper(ctx, slotDefault)
 	if err != nil {
 		t.Fatalf("first resolveHelper: %v", err)
 	}
@@ -85,8 +106,15 @@ func TestResolveSlotIsIdempotent(t *testing.T) {
 	if !created {
 		t.Error("first resolveHelper should have reported created=true — the window had no helper")
 	}
+	// The owner comes back because a pane we made is the one kind of pane whose
+	// line buffer may be destroyed; see clearForDisplay. A resolution that
+	// reported nothing here would push that decision back onto a second,
+	// lock-free registry read, which is the race this field exists to close.
+	if owner != ownerAgent {
+		t.Errorf("a pane this server split reported owner %q, want %q", owner, ownerAgent)
+	}
 
-	second, slot, created, err := client.resolveHelper(ctx, slotDefault)
+	second, slot, created, owner, err := client.resolveHelper(ctx, slotDefault)
 	if err != nil {
 		t.Fatalf("second resolveHelper: %v", err)
 	}
@@ -98,6 +126,12 @@ func TestResolveSlotIsIdempotent(t *testing.T) {
 	}
 	if created {
 		t.Error("second resolveHelper reported created=true for a pane it reused")
+	}
+	// The reuse path reads its owner out of the registry record it chose from,
+	// rather than assuming: a slot can hold a pane the previous call adopted.
+	if owner != ownerAgent {
+		t.Errorf("the reuse path reported owner %q for a pane this server split, want %q",
+			owner, ownerAgent)
 	}
 
 	if title := tmuxExec(t, "display-message", "-p", "-t", first, "#{pane_title}"); title != "agent" {
@@ -114,7 +148,7 @@ func TestResolveSlotAfterKillCreatesAgain(t *testing.T) {
 	client, _ := slotFixture(t)
 	ctx := context.Background()
 
-	first, _, _, err := client.resolveHelper(ctx, slotDefault)
+	first, _, _, _, err := client.resolveHelper(ctx, slotDefault)
 	if err != nil {
 		t.Fatalf("first resolveHelper: %v", err)
 	}
@@ -122,7 +156,7 @@ func TestResolveSlotAfterKillCreatesAgain(t *testing.T) {
 		t.Fatalf("kill helper pane: %v", err)
 	}
 
-	second, _, created, err := client.resolveHelper(ctx, slotDefault)
+	second, _, created, _, err := client.resolveHelper(ctx, slotDefault)
 	if err != nil {
 		t.Fatalf("second resolveHelper: %v", err)
 	}
@@ -144,11 +178,11 @@ func TestSlotPlacement(t *testing.T) {
 	client, self := slotFixture(t)
 	ctx := context.Background()
 
-	one, _, _, err := client.resolveHelper(ctx, 1)
+	one, _, _, _, err := client.resolveHelper(ctx, 1)
 	if err != nil {
 		t.Fatalf("resolve slot 1: %v", err)
 	}
-	two, slot, _, err := client.resolveHelper(ctx, 2)
+	two, slot, _, _, err := client.resolveHelper(ctx, 2)
 	if err != nil {
 		t.Fatalf("resolve slot 2: %v", err)
 	}
@@ -181,6 +215,69 @@ func TestSlotPlacement(t *testing.T) {
 	}
 }
 
+// TestSlotTwoNeverSplitsAnAdoptedPane is the placement table's owner rule, at
+// the one point where the table and the policy disagreed.
+//
+// Slot 2 is normally carved out of the slot-1 pane, so the two helpers stack in
+// a column instead of squeezing the agent's own pane a second time. But the
+// slot-1 pane may be one the agent ADOPTED from the user, and an acquired pane
+// is the user's real estate: halving it rearranges a layout they built by hand.
+// anchorOrSelf states that policy and enforces it for every slot from 4 up; the
+// slot-2 fast path looked its anchor up by slot and liveness alone, so the rule
+// held only in windows where nothing had been adopted — which is to say, not in
+// the windows where it matters.
+//
+// The geometry of the ADOPTED pane is the assertion, because a split is visible
+// there and nowhere else: tmux halves the anchor. Its size before and after is
+// therefore the whole question, and it is asked of tmux rather than of the
+// registry. Where slot 2 does land is checked too, so a placement that avoided
+// the user's pane by putting the helper somewhere absurd is not read as success.
+func TestSlotTwoNeverSplitsAnAdoptedPane(t *testing.T) {
+	client, self := slotFixture(t)
+	ctx := context.Background()
+
+	// The user's own pane, made with raw tmux so the server has never marked it.
+	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
+	waitForClientPaneIdle(t, client, usersPane)
+
+	one, _, _, owner, err := client.resolveHelper(ctx, slotDefault)
+	if err != nil {
+		t.Fatalf("resolve slot 1: %v", err)
+	}
+	if one != usersPane || owner != ownerAcquired {
+		t.Fatalf("the fixture did not exercise adoption: slot 1 resolved to %s (owner %q), want the "+
+			"user's pane %s adopted as %q", one, owner, usersPane, ownerAcquired)
+	}
+	beforeW, beforeH := paneSize(t, usersPane)
+
+	two, slot, _, _, err := client.resolveHelper(ctx, 2)
+	if err != nil {
+		t.Fatalf("resolve slot 2: %v", err)
+	}
+	if slot != 2 {
+		t.Errorf("slot 2 resolution reported slot %d", slot)
+	}
+	if two == usersPane || two == self {
+		t.Fatalf("slot 2 resolved to %s, which is the user's pane or the agent's own", two)
+	}
+
+	if afterW, afterH := paneSize(t, usersPane); afterW != beforeW || afterH != beforeH {
+		t.Errorf("the user's adopted pane %s went from %dx%d to %dx%d when slot 2 was opened: it "+
+			"was split in half to make room. We may type into a pane we adopted; we may not "+
+			"rearrange the layout it sits in, which is the rule anchorOrSelf applies one function "+
+			"away", usersPane, beforeW, beforeH, afterW, afterH)
+	}
+
+	// And it went where the fallback says it should: out of the agent's own pane,
+	// there being no pane in this window that the server made.
+	selfLeft, selfTop := paneOrigin(t, self)
+	twoLeft, twoTop := paneOrigin(t, two)
+	if twoLeft != selfLeft || twoTop <= selfTop {
+		t.Errorf("slot 2 landed at column %d row %d; with no agent-made pane to split it belongs "+
+			"below the agent's own pane at column %d row %d", twoLeft, twoTop, selfLeft, selfTop)
+	}
+}
+
 // TestNumberedSlotsAreIndependent is what remains of the isolation guarantee now
 // that slot:"new" is gone. A caller that wants a pane nobody else will type into
 // names a number nobody else is using — so the property that has to hold is that
@@ -196,7 +293,7 @@ func TestNumberedSlotsAreIndependent(t *testing.T) {
 
 	seen := map[string]int{}
 	for _, want := range []int{1, 2, 3} {
-		pane, slot, created, err := client.resolveHelper(ctx, want)
+		pane, slot, created, _, err := client.resolveHelper(ctx, want)
 		if err != nil {
 			t.Fatalf("resolve slot %d: %v", want, err)
 		}
@@ -239,7 +336,7 @@ func TestResolveHelperNeverReturnsSelf(t *testing.T) {
 		t.Fatalf("fixture is not exercising the case: self carries no slot-1 record (found=%v rec=%+v err=%v)", found, rec, err)
 	}
 
-	pane, _, created, err := client.resolveHelper(ctx, slotDefault)
+	pane, _, created, _, err := client.resolveHelper(ctx, slotDefault)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
@@ -352,7 +449,7 @@ func TestAcquireIdleUnownedPane(t *testing.T) {
 	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
 	waitForClientPaneIdle(t, client, usersPane)
 
-	pane, _, created, err := client.resolveHelper(ctx, slotDefault)
+	pane, _, created, _, err := client.resolveHelper(ctx, slotDefault)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
@@ -378,6 +475,87 @@ func TestAcquireIdleUnownedPane(t *testing.T) {
 	// And it must not be adopted twice into different slots.
 	if _, ok := client.ownedPanesInWindow(ctx, tmuxExec(t, "display-message", "-p", "-t", self, "#{window_id}")); ok != nil {
 		t.Fatalf("ownedPanesInWindow: %v", ok)
+	}
+}
+
+// TestFailedAdoptionLeavesNoPartialMark covers the state a half-written
+// adoption used to leave on one of the USER's panes.
+//
+// markPaneOwnedAs writes witness → owner → slot and stops at the first failure,
+// so a context that expires or one transient tmux error leaves a prefix behind.
+// witness + owner with no slot is a record parseRegistryLine accepts, and it is
+// the worst record this server can produce on a pane it does not own: canAcquire
+// refuses any pane whose owner mark is set at all, so it can never be adopted
+// again; no slot lookup matches it, so it is never reused; and
+// close-pane({slot:"all"}) sweeps slotted records only, so no teardown ever
+// comes back for it. One of the user's shells, wearing our label, invisible to
+// every tool in this server — and nothing but the failing call ever knows.
+//
+// # How the failure is produced
+//
+// By handing the adoption a context that can write nothing, against a pane
+// already carrying the prefix the first two writes leave. Interrupting a real
+// markPaneOwnedAs *between* its second and third tmux calls is not something a
+// test can arrange without winning a race measured in milliseconds, and a test
+// that has to win a race is one that reports green on a bad day. The prefix is
+// written by markPaneOwnedAs itself with slot 0, so it is the genuine article
+// rather than a hand-built approximation, and what is asserted is the property
+// that matters either way: after an adoption that failed, the pane carries
+// nothing of ours and can be adopted again.
+//
+// It also pins the rollback's detached context, which is not an optimisation. A
+// context deadline is the likeliest reason the mark failed in the first place;
+// a cleanup issued on that same dead context is three tmux commands that never
+// run, and the repair would be missing in exactly the case that motivates it.
+// This test's context is cancelled, so a rollback that reused it leaves the
+// markers in place and the assertions below go red.
+//
+// The happy path runs first so that an adoption which simply always fails
+// cannot pass this test.
+func TestFailedAdoptionLeavesNoPartialMark(t *testing.T) {
+	client, self := slotFixture(t)
+	ctx := context.Background()
+
+	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
+	waitForClientPaneIdle(t, client, usersPane)
+
+	if !client.adoptCandidateLocked(ctx, usersPane, slotDefault) {
+		t.Fatalf("adoption of the idle pane %s failed outright; the failure path below would then "+
+			"be the only thing this test exercises", usersPane)
+	}
+	rec, found, err := client.paneRecordFor(ctx, usersPane)
+	if err != nil || !found || rec.Owner != ownerAcquired || rec.Slot != slotDefault {
+		t.Fatalf("a successful adoption left record %+v (found=%v err=%v), want owner %q slot %d",
+			rec, found, err, ownerAcquired, slotDefault)
+	}
+
+	// Back to an unclaimed pane, then to the prefix a mark interrupted after its
+	// second write leaves: witness and owner, no slot.
+	if err := client.clearPaneRegistration(ctx, usersPane); err != nil {
+		t.Fatalf("reset the pane: %v", err)
+	}
+	if err := client.markPaneOwnedAs(ctx, "", usersPane, ownerAcquired, 0); err != nil {
+		t.Fatalf("write the partial mark: %v", err)
+	}
+
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	if client.adoptCandidateLocked(dead, usersPane, slotDefault) {
+		t.Fatal("adoption reported success on a cancelled context, so nothing was written and the " +
+			"pane was claimed anyway — every keystroke sent to it after this would be sent to a " +
+			"pane we cannot identify again")
+	}
+
+	for _, opt := range []string{paneOptSlot, paneOptOwner, paneOptWitness} {
+		if got := tmuxExec(t, "display-message", "-t", usersPane, "-p", "#{"+opt+"}"); got != "" {
+			t.Errorf("%s is still %q on %s after the adoption failed; the pane is stranded — no slot "+
+				"lookup matches it, close-pane({slot:\"all\"}) does not see it, and the owner mark "+
+				"stops it being adopted ever again", opt, got, usersPane)
+		}
+	}
+	if !client.canAcquire(ctx, usersPane, self) {
+		t.Error("the pane cannot be adopted again after a failed adoption; an attempt that did not " +
+			"succeed has to leave the pane exactly as unclaimed as it found it")
 	}
 }
 
@@ -413,7 +591,7 @@ func TestAcquireRejectsPaneRunningCat(t *testing.T) {
 		t.Error("canAcquire accepted a pane running cat; the shell is not the foreground process")
 	}
 
-	pane, _, _, err := client.resolveHelper(ctx, slotDefault)
+	pane, _, _, _, err := client.resolveHelper(ctx, slotDefault)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
@@ -480,7 +658,7 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 		}
 	}
 
-	winner, _, _, err := client.resolveHelper(ctx, slotDefault)
+	winner, _, _, _, err := client.resolveHelper(ctx, slotDefault)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
@@ -717,7 +895,7 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 			go func(slot int) {
 				defer wg.Done()
 				<-release // so they arrive together rather than in start order
-				pane, got, created, err := client.resolveHelper(ctx, slot)
+				pane, got, created, _, err := client.resolveHelper(ctx, slot)
 				first <- resolution{asked: slot, got: got, pane: pane, created: created, err: err}
 			}(slot)
 		}
@@ -806,7 +984,7 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 			go func(slot int) {
 				defer wg2.Done()
 				<-release2
-				pane, got, created, err := client.resolveHelper(ctx, slot)
+				pane, got, created, _, err := client.resolveHelper(ctx, slot)
 				second <- resolution{asked: slot, got: got, pane: pane, created: created, err: err}
 			}(slot)
 		}

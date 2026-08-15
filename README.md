@@ -127,7 +127,9 @@ Three properties are worth knowing:
   that the process you started there earlier is gone.
 - **Explicit `paneId` still wins, and still answers exactly as it always did.** Naming a
   pane bypasses slot resolution entirely; `slot` and `created` are omitted from the
-  response.
+  response, and `capture-pane` and `screenshot-pane` — whose bodies are text and an image,
+  so their resolution has to ride in `structuredContent` — attach nothing at all. The
+  resolution fields appear only on a call that actually resolved a slot.
 
 `close-pane` is the inverse: it kills panes the server created and merely interrupts and
 releases panes it adopted from the user. It refuses any `paneId` it does not recognise as
@@ -145,8 +147,8 @@ looks like, and closing it would destroy the session the request arrived through
 | `list-sessions` | List all tmux sessions | — | `[{id, name, windows, attached}]` |
 | `list-windows` | List windows in a session | `sessionId` | `[{id, name, active, panes}]` |
 | `list-panes` | List panes with dimensions and current path | `windowId` | `[{id, title, active, width, height, currentCommand, currentPath}]` |
-| `capture-pane` | Read terminal content | `slot`, `paneId`, `lines`, `colors` | raw text (+ `structuredContent`) |
-| `screenshot-pane` | Visual screenshot opened in browser | `slot`, `paneId`, `theme`, `output` | image, file path, or HTML |
+| `capture-pane` | Read terminal content | `slot`, `paneId`, `lines`, `colors` | raw text (+ `structuredContent` when a slot was resolved) |
+| `screenshot-pane` | Visual screenshot opened in browser | `slot`, `paneId`, `theme`, `output` | image, file path, or HTML (+ `structuredContent` when a slot was resolved) |
 | `create-session` | Create a detached session | `name` (optional) | `{sessionId, sessionName, windowId, paneId}` |
 | `create-window` | Add a window to a session | `sessionId`, `name` | `{windowId, windowName, paneId}` |
 | `split-pane` | Get a pane to work in beside the agent. With no arguments returns helper slot 1, creating or reusing it; `paneId` splits a specific pane instead | `slot`, `paneId`, `direction`, `size` | `{paneId, windowId, reused?, slot?, created?}` |

@@ -148,7 +148,19 @@ func paneIDNumber(paneID string) int {
 // unpreventable and is instead *repaired* by the duplicate-slot healing in
 // slotCandidateLocked, which is not defensive decoration but the second half of
 // this lock.
-func (t *tmuxClient) resolveHelper(ctx context.Context, slot int) (paneID string, resolved int, created bool, err error) {
+//
+// owner comes back with the pane, and it is not a convenience field. It is the
+// registry's answer as read INSIDE this lock — the same read every branch below
+// already had to make in order to choose — so that a caller which then has to
+// decide something destructive about the pane can decide it from the state
+// resolution saw, instead of reading the registry again once the lock is gone.
+// Between those two reads a concurrent close-pane can release the pane and hand
+// it back to the user, leaving no record at all, and a second read cannot tell
+// "released a millisecond ago" from "never claimed". See clearForDisplay, where
+// that difference is the user's half-typed command line.
+func (t *tmuxClient) resolveHelper(
+	ctx context.Context, slot int,
+) (paneID string, resolved int, created bool, owner string, err error) {
 	t.slotMu.Lock()
 	defer t.slotMu.Unlock()
 	return t.resolveHelperLocked(ctx, slot)
@@ -201,20 +213,25 @@ func (t *tmuxClient) resolveHelperNoCreateLocked(
 // branch below — reuse, adopt, create — is chosen from the same `reg` snapshot
 // and acts while the lock still holds it, so no concurrent caller can claim the
 // slot between the read that found it free and the write that takes it.
-func (t *tmuxClient) resolveHelperLocked(ctx context.Context, slot int) (string, int, bool, error) {
+//
+// Each branch also states the owner it is handing back, and each of the three
+// knows it for certain: reuse carries the record it chose from, adoption has
+// just written ownerAcquired, and a pane we split is ours. See resolveHelper for
+// what the value is for.
+func (t *tmuxClient) resolveHelperLocked(ctx context.Context, slot int) (string, int, bool, string, error) {
 	self, window, err := t.selfWindow(ctx)
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, false, "", err
 	}
 
 	reg, err := t.paneRegistryInWindow(ctx, window)
 	if err != nil {
-		return "", 0, false, fmt.Errorf("read the pane registry of window %s: %w", window, err)
+		return "", 0, false, "", fmt.Errorf("read the pane registry of window %s: %w", window, err)
 	}
 
 	// Reuse.
 	if rec, ok := t.slotCandidateLocked(ctx, slot, self, reg); ok {
-		return t.helperResult(rec.PaneID, self, slot, false)
+		return t.helperResult(rec.PaneID, self, slot, false, rec.Owner)
 	}
 
 	// Adopt. The registry lookup here is the "unowned" half of the acquisition
@@ -223,7 +240,7 @@ func (t *tmuxClient) resolveHelperLocked(ctx context.Context, slot int) (string,
 	// owner mark for the panes that reach it, because absence from this map means
 	// "no record we recognise", which is not the same as "unclaimed".
 	if pane, ok := t.acquirePaneLocked(ctx, window, reg, slot, self); ok {
-		return t.helperResult(pane, self, slot, true)
+		return t.helperResult(pane, self, slot, true, ownerAcquired)
 	}
 
 	// Create. Failures of the two markers below are deliberately not fatal, for
@@ -234,12 +251,12 @@ func (t *tmuxClient) resolveHelperLocked(ctx context.Context, slot int) (string,
 	place := t.placementForSlot(ctx, window, reg, slot, self)
 	cp, err := t.SplitPane(ctx, place.anchor, place.direction, place.size)
 	if err != nil {
-		return "", 0, false, fmt.Errorf("create helper pane for slot %d: %w", slot, err)
+		return "", 0, false, "", fmt.Errorf("create helper pane for slot %d: %w", slot, err)
 	}
 	_ = t.setPaneSlot(ctx, cp.PaneID, slot)
 	_ = t.setPaneTitle(ctx, cp.PaneID, helperTitle(slot))
 	t.waitForShellReady(ctx, cp.PaneID)
-	return t.helperResult(cp.PaneID, self, slot, true)
+	return t.helperResult(cp.PaneID, self, slot, true, ownerAgent)
 }
 
 // helperResult is the single exit through which every resolution passes, and it
@@ -253,13 +270,21 @@ func (t *tmuxClient) resolveHelperLocked(ctx context.Context, slot int) (string,
 // because the failure it guards against is the one failure that cannot be
 // diagnosed from outside the process: the agent's own transcript would fill with
 // its own keystrokes and there would be nothing left to read the diagnosis from.
-func (t *tmuxClient) helperResult(paneID, self string, slot int, created bool) (string, int, bool, error) {
+//
+// It is also the single exit the owner passes through, which is what makes
+// "every resolution reports whose pane it handed back" a property of one
+// function rather than a habit three branches share. A refusal reports no owner
+// at all: there is no pane, so there is nothing to be the owner of, and an empty
+// value is the one clearForDisplay treats as "do not touch the line".
+func (t *tmuxClient) helperResult(
+	paneID, self string, slot int, created bool, owner string,
+) (string, int, bool, string, error) {
 	if paneID == self {
-		return "", 0, false, fmt.Errorf(
+		return "", 0, false, "", fmt.Errorf(
 			"internal error: slot %d resolved to this server's own pane %s; refusing to return it",
 			slot, paneID)
 	}
-	return paneID, slot, created, nil
+	return paneID, slot, created, owner, nil
 }
 
 // slotCandidateLocked returns the pane currently holding slot, and repairs the
@@ -412,6 +437,8 @@ func (t *tmuxClient) closeCandidateLocked(
 // A failure to write the markers abandons the adoption rather than returning the
 // pane: an adopted pane whose owner mark did not stick is a pane we would type
 // into and never be able to identify again, which is worse than not adopting it.
+// Abandoning it also means undoing whatever part of the mark did stick, which is
+// adoptCandidateLocked's job and the reason that step is a function of its own.
 func (t *tmuxClient) acquirePaneLocked(
 	ctx context.Context, windowID string, reg map[string]paneRecord, slot int, self string,
 ) (string, bool) {
@@ -429,17 +456,66 @@ func (t *tmuxClient) acquirePaneLocked(
 		if !t.canAcquire(ctx, p.ID, self) {
 			continue
 		}
-		// markPaneOwnedAs is the one writer that takes socket and bare id
-		// separately, because its original callers are mid-creation and hold
-		// both; here they have to be split back out of the id ListPanes reported.
-		socket, bareID := parseTarget(p.ID)
-		if err := t.markPaneOwnedAs(ctx, socket, bareID, ownerAcquired, slot); err != nil {
+		if !t.adoptCandidateLocked(ctx, p.ID, slot) {
 			continue
 		}
-		_ = t.setPaneTitle(ctx, p.ID, helperTitle(slot))
 		return p.ID, true
 	}
 	return "", false
+}
+
+// partialMarkUndoTimeout bounds the rollback in adoptCandidateLocked. It is
+// short because the rollback is three set-option calls against a pane we have
+// just been talking to, and because it runs under slotMu: a wedged tmux must not
+// be able to hold the lock that every other resolution is queued behind.
+const partialMarkUndoTimeout = 2 * time.Second
+
+// adoptCandidateLocked writes the markers that make one candidate pane
+// ours-by-adoption, and leaves NOTHING behind if it cannot write all of them.
+// The caller must hold slotMu.
+//
+// markPaneOwnedAs writes witness → owner → slot and returns on the first
+// failure, so a cancelled context or one transient tmux error leaves a *prefix*
+// of that sequence on the pane. Every prefix is inert to slot resolution — the
+// write order is chosen there precisely so a half-claimed pane can never steer a
+// later call — and "inert" was mistaken for "harmless", which it is not on a
+// pane the USER owns.
+//
+// witness + owner with no slot is a record parseRegistryLine accepts, and it
+// strands the pane in exactly the state clearPaneRegistration's comment says
+// must never be produced. canAcquire refuses any pane whose owner mark is set at
+// all, so it can never be adopted again; no slot lookup matches it, so it is
+// never reused; and close-pane({slot:"all"}) covers records at slotDefault and
+// above, so no teardown will ever come back for it. What the user is left with
+// is one of their own shells, wearing our label, that no tool in this server can
+// see or release — and the moment the write fails is the only moment anything in
+// the process knows it happened.
+//
+// The undo runs on a context DETACHED from the caller's, and that is the whole
+// point rather than a detail. The likeliest reason the mark failed is that the
+// caller's context expired; a rollback issued on that same dead context is three
+// tmux commands that do not run, so the repair would be missing in precisely the
+// case that motivates it. context.WithoutCancel keeps the values and drops the
+// cancellation, and the timeout above bounds what that buys.
+//
+// The title is written last and its failure ignored, as everywhere else here: a
+// label is cosmetic, and a pane we have successfully claimed must not be
+// abandoned over one. This is also why the whole step is its own function —
+// a future edit that adds a fourth marker has one place to put it, and cannot
+// add it above the rollback by accident.
+func (t *tmuxClient) adoptCandidateLocked(ctx context.Context, paneID string, slot int) bool {
+	// markPaneOwnedAs is the one writer that takes socket and bare id
+	// separately, because its original callers are mid-creation and hold both;
+	// here they have to be split back out of the id ListPanes reported.
+	socket, bareID := parseTarget(paneID)
+	if err := t.markPaneOwnedAs(ctx, socket, bareID, ownerAcquired, slot); err != nil {
+		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
+		defer cancel()
+		_ = t.clearPaneRegistration(undoCtx, paneID)
+		return false
+	}
+	_ = t.setPaneTitle(ctx, paneID, helperTitle(slot))
+	return true
 }
 
 // canAcquire reports whether an unowned pane may be adopted as a helper.
@@ -552,10 +628,23 @@ type helperPlacement struct {
 //
 //	slot 1  → split self horizontally: the helper lands beside the agent, which
 //	          is where the user is already looking.
-//	slot 2  → split the slot-1 pane vertically, so the two helpers stack in the
-//	          same column instead of squeezing the agent's own pane again.
+//	slot 2  → split the slot-1 pane vertically — if we MADE the slot-1 pane — so
+//	          the two helpers stack in the same column instead of squeezing the
+//	          agent's own pane again.
 //	slot 3  → split self vertically.
 //	slot ≥4 → split whichever agent-owned pane has the most room left.
+//
+// Every anchor in that table is a pane this server created, and the owner check
+// in case 2 is what makes that true rather than nearly true. The slot-1 pane may
+// have been ADOPTED from the user, and an acquired pane is the user's real
+// estate: we may type into it, because that is what acquisition means, but
+// halving it rearranges a layout they built by hand — a visible change nobody
+// asked for, arriving from a request to open a second helper somewhere. That is
+// the policy anchorOrSelf states and enforces for slot ≥4; this fast path
+// skipped it, which made the rule true only where nothing had been adopted. An
+// acquired slot 1 therefore falls through to anchorOrSelf, which picks another
+// pane we made or, finding none, splits the agent's own pane — the same answer
+// as if slot 1 were not there at all.
 //
 // Only the anchor can be missing, and every fallback chain terminates at self,
 // which cannot be missing: resolveHelperLocked has already failed with
@@ -580,7 +669,7 @@ func (t *tmuxClient) placementForSlot(
 	case 1:
 		return helperPlacement{anchor: self, direction: "horizontal", size: 50}
 	case 2:
-		if rec, ok := aliveSlotPane(reg, slotDefault); ok && rec.PaneID != self {
+		if rec, ok := aliveSlotPane(reg, slotDefault); ok && rec.Owner == ownerAgent && rec.PaneID != self {
 			return helperPlacement{anchor: rec.PaneID, direction: "vertical", size: 50}
 		}
 		return helperPlacement{anchor: t.anchorOrSelf(ctx, windowID, reg, self), direction: "vertical", size: 50}
@@ -592,6 +681,12 @@ func (t *tmuxClient) placementForSlot(
 }
 
 // aliveSlotPane returns the live pane holding the given slot, if any.
+//
+// It matches on slot and liveness and nothing else, and returns the whole record
+// rather than an id so that its caller can apply the ownership question itself.
+// "Which pane holds this slot" and "may we split it" are two questions, and
+// answering the second one in here would hide it from the one place — placement
+// — where it decides whether the user's layout gets rearranged.
 func aliveSlotPane(reg map[string]paneRecord, slot int) (paneRecord, bool) {
 	for _, rec := range reg {
 		if rec.Slot == slot && !rec.Dead {
