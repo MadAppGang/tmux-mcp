@@ -53,28 +53,33 @@ func slotFixture(t *testing.T) (*tmuxClient, string) {
 // which pane was chosen.
 func paneSize(t *testing.T, paneID string) (width, height int) {
 	t.Helper()
-	out := tmuxExec(t, "display-message", "-p", "-t", paneID, "#{pane_width}\t#{pane_height}")
-	parts := strings.Split(out, "\t")
-	if len(parts) != 2 {
-		t.Fatalf("unexpected size for pane %s: %q", paneID, out)
-	}
-	width, _ = strconv.Atoi(parts[0])
-	height, _ = strconv.Atoi(parts[1])
-	return width, height
+	return paneCells(t, paneID, "#{pane_width}\t#{pane_height}")
 }
 
 // paneOrigin returns a pane's top-left cell, used to prove which pane a split
 // was carved out of.
 func paneOrigin(t *testing.T, paneID string) (left, top int) {
 	t.Helper()
-	out := tmuxExec(t, "display-message", "-p", "-t", paneID, "#{pane_left}\t#{pane_top}")
+	return paneCells(t, paneID, "#{pane_left}\t#{pane_top}")
+}
+
+// paneCells reads a pair of integer cell coordinates from a tmux format string.
+//
+// Both callers want the same thing — ask tmux for two numbers about one pane,
+// fail the test if it answers with anything else — and differ only in which two
+// numbers. Keeping the named wrappers means the tests still read as paneSize and
+// paneOrigin rather than as format strings, while the parsing that would
+// otherwise be copied between them exists once.
+func paneCells(t *testing.T, paneID, format string) (int, int) {
+	t.Helper()
+	out := tmuxExec(t, "display-message", "-p", "-t", paneID, format)
 	parts := strings.Split(out, "\t")
 	if len(parts) != 2 {
-		t.Fatalf("unexpected geometry for pane %s: %q", paneID, out)
+		t.Fatalf("pane %s answered %q for format %q, want two tab-separated numbers", paneID, out, format)
 	}
-	left, _ = strconv.Atoi(parts[0])
-	top, _ = strconv.Atoi(parts[1])
-	return left, top
+	first, _ := strconv.Atoi(parts[0])
+	second, _ := strconv.Atoi(parts[1])
+	return first, second
 }
 
 // ---- Resolution ----

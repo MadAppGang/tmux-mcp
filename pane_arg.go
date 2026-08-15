@@ -177,6 +177,18 @@ type paneArgSpec struct {
 	AllowHeadless bool
 }
 
+// Resolved reports whether this target came from slot resolution rather than a
+// paneId the caller named.
+//
+// The fact itself is just Slot != 0, and the reason it earns a method is that
+// four call sites across two files have to agree about it, and they decide
+// different things with it: whether to attach resolution metadata to a response
+// (capture-pane, split-pane, screenshot-pane) and whether it is safe to clear a
+// pane's line (write-to-display). Slot 0 meaning "explicit paneId" is a sentinel
+// this package chose, not something the type enforces, so spelling it out four
+// times is four places to update if that ever changes and nothing linking them.
+func (tgt paneTarget) Resolved() bool { return tgt.Slot != 0 }
+
 // resolution projects a target into the fields tools put in their responses.
 func (tgt paneTarget) resolution() paneResolution {
 	return paneResolution{PaneID: tgt.PaneID, Slot: tgt.Slot, Created: tgt.Created}

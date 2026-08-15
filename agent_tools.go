@@ -499,7 +499,7 @@ func registerWriteToDisplay(s *server.MCPServer, client *tmuxClient) {
 // reached by naming it — which is the behaviour every pre-slot caller of this
 // tool already relies on.
 func (t *tmuxClient) clearForDisplay(ctx context.Context, tgt paneTarget) error {
-	owner, bySlot := tgt.Owner, tgt.Slot != 0
+	owner, bySlot := tgt.Owner, tgt.Resolved()
 	if !bySlot {
 		rec, found, err := t.paneRecordFor(ctx, tgt.PaneID)
 		if err != nil {

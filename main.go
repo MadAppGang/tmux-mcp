@@ -339,7 +339,7 @@ func registerCapturePane(s *server.MCPServer, client *tmuxClient) {
 		// promise, and one that a top-level key silently added to two of them
 		// breaks. See TestExplicitPaneIdResponsesAreUnchanged.
 		res := mcp.NewToolResultText(content)
-		if tgt.Slot != 0 {
+		if tgt.Resolved() {
 			res.StructuredContent = tgt.resolution()
 		}
 		return res, nil
@@ -409,7 +409,7 @@ func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 		// Slot path: the resolver has already produced the pane, placed by the
 		// server's own rules. Reused is set from Created so a consumer that
 		// predates slots and keys on "reused" keeps reading a true answer.
-		if tgt.Slot != 0 {
+		if tgt.Resolved() {
 			windowID, _ := client.getWindowIDForPane(ctx, tgt.PaneID)
 			return jsonResult(&CreatedPane{
 				PaneID:   tgt.PaneID,
@@ -751,7 +751,7 @@ func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
 		// an image (or the HTML fallback) and must stay exactly that, so the
 		// resolution rides in structuredContent — and only when there was a
 		// resolution. A call that named its pane gets back what it always got.
-		if res != nil && tgt.Slot != 0 {
+		if res != nil && tgt.Resolved() {
 			res.StructuredContent = tgt.resolution()
 		}
 		return res, nil
