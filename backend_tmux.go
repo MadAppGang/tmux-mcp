@@ -182,6 +182,47 @@ func parseTarget(target string) (socket string, id string) {
 	return "", target
 }
 
+// paneRef is a pane handle that is opaque to policy: hold it, pass it back,
+// compare it. It is what the port speaks instead of a tmux id.
+//
+// It is a STRUCT rather than a defined string type, and the String method below
+// is the whole reason. A defined string type stops an id reaching a response
+// STRUCT and stops nothing else: %s and %v on a defined string type are silent,
+// and every id leak this design has to prevent escapes through a path no
+// response type covers — an image caption, a progress notification, a channel
+// text line, an fmt.Errorf in policy code. Each of those is a format verb the
+// type system is perfectly happy about.
+//
+// Wrapping the id in a struct with a redacting String makes that class of
+// mistake visible instead of silent: a leak prints "<pane>" in the output a
+// human or a test is reading, rather than "%73" in the model's context. It is
+// defence in depth and not the primary control — the primary control is that
+// only this file can turn a handle back into an id — but it is the only control
+// that works on code nobody thought to check.
+//
+// The struct is comparable, so it still keys the registry map, and it costs
+// nothing at runtime. It marshals to {} if a response type ever embeds one,
+// which is the safe direction.
+type paneRef struct{ id string }
+
+// String is deliberately lossy. Anything that formats a paneRef is a bug, and
+// this is what that bug looks like when it reaches a log, a test failure or a
+// response body.
+func (p paneRef) String() string { return "<pane>" }
+
+// target is the real id, for this file's tmux invocations. It is the single
+// accessor, so "who can turn a handle back into an id" is a question with one
+// answer.
+func (p paneRef) target() string { return p.id }
+
+// newPaneRef is the only constructor, and it lives here beside target for the
+// same reason.
+func newPaneRef(id string) paneRef { return paneRef{id: id} }
+
+// empty reports whether this is the zero handle — no pane, as opposed to a pane
+// whose id we happen not to like.
+func (p paneRef) empty() bool { return p.id == "" }
+
 // socketArgs returns the global tmux flags that must precede a subcommand in
 // order to target the given socket. An empty socket means the default server,
 // which needs no flags.
@@ -200,16 +241,21 @@ func parseTarget(target string) (socket string, id string) {
 // "new-session -f /dev/null" would parse /dev/null as the new session's *client
 // flags*, and "split-window -f" is a full-width split.
 
-// paneIDNumber extracts the numeric part of a tmux pane id ("%12" → 12).
+// paneSeq is the creation ordinal of a pane, extracted from its tmux id
+// ("%12" → 12). Policy may only COMPARE it; this is the one place that parses.
+//
+// It exists because three rules in helper_panes.go are about age: keep the
+// OLDEST pane when two servers race for a slot, consider adoption candidates
+// oldest-first, and break geometry ties deterministically. Every one of them
+// used to parse "%12" itself, which is a tmux id in policy code.
 //
 // Sorting pane ids as strings is wrong in a way that only appears after a
 // session has been running a while: "%10" sorts before "%9" lexically, so the
-// "keep the lowest id" rules in helper_panes.go — which mean "keep the oldest
-// pane", the one most likely to have the caller's process in it — would start
-// preferring the newest pane once the window had passed ten panes. An
-// unparseable id sorts last, so a pane we cannot rank can never win a tie-break
-// by accident.
-func paneIDNumber(paneID string) int {
+// "keep the lowest id" rules — which mean "keep the oldest pane", the one most
+// likely to have the caller's process in it — would start preferring the newest
+// pane once the window had passed ten panes. An unparseable id sorts last, so a
+// pane we cannot rank can never win a tie-break by accident.
+func paneSeq(paneID string) int {
 	_, bare := parseTarget(paneID)
 	n, err := strconv.Atoi(strings.TrimPrefix(bare, "%"))
 	if err != nil {
@@ -996,10 +1042,11 @@ func (t *tmuxClient) getWindowIDForPane(ctx context.Context, paneID string) (str
 // paneRecord is one pane's registry entry, as read back from its tmux options.
 // A zero Slot means "no slot marker"; slots start at 1.
 type paneRecord struct {
-	PaneID string // as ListPanes reports it — "headless:" prefix preserved
-	Owner  string // ownerAgent or ownerAcquired; never empty in a valid record
-	Slot   int    // 0 when the pane carries no slot marker
-	Dead   bool   // #{pane_dead}: the pane exists but its process has exited
+	Ref   paneRef // the handle; the id inside it never leaves this file
+	Owner string  // ownerAgent or ownerAcquired; never empty in a valid record
+	Slot  int     // 0 when the pane carries no slot marker
+	Dead  bool    // #{pane_dead}: the pane exists but its process has exited
+	Seq   int     // creation ordinal — see paneSeq. Policy compares, never parses.
 }
 
 // registryFormat is the tmux format string both registry readers use. Keeping
@@ -1049,16 +1096,25 @@ func parseRegistryLine(line, prefix string) (paneRecord, bool) {
 		slot = 0
 	}
 	return paneRecord{
-		PaneID: prefix + paneID,
-		Owner:  owner,
-		Slot:   slot,
-		Dead:   dead == "1",
+		Ref:   newPaneRef(prefix + paneID),
+		Owner: owner,
+		Slot:  slot,
+		Dead:  dead == "1",
+		Seq:   paneSeq(paneID),
 	}, true
 }
 
-// paneRegistryInWindow returns every pane in the window that carries a valid
-// registry record, keyed by the same (possibly "headless:"-prefixed) ID that
-// ListPanes reports. One tmux call, five format variables.
+// paneRegistryAround returns every pane in the window CONTAINING the given
+// target that carries a valid registry record. One tmux call, five format
+// variables.
+//
+// The target is a pane, not a window, and that is what lets a window id stay out
+// of the port: "list-panes -t %5" enumerates %5's whole window, exactly as
+// "list-panes -t @1" does (verified on tmux 3.7c). The scope is unchanged and
+// still deliberate — helper panes belong beside the agent, in the window the
+// user is looking at, and a resolution that could reach into their other windows
+// could hand back a pane they are not watching, which from the agent's side is
+// indistinguishable from a pane it made.
 //
 // A record counts only when the witness equals the pane's own ID and the owner
 // is a value this binary recognises — see parseRegistryLine.
@@ -1067,8 +1123,8 @@ func parseRegistryLine(line, prefix string) (paneRecord, bool) {
 // list-panes when the user has remain-on-exit set. Such a pane accepts
 // send-keys and silently swallows every keystroke, which is the worst possible
 // failure for a helper pane: no error, no output, no clue.
-func (t *tmuxClient) paneRegistryInWindow(ctx context.Context, windowID string) (map[string]paneRecord, error) {
-	socket, bareID := parseTarget(windowID)
+func (t *tmuxClient) paneRegistryAround(ctx context.Context, target string) (map[paneRef]paneRecord, error) {
+	socket, bareID := parseTarget(target)
 	out, err := t.runWithSocket(ctx, socket, "list-panes", "-t", bareID, "-F", registryFormat())
 	if err != nil {
 		return nil, err
@@ -1077,13 +1133,13 @@ func (t *tmuxClient) paneRegistryInWindow(ctx context.Context, windowID string) 
 	if socket != "" {
 		prefix = headlessPrefix
 	}
-	reg := make(map[string]paneRecord)
+	reg := make(map[paneRef]paneRecord)
 	for _, line := range strings.Split(out, "\n") {
 		rec, ok := parseRegistryLine(line, prefix)
 		if !ok {
 			continue
 		}
-		reg[rec.PaneID] = rec
+		reg[rec.Ref] = rec
 	}
 	return reg, nil
 }
@@ -1142,7 +1198,7 @@ func (t *tmuxClient) paneOwnerMark(ctx context.Context, paneID string) (string, 
 // ownedPanesInWindow returns the panes in the window that we *created*, keyed by
 // the same (possibly "headless:"-prefixed) ID that ListPanes reports.
 //
-// This is deliberately narrower than paneRegistryInWindow: it excludes panes
+// This is deliberately narrower than paneRegistryAround: it excludes panes
 // with owner ownerAcquired. Its only caller is findIdlePaneInWindow, which backs
 // split-pane's reuse, and split-pane's contract is that a pane reported
 // "reused": true was created by the server and is therefore safe to kill. An
@@ -1150,8 +1206,8 @@ func (t *tmuxClient) paneOwnerMark(ctx context.Context, paneID string) (string, 
 // convert "reused": true into a licence to kill a pane the user is using, which
 // is the one unrecoverable half of the whole hazard.
 //
-// Slot resolution needs both owner kinds and calls paneRegistryInWindow
-// directly. The two callers want genuinely different sets, so they get two
+// Slot resolution needs both owner kinds and reaches the same read through the
+// port's Records. The two callers want genuinely different sets, so they get two
 // functions rather than one function with a flag.
 //
 // Dead panes are deliberately NOT filtered here even though the record now
@@ -1161,14 +1217,14 @@ func (t *tmuxClient) paneOwnerMark(ctx context.Context, paneID string) (string, 
 // tests. The Dead flag is for the new resolver, which has no GetPaneState call
 // to lean on.
 func (t *tmuxClient) ownedPanesInWindow(ctx context.Context, windowID string) (map[string]bool, error) {
-	reg, err := t.paneRegistryInWindow(ctx, windowID)
+	reg, err := t.paneRegistryAround(ctx, windowID)
 	if err != nil {
 		return nil, err
 	}
 	owned := make(map[string]bool, len(reg))
-	for id, rec := range reg {
+	for ref, rec := range reg {
 		if rec.Owner == ownerAgent {
-			owned[id] = true
+			owned[ref.target()] = true
 		}
 	}
 	return owned, nil
@@ -1311,4 +1367,271 @@ func isShellProcess(cmd string) bool {
 		return true
 	}
 	return false
+}
+
+// ---- The port ----
+//
+// Everything below is the boundary between policy and the multiplexer. Policy
+// holds a Backend and nothing else; this file is the only implementation, and
+// the only code in the package that knows what a "%" is.
+
+// splitAxis is which way a new pane goes relative to its anchor. It is typed
+// because "horizontal" and "vertical" are tmux's words for it, and a second
+// multiplexer would have its own.
+type splitAxis int
+
+const (
+	splitBeside splitAxis = iota // side by side
+	splitBelow                   // stacked
+)
+
+// tmuxDirection is the only place the two words are spelled.
+func (a splitAxis) tmuxDirection() string {
+	if a == splitBeside {
+		return "horizontal"
+	}
+	return "vertical"
+}
+
+// placement is the server-decided geometry for a new visible pane. The agent
+// never passes any of it — placementForSlot decides — and this is how that
+// decision crosses the seam.
+type placement struct {
+	Anchor      paneRef
+	Axis        splitAxis
+	SizePercent int // 0 means the backend's default
+}
+
+// paneInfo is geometry and label, for the two decisions that need them: which
+// pane has the most room to give up, and what order to consider adoption
+// candidates in. Seq is the same creation ordinal paneRecord carries, so both
+// discovery views rank panes the same way.
+type paneInfo struct {
+	Ref           paneRef
+	Title         string
+	Width, Height int
+	Seq           int
+}
+
+// execOutcome is what running one command in a pane produced.
+type execOutcome struct {
+	Output   string
+	ExitCode int
+	TimedOut bool
+}
+
+// Backend is the port. Policy calls only this; only this file implements it.
+//
+// It is one interface rather than four because a resolution needs identity,
+// discovery, registry writes and IO inside a single slotMu hold: segregating
+// them would move the fan-in out one level and buy nothing while there is one
+// consumer and one implementation.
+type Backend interface {
+	// ---- Identity ----
+
+	// Self is the pane this server runs in, and is the ONLY reader of TMUX_PANE
+	// in the package (Invariant S). It returns errNotInTmux when there is none.
+	Self(ctx context.Context) (paneRef, error)
+
+	// ---- Structure ----
+
+	OpenBeside(ctx context.Context, place placement) (paneRef, error)
+	Close(ctx context.Context, p paneRef) error
+
+	// ---- Discovery ----
+
+	// Siblings lists every pane sharing a window with the given one, geometry
+	// included. A failure here DEGRADES rather than being fatal — no adoption,
+	// and the anchor falls back to self — which is why it is separate from
+	// Records, whose failure is fatal to a resolution.
+	Siblings(ctx context.Context, of paneRef) ([]paneInfo, error)
+
+	// Records is the witnessed registry of the window around the given pane.
+	Records(ctx context.Context, of paneRef) (map[paneRef]paneRecord, error)
+
+	// RecordFor is the single-pane witnessed lookup, and it exists only while the
+	// explicit-paneId path does: both remaining callers — close-pane's explicit
+	// branch and clearForDisplay's re-read — are on that path, and the commit
+	// that deletes it deletes this with it. It is named here rather than left
+	// implicit so that "why does the port have a single-pane read?" has an answer
+	// with an expiry date on it.
+	RecordFor(ctx context.Context, p paneRef) (paneRecord, bool, error)
+
+	// OwnerMark asks the OPPOSITE question from Records and is deliberately not
+	// witnessed: not "is this pane ours?" but "is it wholly unclaimed?", where
+	// every answer other than the empty string means hands off. See
+	// paneOwnerMark's comment; the inversion is load-bearing.
+	OwnerMark(ctx context.Context, p paneRef) (string, error)
+
+	// ---- Registry writes ----
+
+	// Claim writes the ownership marks in the order the backend chooses.
+	Claim(ctx context.Context, p paneRef, owner string, slot int) error
+
+	// SetSlot sets or (slot <= 0) unsets ONLY the slot marker on an
+	// already-claimed pane. The healing half of resolution: the pane stays ours,
+	// it stops answering to a slot.
+	SetSlot(ctx context.Context, p paneRef, slot int) error
+
+	ClearMarks(ctx context.Context, p paneRef) error
+
+	// ---- IO ----
+
+	SendKeys(ctx context.Context, p paneRef, keys string, literal, enter bool) error
+	Capture(ctx context.Context, p paneRef, lines int, colors bool) (string, error)
+	Screen(ctx context.Context, p paneRef) (screen, error)
+	Exec(ctx context.Context, p paneRef, command string) (*execOutcome, error)
+
+	// Foreground is the OS-level state of the pane's process.
+	Foreground(ctx context.Context, p paneRef) (*PaneState, error)
+
+	// Bell reports the backend's CURRENT bell indication for the pane. It is not
+	// read-and-clear — see the implementation.
+	Bell(ctx context.Context, p paneRef) (bool, error)
+
+	// ---- UI ----
+
+	SetTitle(ctx context.Context, p paneRef, title string) error
+	Notify(ctx context.Context, message string, d time.Duration) error
+}
+
+// tmuxBackend is the tmux implementation of Backend.
+//
+// It wraps tmuxClient rather than being it, and the split is the point: the
+// client's methods take strings, because they are a thin transcription of a CLI
+// that takes strings, while the port takes handles. One type carrying both
+// would be two overlapping APIs on one receiver, which is exactly the ambiguity
+// the seam exists to remove — a policy author would have a stringly-typed
+// escape hatch on the same value.
+type tmuxBackend struct{ c *tmuxClient }
+
+func newTmuxBackend(c *tmuxClient) *tmuxBackend { return &tmuxBackend{c: c} }
+
+// Compile-time proof that the adapter still satisfies the port. Without it, a
+// method whose signature drifts produces an error at the construction site in
+// main.go, several files away from the change that caused it.
+var _ Backend = (*tmuxBackend)(nil)
+
+// Self reads TMUX_PANE, and is the ONLY place in the package that does.
+//
+// The value is inherited from the environment at spawn and is stable for the
+// process lifetime, which is the entire point: it cannot race with the user
+// switching windows, panes or sessions, unlike any query of tmux's "active"
+// pane, which answers a question about the user's cursor rather than about this
+// process. A resolution that consulted the active pane would place the agent's
+// helper next to wherever the user happened to be looking at that instant.
+//
+// It is also not a guess: every agent runtime that starts this server starts it
+// inside the pane the user is looking at, so an empty answer means something
+// specific and reportable — "this process is not in tmux" — rather than "lookup
+// failed", which is why the caller can turn it into errNotInTmux instead of a
+// fallback.
+//
+// Reading it here rather than at each call site is deliberate: the set of
+// callers permitted to ask "which pane am I?" is a safety property (a pane the
+// agent may split, never a pane the agent may type into), and a single named
+// accessor is what makes that set auditable — see
+// TestOnlyPolicyCodeKnowsOurOwnPane.
+func (b *tmuxBackend) Self(_ context.Context) (paneRef, error) {
+	id := os.Getenv("TMUX_PANE")
+	if id == "" {
+		return paneRef{}, errNotInTmux
+	}
+	return newPaneRef(id), nil
+}
+
+func (b *tmuxBackend) OpenBeside(ctx context.Context, place placement) (paneRef, error) {
+	cp, err := b.c.SplitPane(ctx, place.Anchor.target(), place.Axis.tmuxDirection(), place.SizePercent)
+	if err != nil {
+		return paneRef{}, err
+	}
+	return newPaneRef(cp.PaneID), nil
+}
+
+func (b *tmuxBackend) Close(ctx context.Context, p paneRef) error {
+	return b.c.KillPane(ctx, p.target())
+}
+
+func (b *tmuxBackend) Siblings(ctx context.Context, of paneRef) ([]paneInfo, error) {
+	// A pane target resolves to its window, so the window id never reaches the
+	// port — see paneRegistryAround for the verification.
+	panes, err := b.c.ListPanes(ctx, of.target())
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]paneInfo, 0, len(panes))
+	for _, p := range panes {
+		infos = append(infos, paneInfo{
+			Ref:    newPaneRef(p.ID),
+			Title:  p.Title,
+			Width:  p.Width,
+			Height: p.Height,
+			Seq:    paneSeq(p.ID),
+		})
+	}
+	return infos, nil
+}
+
+func (b *tmuxBackend) Records(ctx context.Context, of paneRef) (map[paneRef]paneRecord, error) {
+	return b.c.paneRegistryAround(ctx, of.target())
+}
+
+func (b *tmuxBackend) RecordFor(ctx context.Context, p paneRef) (paneRecord, bool, error) {
+	return b.c.paneRecordFor(ctx, p.target())
+}
+
+func (b *tmuxBackend) OwnerMark(ctx context.Context, p paneRef) (string, error) {
+	return b.c.paneOwnerMark(ctx, p.target())
+}
+
+// Claim splits the handle back into socket and bare id, which is the step that
+// used to happen in policy: markPaneOwnedAs takes them separately because its
+// original callers are mid-creation and hold both.
+func (b *tmuxBackend) Claim(ctx context.Context, p paneRef, owner string, slot int) error {
+	socket, bareID := parseTarget(p.target())
+	return b.c.markPaneOwnedAs(ctx, socket, bareID, owner, slot)
+}
+
+func (b *tmuxBackend) SetSlot(ctx context.Context, p paneRef, slot int) error {
+	return b.c.setPaneSlot(ctx, p.target(), slot)
+}
+
+func (b *tmuxBackend) ClearMarks(ctx context.Context, p paneRef) error {
+	return b.c.clearPaneRegistration(ctx, p.target())
+}
+
+func (b *tmuxBackend) SendKeys(ctx context.Context, p paneRef, keys string, literal, enter bool) error {
+	return b.c.SendKeys(ctx, p.target(), keys, literal, enter)
+}
+
+func (b *tmuxBackend) Capture(ctx context.Context, p paneRef, lines int, colors bool) (string, error) {
+	return b.c.CapturePane(ctx, p.target(), lines, colors)
+}
+
+func (b *tmuxBackend) Screen(ctx context.Context, p paneRef) (screen, error) {
+	return b.c.Screen(ctx, p.target())
+}
+
+func (b *tmuxBackend) Exec(ctx context.Context, p paneRef, command string) (*execOutcome, error) {
+	res, err := b.c.ExecuteCommand(ctx, p.target(), command)
+	if err != nil {
+		return nil, err
+	}
+	return &execOutcome{Output: res.Output, ExitCode: res.ExitCode, TimedOut: res.TimedOut}, nil
+}
+
+func (b *tmuxBackend) Foreground(ctx context.Context, p paneRef) (*PaneState, error) {
+	return b.c.GetPaneState(ctx, p.target())
+}
+
+func (b *tmuxBackend) Bell(ctx context.Context, p paneRef) (bool, error) {
+	return b.c.Bell(ctx, p.target())
+}
+
+func (b *tmuxBackend) SetTitle(ctx context.Context, p paneRef, title string) error {
+	return b.c.setPaneTitle(ctx, p.target(), title)
+}
+
+func (b *tmuxBackend) Notify(ctx context.Context, message string, d time.Duration) error {
+	return b.c.DisplayMessage(ctx, message, int(d.Milliseconds()))
 }

@@ -12,14 +12,21 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-func registerAgentTools(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
-	registerStartAndWatch(s, client, emitter)
-	registerWatchPane(s, client, emitter)
-	registerPaneState(s, client)
-	registerRunInREPL(s, client)
-	registerWriteToDisplay(s, client)
-	registerDisplayMessage(s, client)
-	registerClosePane(s, client)
+// registerAgentTools takes the slots policy rather than a tmux client. Every
+// handler below resolves through sl and does its IO through sl.b, so the only
+// multiplexer access in this file is the port.
+//
+// The one exception is start-and-watch's headless branch, which still creates a
+// session through the raw client because a headless pane is not a slot and has
+// no policy to resolve. It goes when the isolated-slot contract replaces it.
+func registerAgentTools(s *server.MCPServer, client *tmuxClient, sl *slots, emitter *ChannelEmitter) {
+	registerStartAndWatch(s, client, sl, emitter)
+	registerWatchPane(s, sl, emitter)
+	registerPaneState(s, sl)
+	registerRunInREPL(s, sl)
+	registerWriteToDisplay(s, sl)
+	registerDisplayMessage(s, sl)
+	registerClosePane(s, sl)
 }
 
 // closedPane is one entry in close-pane's response. The response is always an
@@ -43,7 +50,7 @@ func watchResultToToolResult(r *WatchResult) (*mcp.CallToolResult, error) {
 
 // ---- start-and-watch ----
 
-func registerStartAndWatch(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
+func registerStartAndWatch(s *server.MCPServer, client *tmuxClient, sl *slots, emitter *ChannelEmitter) {
 	s.AddTool(mcp.NewTool("start-and-watch",
 		mcp.WithDescription("Start a command in a pane and monitor its output. Blocks until a readiness pattern matches, a named trigger fires, or the timeout expires. paneId is optional: with no paneId the command starts in helper slot 1, a reusable pane beside the agent in the user's own window — so a dev server started here stays visible and can be watched again later. headless=true runs it in an invisible isolated session instead."),
 		mcp.WithString("paneId",
@@ -95,11 +102,11 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient, emitter *Cha
 		// is the whole point: "not in tmux, use headless" and "slot and headless
 		// cannot be combined" are instructions to the agent, and a transport
 		// error hides the text behind a -32603.
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{AllowHeadless: true})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{AllowHeadless: true})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		paneID := tgt.PaneID
+		pane := tgt.Ref
 		if tgt.Headless {
 			// The one branch that still creates its own session: a headless pane
 			// lives on a separate socket with no window, so no slot can name it.
@@ -107,7 +114,7 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient, emitter *Cha
 			if err != nil {
 				return nil, fmt.Errorf("failed to create headless session: %w", err)
 			}
-			paneID = created.PaneID
+			pane = newPaneRef(created.PaneID)
 		}
 
 		mode := resolveMode(modeName)
@@ -127,7 +134,7 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient, emitter *Cha
 			},
 		}
 		// Append additional triggers.
-		triggers = append(triggers, parseTriggers(triggerSpec, client)...)
+		triggers = append(triggers, parseTriggers(triggerSpec, sl.b)...)
 
 		// Snapshot the pane BEFORE sending, and hand that baseline to the
 		// monitor. If the monitor took its own baseline it would do so after the
@@ -135,16 +142,16 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient, emitter *Cha
 		// millisecond ("echo done") would have its output captured *into* the
 		// baseline — never appearing as new content, never matching the readiness
 		// pattern, and reported as a timeout despite having succeeded.
-		baseline, _ := client.CapturePane(ctx, paneID, 0, false)
+		baseline, _ := sl.b.Capture(ctx, pane, 0, false)
 
-		if err := client.SendKeys(ctx, paneID, command, true, true); err != nil {
+		if err := sl.b.SendKeys(ctx, pane, command, true, true); err != nil {
 			return nil, fmt.Errorf("failed to send command: %w", err)
 		}
 
 		// Passing the command lets the monitor drop the shell's echo of it, which
 		// would otherwise be the first line of new output and would be matched by
 		// the error and pattern triggers. See dropEcho.
-		result, err := monitorPaneFrom(ctx, s, client, paneID, &baseline, command,
+		result, err := monitorPaneFrom(ctx, s, sl.b, pane, &baseline, command,
 			mode, triggers, timeoutSecs, emitter)
 		if err != nil {
 			return nil, err
@@ -156,7 +163,7 @@ func registerStartAndWatch(s *server.MCPServer, client *tmuxClient, emitter *Cha
 
 // ---- watch-pane ----
 
-func registerWatchPane(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
+func registerWatchPane(s *server.MCPServer, sl *slots, emitter *ChannelEmitter) {
 	s.AddTool(mcp.NewTool("watch-pane",
 		mcp.WithDescription("Monitor a pane using smart triggers. Blocks until a trigger fires or the timeout expires. paneId is optional: with no paneId it watches helper slot 1, which is where start-and-watch and execute-command run by default."),
 		mcp.WithString("paneId",
@@ -174,7 +181,7 @@ func registerWatchPane(s *server.MCPServer, client *tmuxClient, emitter *Channel
 		),
 		slotProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -184,9 +191,9 @@ func registerWatchPane(s *server.MCPServer, client *tmuxClient, emitter *Channel
 		timeoutSecs := req.GetInt("timeout", 60)
 
 		mode := resolveMode(modeName)
-		triggers := parseTriggers(triggerSpec, client)
+		triggers := parseTriggers(triggerSpec, sl.b)
 
-		result, err := monitorPane(ctx, s, client, tgt.PaneID, mode, triggers, timeoutSecs, emitter)
+		result, err := monitorPane(ctx, s, sl.b, tgt.Ref, mode, triggers, timeoutSecs, emitter)
 		if err != nil {
 			return nil, err
 		}
@@ -197,7 +204,7 @@ func registerWatchPane(s *server.MCPServer, client *tmuxClient, emitter *Channel
 
 // ---- pane-state ----
 
-func registerPaneState(s *server.MCPServer, client *tmuxClient) {
+func registerPaneState(s *server.MCPServer, sl *slots) {
 	s.AddTool(mcp.NewTool("pane-state",
 		mcp.WithDescription("Get native OS-level process state for a pane. Returns whether the foreground process is alive and whether it is waiting for user input (detected via OS-level process inspection, not regex). paneId is optional: with no paneId it inspects helper slot 1."),
 		mcp.WithString("paneId",
@@ -209,11 +216,11 @@ func registerPaneState(s *server.MCPServer, client *tmuxClient) {
 		// renaming of one of their idle shells. See capture-pane in main.go for
 		// why an annotation a client may act on cannot survive that.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		state, err := client.GetPaneState(ctx, tgt.PaneID)
+		state, err := sl.b.Foreground(ctx, tgt.Ref)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to get pane state", err), nil
 		}
@@ -223,7 +230,7 @@ func registerPaneState(s *server.MCPServer, client *tmuxClient) {
 
 // ---- run-in-repl ----
 
-func registerRunInREPL(s *server.MCPServer, client *tmuxClient) {
+func registerRunInREPL(s *server.MCPServer, sl *slots) {
 	s.AddTool(mcp.NewTool("run-in-repl",
 		mcp.WithDescription("Send input to a running REPL and wait for the prompt to reappear, then return the output. Works with Python, Node, psql, bash, etc. paneId is optional: with no paneId it talks to helper slot 1, which is where a REPL started by start-and-watch or execute-command is running."),
 		mcp.WithString("paneId",
@@ -260,25 +267,25 @@ func registerRunInREPL(s *server.MCPServer, client *tmuxClient) {
 			return mcp.NewToolResultError(fmt.Sprintf("invalid promptPattern %q: %v", promptStr, err)), nil
 		}
 
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		paneID := tgt.PaneID
+		pane := tgt.Ref
 
 		// Capture baseline content before sending input.
-		baseline, _ := client.CapturePane(ctx, paneID, 0, false)
+		baseline, _ := sl.b.Capture(ctx, pane, 0, false)
 
 		// Record the initial foreground command BEFORE sending input
 		// so we can detect REPL exit (foreground command change).
-		initialState, _ := client.GetPaneState(ctx, paneID)
+		initialState, _ := sl.b.Foreground(ctx, pane)
 		initialCmd := ""
 		if initialState != nil {
 			initialCmd = initialState.ForegroundCmd
 		}
 
 		// Send the input with Enter.
-		if err := client.SendKeys(ctx, paneID, input, true, true); err != nil {
+		if err := sl.b.SendKeys(ctx, pane, input, true, true); err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to send input", err), nil
 		}
 
@@ -292,10 +299,10 @@ func registerRunInREPL(s *server.MCPServer, client *tmuxClient) {
 			case <-ctx.Done():
 				return mcp.NewToolResultError("context cancelled waiting for REPL prompt"), nil
 			case tick := <-ticker.C:
-				output, err := client.CapturePane(ctx, paneID, 0, false)
+				output, err := sl.b.Capture(ctx, pane, 0, false)
 				if err != nil {
 					// Pane may have been destroyed — check if process exited.
-					paneState, _ := client.GetPaneState(ctx, paneID)
+					paneState, _ := sl.b.Foreground(ctx, pane)
 					if paneState != nil && !paneState.IsAlive {
 						return jsonResult(replResult{
 							paneResolution: tgt.resolution(),
@@ -322,7 +329,7 @@ func registerRunInREPL(s *server.MCPServer, client *tmuxClient) {
 				}
 
 				// Check if the REPL process has exited.
-				paneState, _ := client.GetPaneState(ctx, paneID)
+				paneState, _ := sl.b.Foreground(ctx, pane)
 				if paneState != nil {
 					if !paneState.IsAlive || (initialCmd != "" && paneState.ForegroundCmd != initialCmd) {
 						return jsonResult(replResult{
@@ -358,7 +365,7 @@ func registerRunInREPL(s *server.MCPServer, client *tmuxClient) {
 // human sees the text, and a headless pane lives on a socket with no window and
 // no viewer. Refusing headless:true is more useful than honouring it, because
 // honouring it would silently write coaching text into a void.
-func registerWriteToDisplay(s *server.MCPServer, client *tmuxClient) {
+func registerWriteToDisplay(s *server.MCPServer, sl *slots) {
 	s.AddTool(mcp.NewTool("write-to-display",
 		mcp.WithDescription("Write text to a pane as a side-channel coaching display. The user sees it in their terminal; the tool returns only the pane it wrote to, so the text does not enter the model's context. paneId is optional: with no paneId the text goes to helper slot 1, a pane beside the agent that is created or adopted on first use — never the agent's own pane."),
 		mcp.WithString("paneId",
@@ -380,7 +387,7 @@ func registerWriteToDisplay(s *server.MCPServer, client *tmuxClient) {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -389,12 +396,12 @@ func registerWriteToDisplay(s *server.MCPServer, client *tmuxClient) {
 			// The whole target goes in, not the pane id. What the clear has to
 			// know is whose pane this is, and the only trustworthy answer is the
 			// one resolution already read under the lock — see clearForDisplay.
-			if err := client.clearForDisplay(ctx, tgt); err != nil {
+			if err := sl.clearForDisplay(ctx, tgt); err != nil {
 				return mcp.NewToolResultErrorFromErr("failed to clear pane", err), nil
 			}
 		}
 
-		if err := client.SendKeys(ctx, tgt.PaneID, text, true, false); err != nil {
+		if err := sl.b.SendKeys(ctx, tgt.Ref, text, true, false); err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to write to display", err), nil
 		}
 		return jsonResult(tgt.resolution())
@@ -498,12 +505,12 @@ func registerWriteToDisplay(s *server.MCPServer, client *tmuxClient) {
 // A pane with no record at all keeps the old behaviour, and can now only be
 // reached by naming it — which is the behaviour every pre-slot caller of this
 // tool already relies on.
-func (t *tmuxClient) clearForDisplay(ctx context.Context, tgt paneTarget) error {
+func (s *slots) clearForDisplay(ctx context.Context, tgt paneTarget) error {
 	owner, bySlot := tgt.Owner, tgt.Resolved()
 	if !bySlot {
-		rec, found, err := t.paneRecordFor(ctx, tgt.PaneID)
+		rec, found, err := s.b.RecordFor(ctx, tgt.Ref)
 		if err != nil {
-			return t.SendKeys(ctx, tgt.PaneID, "C-l", false, false)
+			return s.b.SendKeys(ctx, tgt.Ref, "C-l", false, false)
 		}
 		owner = ""
 		if found {
@@ -511,12 +518,12 @@ func (t *tmuxClient) clearForDisplay(ctx context.Context, tgt paneTarget) error 
 		}
 	}
 	if !clearKillsTheLine(owner, bySlot) {
-		return t.SendKeys(ctx, tgt.PaneID, "C-l", false, false)
+		return s.b.SendKeys(ctx, tgt.Ref, "C-l", false, false)
 	}
-	if err := t.SendKeys(ctx, tgt.PaneID, "C-u", false, false); err != nil {
+	if err := s.b.SendKeys(ctx, tgt.Ref, "C-u", false, false); err != nil {
 		return err
 	}
-	if err := t.SendKeys(ctx, tgt.PaneID, "clear", false, true); err != nil {
+	if err := s.b.SendKeys(ctx, tgt.Ref, "clear", false, true); err != nil {
 		return err
 	}
 	// Brief pause so the clear completes before we write. Only the shell-command
@@ -583,7 +590,7 @@ func clearKillsTheLine(owner string, bySlot bool) bool {
 //
 // The handler itself only parses. All three forms are executed by closePanes,
 // under one slotMu hold, because teardown mutates the state resolution reads.
-func registerClosePane(s *server.MCPServer, client *tmuxClient) {
+func registerClosePane(s *server.MCPServer, sl *slots) {
 	s.AddTool(mcp.NewTool("close-pane",
 		mcp.WithDescription("Close a helper pane the agent is finished with. Panes this server created are killed; panes it adopted from the user are interrupted (C-c) and released, never killed. With no arguments it closes helper slot 1; slot:\"all\" closes every helper pane in this window. Refuses any paneId it does not recognise as its own, and refuses the pane this server is itself running in — use kill-pane if you are certain."),
 		mcp.WithString("paneId",
@@ -608,10 +615,10 @@ func registerClosePane(s *server.MCPServer, client *tmuxClient) {
 		// mutates the state resolution reads and a close that ran outside the lock
 		// would race a concurrent send-keys into the pane it is destroying. An
 		// explicit paneId still wins over slot, exactly as it does everywhere else.
-		entries, err := client.closePanes(ctx, closeSelector{
-			PaneID: req.GetString("paneId", ""),
-			All:    all,
-			Slot:   slot,
+		entries, err := sl.closePanes(ctx, closeSelector{
+			Pane: newPaneRef(req.GetString("paneId", "")),
+			All:  all,
+			Slot: slot,
 		})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -632,7 +639,7 @@ func closedResult(entries ...closedPane) any {
 
 // ---- display-message ----
 
-func registerDisplayMessage(s *server.MCPServer, client *tmuxClient) {
+func registerDisplayMessage(s *server.MCPServer, sl *slots) {
 	s.AddTool(mcp.NewTool("display-message",
 		// The clarification is not decoration. This tool shares a name with
 		// "tmux display-message -p", which is a FORMAT QUERY — the exact command
@@ -655,9 +662,8 @@ func registerDisplayMessage(s *server.MCPServer, client *tmuxClient) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		durationSecs := req.GetInt("duration", 3)
-		durationMs := durationSecs * 1000
 
-		if err := client.DisplayMessage(ctx, message, durationMs); err != nil {
+		if err := sl.b.Notify(ctx, message, time.Duration(durationSecs)*time.Second); err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to display message", err), nil
 		}
 		return mcp.NewToolResultText("Message displayed"), nil

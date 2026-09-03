@@ -46,8 +46,10 @@ func resolveMode(name string) NotificationMode {
 
 // MonitorState carries the evolving state passed to trigger Check functions.
 type MonitorState struct {
-	// PaneID being monitored.
-	PaneID string
+	// Pane being monitored, as an opaque handle. Nothing here formats it: the
+	// progress notification and the channel event name the SLOT, which is the
+	// only pane name this contract has.
+	Pane paneRef
 	// Baseline content captured at the start of monitoring.
 	Baseline string
 	// Current full pane content.
@@ -70,8 +72,8 @@ type MonitorState struct {
 	LastOutputTime time.Time
 	// Start is when monitoring began.
 	Start time.Time
-	// Client provides tmux access.
-	Client *tmuxClient
+	// Backend provides multiplexer access.
+	Backend Backend
 }
 
 // Trigger defines a named condition that, when true, terminates monitoring.
@@ -92,9 +94,9 @@ type Trigger struct {
 //	error        — common error pattern in new output
 //	bell         — tmux window bell flag set
 //	pattern:X    — custom regex X matches a new output line
-func parseTriggers(spec string, client *tmuxClient) []Trigger {
+func parseTriggers(spec string, b Backend) []Trigger {
 	if spec == "" {
-		return defaultTriggers(client)
+		return defaultTriggers(b)
 	}
 	var ts []Trigger
 	for _, part := range strings.Split(spec, ",") {
@@ -102,7 +104,7 @@ func parseTriggers(spec string, client *tmuxClient) []Trigger {
 		if part == "" {
 			continue
 		}
-		t := buildTrigger(part, client)
+		t := buildTrigger(part, b)
 		if t != nil {
 			ts = append(ts, *t)
 		}
@@ -111,10 +113,10 @@ func parseTriggers(spec string, client *tmuxClient) []Trigger {
 }
 
 // defaultTriggers returns the default trigger set for watch-pane.
-func defaultTriggers(client *tmuxClient) []Trigger {
+func defaultTriggers(b Backend) []Trigger {
 	var ts []Trigger
 	for _, name := range []string{"exit", "user_input", "error"} {
-		t := buildTrigger(name, client)
+		t := buildTrigger(name, b)
 		if t != nil {
 			ts = append(ts, *t)
 		}
@@ -140,7 +142,7 @@ var shellNames = map[string]bool{
 var errorRe = regexp.MustCompile(`(?i:error[: ]|fatal|panic|exception|failed)|\bFAIL\b`)
 
 // buildTrigger constructs a Trigger for the given name string.
-func buildTrigger(name string, client *tmuxClient) *Trigger {
+func buildTrigger(name string, b Backend) *Trigger {
 	switch {
 	case name == "exit":
 		return &Trigger{
@@ -229,7 +231,7 @@ func buildTrigger(name string, client *tmuxClient) *Trigger {
 				// A failed read is not a quiet pane, but it is not a reason to
 				// abort a watch either: the trigger reports "no bell" and the
 				// next poll asks again, which is what this has always done.
-				rang, err := client.Bell(ctx, s.PaneID)
+				rang, err := b.Bell(ctx, s.Pane)
 				if err != nil || !rang {
 					return false, ""
 				}
@@ -347,14 +349,14 @@ func isCommandEcho(line, cmd string) bool {
 func monitorPane(
 	ctx context.Context,
 	s *server.MCPServer,
-	client *tmuxClient,
-	paneID string,
+	b Backend,
+	pane paneRef,
 	mode NotificationMode,
 	triggers []Trigger,
 	timeoutSecs int,
 	emitter *ChannelEmitter,
 ) (*WatchResult, error) {
-	return monitorPaneFrom(ctx, s, client, paneID, nil, "", mode, triggers, timeoutSecs, emitter)
+	return monitorPaneFrom(ctx, s, b, pane, nil, "", mode, triggers, timeoutSecs, emitter)
 }
 
 // monitorPaneFrom polls at mode.PollInterval, checks all triggers each tick,
@@ -374,8 +376,8 @@ func monitorPane(
 func monitorPaneFrom(
 	ctx context.Context,
 	s *server.MCPServer,
-	client *tmuxClient,
-	paneID string,
+	b Backend,
+	pane paneRef,
 	baseline *string,
 	echoCmd string,
 	mode NotificationMode,
@@ -392,24 +394,24 @@ func monitorPaneFrom(
 	if baseline != nil {
 		base = *baseline
 	} else {
-		base, _ = client.CapturePane(ctx, paneID, 0, false)
+		base, _ = b.Capture(ctx, pane, 0, false)
 	}
 
 	// Fetch initial process state to record the starting command.
-	initialState, _ := client.GetPaneState(ctx, paneID)
+	initialState, _ := b.Foreground(ctx, pane)
 	initialCmd := ""
 	if initialState != nil {
 		initialCmd = initialState.ForegroundCmd
 	}
 
 	ms := &MonitorState{
-		PaneID:           paneID,
+		Pane:             pane,
 		Baseline:         base,
 		InitialCmd:       initialCmd,
 		LastProgressTime: start,
 		LastOutputTime:   start,
 		Start:            start,
-		Client:           client,
+		Backend:          b,
 	}
 
 	ticker := time.NewTicker(mode.PollInterval)
@@ -424,18 +426,18 @@ func monitorPaneFrom(
 			elapsed := time.Since(start)
 
 			// Capture current pane content.
-			current, err := client.CapturePane(ctx, paneID, 0, false)
+			current, err := b.Capture(ctx, pane, 0, false)
 			if err != nil {
 				// CapturePane fails when the pane has been destroyed (e.g.
 				// after shell exit). Still fetch pane state so the "exit"
 				// trigger can fire.
-				paneState, _ := client.GetPaneState(ctx, paneID)
+				paneState, _ := b.Foreground(ctx, pane)
 				ms.PaneState = paneState
 				for _, trig := range triggers {
 					fired, detail := trig.Check(ctx, ms)
 					if fired {
 						result := &WatchResult{
-							PaneID:    paneID,
+							PaneID:    pane.target(),
 							Event:     trig.Name,
 							Detail:    detail,
 							Elapsed:   elapsed.Seconds(),
@@ -448,7 +450,7 @@ func monitorPaneFrom(
 				}
 				if elapsed >= time.Duration(timeoutSecs)*time.Second {
 					result := &WatchResult{
-						PaneID:    paneID,
+						PaneID:    pane.target(),
 						Event:     "timeout",
 						Detail:    fmt.Sprintf("Timed out after %ds", timeoutSecs),
 						Elapsed:   elapsed.Seconds(),
@@ -512,7 +514,7 @@ func monitorPaneFrom(
 			}
 
 			// Fetch process state for native triggers.
-			paneState, _ := client.GetPaneState(ctx, paneID)
+			paneState, _ := b.Foreground(ctx, pane)
 			ms.PaneState = paneState
 
 			// Update new-line count since last progress report.
@@ -523,7 +525,7 @@ func monitorPaneFrom(
 				fired, detail := trig.Check(ctx, ms)
 				if fired {
 					result := &WatchResult{
-						PaneID:    paneID,
+						PaneID:    pane.target(),
 						Event:     trig.Name,
 						Detail:    detail,
 						Elapsed:   elapsed.Seconds(),
@@ -546,10 +548,14 @@ func monitorPaneFrom(
 			}
 
 			if shouldNotify {
+				// pane.target() is one of the two places this file still names a
+				// pane to the caller — the other is WatchResult.PaneID. Both are
+				// the wire's remaining ids, and both become the slot in the
+				// contract commit.
 				_ = s.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
 					"progress": int(elapsed.Seconds()),
 					"total":    timeoutSecs,
-					"message":  fmt.Sprintf("[%s +%ds] %d new lines", paneID, int(elapsed.Seconds()), ms.NewLineCount),
+					"message":  fmt.Sprintf("[%s +%ds] %d new lines", pane.target(), int(elapsed.Seconds()), ms.NewLineCount),
 				})
 				ms.LastProgressTime = time.Now()
 				ms.NewLineCount = 0
@@ -558,7 +564,7 @@ func monitorPaneFrom(
 			// Check overall timeout.
 			if elapsed >= timeout {
 				result := &WatchResult{
-					PaneID:    paneID,
+					PaneID:    pane.target(),
 					Event:     "timeout",
 					Detail:    fmt.Sprintf("Timed out after %ds", timeoutSecs),
 					Elapsed:   elapsed.Seconds(),

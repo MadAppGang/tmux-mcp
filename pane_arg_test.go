@@ -130,11 +130,11 @@ func TestPaneResolutionFlattens(t *testing.T) {
 
 	t.Run("explicit paneId omits the resolution fields", func(t *testing.T) {
 		for name, v := range map[string]any{
-			"send-keys":   paneTarget{PaneID: "%3"}.resolution(),
-			"run-in-repl": replResult{paneResolution: paneTarget{PaneID: "%3"}.resolution()},
+			"send-keys":   paneTarget{Ref: newPaneRef("%3")}.resolution(),
+			"run-in-repl": replResult{paneResolution: paneTarget{Ref: newPaneRef("%3")}.resolution()},
 			"pane-state": paneStateResult{
 				PaneState:      &PaneState{PanePID: 1},
-				paneResolution: paneTarget{PaneID: "%3"}.resolution(),
+				paneResolution: paneTarget{Ref: newPaneRef("%3")}.resolution(),
 			},
 		} {
 			out := marshalMap(t, v)

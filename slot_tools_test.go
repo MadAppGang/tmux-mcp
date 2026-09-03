@@ -928,33 +928,33 @@ func TestClearDecisionNeverKillsALineOnEvidenceItDoesNotHave(t *testing.T) {
 // is green for the reason that makes the fix sound rather than lucky — C-l is
 // safe whatever has happened to the pane since.
 func TestClearForDisplayTrustsTheOwnerCapturedUnderTheLock(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
 	// The user's own pane, in a scratch directory so that a line submitted by
 	// accident leaves its file there rather than in the repository.
 	dir := t.TempDir()
-	usersPane := tmuxExec(t, "split-window", "-d", "-c", dir, "-t", self, "-P", "-F", "#{pane_id}")
-	waitForClientPaneIdle(t, client, usersPane)
+	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-c", dir, "-t", self.target(), "-P", "-F", "#{pane_id}"))
+	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	pane, slot, created, owner, err := client.resolveHelper(ctx, slotDefault)
+	pane, slot, created, owner, err := sl.resolveHelper(ctx, slotDefault)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
 	if pane != usersPane || owner != ownerAcquired {
 		t.Fatalf("the fixture did not exercise adoption: slot 1 resolved to %s (owner %q), want the "+
-			"user's pane %s adopted as %q", pane, owner, usersPane, ownerAcquired)
+			"user's pane %s adopted as %q", pane.target(), owner, usersPane.target(), ownerAcquired)
 	}
 	// The target the handler is holding when the lock goes away.
-	tgt := paneTarget{PaneID: pane, Slot: slot, Created: created, Owner: owner}
+	tgt := paneTarget{Ref: pane, Slot: slot, Created: created, Owner: owner}
 
 	// The concurrent close-pane lands. This is the mutation, verbatim: the
 	// registration is erased and the pane is left alive, which is what "released
 	// back to the user" means.
-	if err := client.clearPaneRegistration(ctx, usersPane); err != nil {
+	if err := sl.b.ClearMarks(ctx, usersPane); err != nil {
 		t.Fatalf("release the adopted pane: %v", err)
 	}
-	if _, found, err := client.paneRecordFor(ctx, usersPane); err != nil || found {
+	if _, found, err := sl.b.RecordFor(ctx, usersPane); err != nil || found {
 		t.Fatalf("the pane still carries a registry record (found=%v err=%v); a re-read would find "+
 			"it and this test would not be reproducing the race at all", found, err)
 	}
@@ -965,15 +965,15 @@ func TestClearForDisplayTrustsTheOwnerCapturedUnderTheLock(t *testing.T) {
 	// different file, so a submitted line would leave the sentinel absent and the
 	// assertion below would report success.
 	sentinel := filepath.Join(dir, "submitted")
-	tmuxExec(t, "send-keys", "-t", usersPane, "-l", "touch "+sentinel+" ")
+	tmuxExec(t, "send-keys", "-t", usersPane.target(), "-l", "touch "+sentinel+" ")
 	sleep(300 * time.Millisecond)
 
-	if err := client.clearForDisplay(ctx, tgt); err != nil {
+	if err := sl.clearForDisplay(ctx, tgt); err != nil {
 		t.Fatalf("clearForDisplay: %v", err)
 	}
 	sleep(300 * time.Millisecond)
 
-	content, err := client.CapturePane(ctx, usersPane, 0, false)
+	content, err := sl.b.Capture(ctx, usersPane, 0, false)
 	if err != nil {
 		t.Fatalf("capture the pane back: %v", err)
 	}

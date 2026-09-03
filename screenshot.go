@@ -112,11 +112,16 @@ func renderHTMLToPNG(ctx context.Context, htmlContent string, cols, rows int) ([
 }
 
 // handleScreenshotPane is the handler for the screenshot-pane tool.
-func handleScreenshotPane(ctx context.Context, client *tmuxClient, paneID, theme, output string) (*mcp.CallToolResult, error) {
+//
+// It takes the port and a handle, not a client and an id. The one place it still
+// needs the id is the image caption, which names the pane to the model; that
+// caption becomes the SLOT in the commit that makes the slot the only handle a
+// caller sees, and target() is called there and nowhere else in this file.
+func handleScreenshotPane(ctx context.Context, b Backend, pane paneRef, theme, output string) (*mcp.CallToolResult, error) {
 	// 1. Snapshot the pane: its content and its geometry. Both tmux commands,
 	// and the 80x24 fallback that covers a failed measurement, live behind
 	// Screen — this file renders, it does not talk to the multiplexer.
-	snap, err := client.Screen(ctx, paneID)
+	snap, err := b.Screen(ctx, pane)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("failed to capture pane", err), nil
 	}
@@ -146,7 +151,7 @@ func handleScreenshotPane(ctx context.Context, client *tmuxClient, paneID, theme
 		pngData, renderErr := renderHTMLToPNG(ctx, html, cols, rows)
 		if renderErr == nil {
 			return mcp.NewToolResultImage(
-				"Terminal screenshot of pane "+paneID,
+				"Terminal screenshot of pane "+pane.target(),
 				base64.StdEncoding.EncodeToString(pngData),
 				"image/png",
 			), nil

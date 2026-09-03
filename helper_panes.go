@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -17,31 +18,29 @@ import (
 // and writes stay there, next to the witness constant that explains them; the
 // rules about what to do with those records live here, findable as a unit.
 //
-// The file boundary is now the thing being enforced rather than merely observed:
-// every tmux invocation in the package is in backend_tmux.go, so this file's
-// tmux vocabulary is exactly what a later commit has to replace with a port.
+// The boundary is now a port rather than a file-naming convention: this file
+// holds a Backend and nothing else, so it cannot reach a tmux command even by
+// accident, and it never sees a pane id — it holds opaque paneRefs.
 
-// selfPane returns the pane this server process runs in, or "" when the server
-// was not started inside tmux.
+// slots is the policy layer, and the change of receiver IS the design.
 //
-// The value is inherited from the environment at spawn and is stable for the
-// process lifetime, which is the entire point: it cannot race with the user
-// switching windows, panes or sessions, unlike any query of tmux's "active"
-// pane, which answers a question about the user's cursor rather than about this
-// process. A resolution that consulted the active pane would place the agent's
-// helper next to wherever the user happened to be looking at that instant.
+// It used to be tmuxClient, which meant every rule below sat one dot away from
+// the tmux CLI: a new branch could shell out, parse an id, or invent a second
+// way to ask "which pane am I" without anything noticing. Holding only the port
+// makes that impossible to write rather than merely discouraged.
 //
-// It is also not a guess: every agent runtime that starts this server starts it
-// from inside a pane, and tmux sets TMUX_PANE in that pane's environment itself.
-// An empty answer therefore means something specific and reportable — "this
-// process is not in tmux" — rather than "lookup failed", which is why the caller
-// can turn it into errNotInTmux instead of a fallback.
-//
-// Reading it through a method rather than at each call site is deliberate: the
-// set of callers permitted to ask "which pane am I?" is a safety property (a
-// pane the agent may split, never a pane the agent may type into), and a single
-// named accessor is what makes that set auditable.
-func (t *tmuxClient) selfPane() string { return os.Getenv("TMUX_PANE") }
+// slotMu moved here from tmuxClient unchanged, and everything resolveHelper and
+// closePanes say about it still applies: mcp-go dispatches tool calls onto a
+// worker pool, so two concurrent calls that both default to slot 1 would each
+// create a pane; and the lock does NOT order two server processes sharing a
+// window, which is why the duplicate healing in slotCandidateLocked is the
+// second half of this lock rather than defensive decoration.
+type slots struct {
+	b      Backend
+	slotMu sync.Mutex
+}
+
+func newSlots(b Backend) *slots { return &slots{b: b} }
 
 // errNotInTmux is returned whenever a call needs the server's own pane and there
 // is none.
@@ -56,31 +55,21 @@ var errNotInTmux = errors.New(
 	"this server is not running inside tmux ($TMUX_PANE is unset), so it has no window to " +
 		"place a pane in — pass an explicit paneId, or use headless:true / create-headless")
 
-// selfWindow returns the server's own pane and the window that contains it.
+// The window scope did not go away with selfWindow; it moved onto the port.
 //
-// Every slot operation is scoped to this one window, and that is a deliberate
-// limit rather than an implementation shortcut: the agent's helper panes belong
-// beside the agent, where the user can see them, and a resolution that could
-// reach into the user's other windows would be able to hand back a pane the user
-// is not looking at — which is indistinguishable, from the agent's side, from a
-// pane it created. Teardown follows the same scope for the same reason.
+// Every slot operation is still scoped to the one window this server's pane
+// lives in, and that is a deliberate limit rather than an implementation
+// shortcut: the agent's helper panes belong beside the agent, where the user can
+// see them, and a resolution that could reach into the user's other windows
+// would be able to hand back a pane the user is not looking at — which is
+// indistinguishable, from the agent's side, from a pane it created. Teardown
+// follows the same scope for the same reason.
 //
-// This is also the single accessor through which resolution and teardown ask
-// "which pane am I?". Keeping the question in one place is what makes Invariant
-// S — the set of code permitted to know the server's own pane — a property a
-// test can check (TestOnlyPolicyCodeKnowsOurOwnPane) rather than a rule every
-// future handler has to remember.
-func (t *tmuxClient) selfWindow(ctx context.Context) (self, windowID string, err error) {
-	self = t.selfPane()
-	if self == "" {
-		return "", "", errNotInTmux
-	}
-	windowID, err = t.getWindowIDForPane(ctx, self)
-	if err != nil {
-		return "", "", fmt.Errorf("locate the window holding this server's own pane %s: %w", self, err)
-	}
-	return self, windowID, nil
-}
+// Backend.Records and Backend.Siblings take "the pane the scope is around" and
+// resolve the window themselves, so a window id is no longer a value policy
+// holds, passes or could accidentally widen. Invariant S survives as Backend
+// .Self, still the single accessor and still the only reader of TMUX_PANE —
+// see TestOnlyPolicyCodeKnowsOurOwnPane.
 
 // Slot numbering.
 //
@@ -142,12 +131,12 @@ func helperTitle(slot int) string {
 // it back to the user, leaving no record at all, and a second read cannot tell
 // "released a millisecond ago" from "never claimed". See clearForDisplay, where
 // that difference is the user's half-typed command line.
-func (t *tmuxClient) resolveHelper(
+func (s *slots) resolveHelper(
 	ctx context.Context, slot int,
-) (paneID string, resolved int, created bool, owner string, err error) {
-	t.slotMu.Lock()
-	defer t.slotMu.Unlock()
-	return t.resolveHelperLocked(ctx, slot)
+) (pane paneRef, resolved int, created bool, owner string, err error) {
+	s.slotMu.Lock()
+	defer s.slotMu.Unlock()
+	return s.resolveHelperLocked(ctx, slot)
 }
 
 // resolveHelperNoCreate finds the pane occupying a slot without creating or
@@ -164,29 +153,29 @@ func (t *tmuxClient) resolveHelper(
 // performs goes through closePanes, which holds slotMu across the lookup AND the
 // mutations that follow it and therefore calls the ...Locked body directly — see
 // closePanes for why the split is mandatory rather than tidy.
-func (t *tmuxClient) resolveHelperNoCreate(ctx context.Context, slot int) (paneRecord, bool, error) {
-	t.slotMu.Lock()
-	defer t.slotMu.Unlock()
+func (s *slots) resolveHelperNoCreate(ctx context.Context, slot int) (paneRecord, bool, error) {
+	s.slotMu.Lock()
+	defer s.slotMu.Unlock()
 
-	self, window, err := t.selfWindow(ctx)
+	self, err := s.b.Self(ctx)
 	if err != nil {
 		return paneRecord{}, false, err
 	}
-	return t.resolveHelperNoCreateLocked(ctx, slot, self, window)
+	return s.resolveHelperNoCreateLocked(ctx, slot, self)
 }
 
 // resolveHelperNoCreateLocked is the body of the above. The caller must hold
-// slotMu, and must have read self and window from selfWindow inside that hold —
-// passing them in rather than re-reading them is what keeps one teardown call to
-// a single answer about which pane is ours.
-func (t *tmuxClient) resolveHelperNoCreateLocked(
-	ctx context.Context, slot int, self, window string,
+// slotMu, and must have read self from the port inside that hold — passing it in
+// rather than re-reading it is what keeps one teardown call to a single answer
+// about which pane is ours.
+func (s *slots) resolveHelperNoCreateLocked(
+	ctx context.Context, slot int, self paneRef,
 ) (paneRecord, bool, error) {
-	reg, err := t.paneRegistryInWindow(ctx, window)
+	reg, err := s.b.Records(ctx, self)
 	if err != nil {
-		return paneRecord{}, false, fmt.Errorf("read the pane registry of window %s: %w", window, err)
+		return paneRecord{}, false, fmt.Errorf("read the pane registry: %w", err)
 	}
-	rec, ok := t.closeCandidateLocked(ctx, slot, self, reg)
+	rec, ok := s.closeCandidateLocked(ctx, slot, self, reg)
 	return rec, ok, nil
 }
 
@@ -202,20 +191,20 @@ func (t *tmuxClient) resolveHelperNoCreateLocked(
 // knows it for certain: reuse carries the record it chose from, adoption has
 // just written ownerAcquired, and a pane we split is ours. See resolveHelper for
 // what the value is for.
-func (t *tmuxClient) resolveHelperLocked(ctx context.Context, slot int) (string, int, bool, string, error) {
-	self, window, err := t.selfWindow(ctx)
+func (s *slots) resolveHelperLocked(ctx context.Context, slot int) (paneRef, int, bool, string, error) {
+	self, err := s.b.Self(ctx)
 	if err != nil {
-		return "", 0, false, "", err
+		return paneRef{}, 0, false, "", err
 	}
 
-	reg, err := t.paneRegistryInWindow(ctx, window)
+	reg, err := s.b.Records(ctx, self)
 	if err != nil {
-		return "", 0, false, "", fmt.Errorf("read the pane registry of window %s: %w", window, err)
+		return paneRef{}, 0, false, "", fmt.Errorf("read the pane registry: %w", err)
 	}
 
 	// Reuse.
-	if rec, ok := t.slotCandidateLocked(ctx, slot, self, reg); ok {
-		return t.helperResult(rec.PaneID, self, slot, false, rec.Owner)
+	if rec, ok := s.slotCandidateLocked(ctx, slot, self, reg); ok {
+		return s.helperResult(rec.Ref, self, slot, false, rec.Owner)
 	}
 
 	// Adopt. The registry lookup here is the "unowned" half of the acquisition
@@ -223,8 +212,8 @@ func (t *tmuxClient) resolveHelperLocked(ctx context.Context, slot int) (string,
 	// know to be ours costs no extra tmux round-trip; canAcquire re-reads the
 	// owner mark for the panes that reach it, because absence from this map means
 	// "no record we recognise", which is not the same as "unclaimed".
-	if pane, ok := t.acquirePaneLocked(ctx, window, reg, slot, self); ok {
-		return t.helperResult(pane, self, slot, true, ownerAcquired)
+	if pane, ok := s.acquirePaneLocked(ctx, reg, slot, self); ok {
+		return s.helperResult(pane, self, slot, true, ownerAcquired)
 	}
 
 	// Create. Failures of the two markers below are deliberately not fatal, for
@@ -232,15 +221,15 @@ func (t *tmuxClient) resolveHelperLocked(ctx context.Context, slot int) (string,
 	// works, it just will not be found again as a reuse candidate, so the caller
 	// loses nothing now and at worst gets a second pane later. Returning an error
 	// here would abandon a pane that has already been created.
-	place := t.placementForSlot(ctx, window, reg, slot, self)
-	cp, err := t.SplitPane(ctx, place.anchor, place.direction, place.size)
+	place := s.placementForSlot(ctx, reg, slot, self)
+	pane, err := s.b.OpenBeside(ctx, place)
 	if err != nil {
-		return "", 0, false, "", fmt.Errorf("create helper pane for slot %d: %w", slot, err)
+		return paneRef{}, 0, false, "", fmt.Errorf("create helper pane for slot %d: %w", slot, err)
 	}
-	_ = t.setPaneSlot(ctx, cp.PaneID, slot)
-	_ = t.setPaneTitle(ctx, cp.PaneID, helperTitle(slot))
-	t.waitForShellReady(ctx, cp.PaneID)
-	return t.helperResult(cp.PaneID, self, slot, true, ownerAgent)
+	_ = s.b.SetSlot(ctx, pane, slot)
+	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
+	s.waitForShellReady(ctx, pane)
+	return s.helperResult(pane, self, slot, true, ownerAgent)
 }
 
 // helperResult is the single exit through which every resolution passes, and it
@@ -260,15 +249,18 @@ func (t *tmuxClient) resolveHelperLocked(ctx context.Context, slot int) (string,
 // function rather than a habit three branches share. A refusal reports no owner
 // at all: there is no pane, so there is nothing to be the owner of, and an empty
 // value is the one clearForDisplay treats as "do not touch the line".
-func (t *tmuxClient) helperResult(
-	paneID, self string, slot int, created bool, owner string,
-) (string, int, bool, string, error) {
-	if paneID == self {
-		return "", 0, false, "", fmt.Errorf(
+func (s *slots) helperResult(
+	pane, self paneRef, slot int, created bool, owner string,
+) (paneRef, int, bool, string, error) {
+	if pane == self {
+		// %s on a paneRef prints "<pane>", not an id, and that is the point: this
+		// sentence reaches the model. The slot number is the handle the caller
+		// has; the sentence itself is rewritten by the contract commit.
+		return paneRef{}, 0, false, "", fmt.Errorf(
 			"internal error: slot %d resolved to this server's own pane %s; refusing to return it",
-			slot, paneID)
+			slot, pane)
 	}
-	return paneID, slot, created, owner, nil
+	return pane, slot, created, owner, nil
 }
 
 // slotCandidateLocked returns the pane currently holding slot, and repairs the
@@ -292,8 +284,8 @@ func (t *tmuxClient) helperResult(
 // their slot markers cleared: they stay agent-owned panes, they simply stop
 // answering to a slot. Keeping the oldest is the choice that preserves whatever
 // long-running process the caller already started.
-func (t *tmuxClient) slotCandidateLocked(
-	ctx context.Context, slot int, self string, reg map[string]paneRecord,
+func (s *slots) slotCandidateLocked(
+	ctx context.Context, slot int, self paneRef, reg map[paneRef]paneRecord,
 ) (paneRecord, bool) {
 	var candidates []paneRecord
 	for _, rec := range reg {
@@ -304,8 +296,8 @@ func (t *tmuxClient) slotCandidateLocked(
 		if rec.Slot != slot || rec.Dead {
 			continue
 		}
-		if rec.PaneID == self {
-			_ = t.setPaneSlot(ctx, rec.PaneID, 0)
+		if rec.Ref == self {
+			_ = s.b.SetSlot(ctx, rec.Ref, 0)
 			continue
 		}
 		candidates = append(candidates, rec)
@@ -314,10 +306,10 @@ func (t *tmuxClient) slotCandidateLocked(
 		return paneRecord{}, false
 	}
 	sort.Slice(candidates, func(i, j int) bool {
-		return paneIDNumber(candidates[i].PaneID) < paneIDNumber(candidates[j].PaneID)
+		return candidates[i].Seq < candidates[j].Seq
 	})
 	for _, dup := range candidates[1:] {
-		t.retireDuplicateLocked(ctx, dup)
+		s.retireDuplicateLocked(ctx, dup)
 	}
 	return candidates[0], true
 }
@@ -344,12 +336,12 @@ func (t *tmuxClient) slotCandidateLocked(
 // from inside a resolution nobody asked to destroy anything, would throw that
 // away. It becomes an unslotted agent pane, which is kill-pane territory, and
 // that is the documented cost of the cross-process race this healing repairs.
-func (t *tmuxClient) retireDuplicateLocked(ctx context.Context, rec paneRecord) {
+func (s *slots) retireDuplicateLocked(ctx context.Context, rec paneRecord) {
 	if rec.Owner == ownerAcquired {
-		_ = t.releaseAcquiredLocked(ctx, rec)
+		_ = s.releaseAcquiredLocked(ctx, rec)
 		return
 	}
-	_ = t.setPaneSlot(ctx, rec.PaneID, 0)
+	_ = s.b.SetSlot(ctx, rec.Ref, 0)
 }
 
 // closeCandidateLocked returns the pane occupying a slot for the purpose of
@@ -381,15 +373,15 @@ func (t *tmuxClient) retireDuplicateLocked(ctx context.Context, rec paneRecord) 
 // The reuse path keeps its filter, so a caller that asks for slot 1 while a
 // corpse holds it gets a fresh pane rather than the body — the corpse is only
 // reachable through close-pane, whose entire job is disposing of it.
-func (t *tmuxClient) closeCandidateLocked(
-	ctx context.Context, slot int, self string, reg map[string]paneRecord,
+func (s *slots) closeCandidateLocked(
+	ctx context.Context, slot int, self paneRef, reg map[paneRef]paneRecord,
 ) (paneRecord, bool) {
-	if rec, ok := t.slotCandidateLocked(ctx, slot, self, reg); ok {
+	if rec, ok := s.slotCandidateLocked(ctx, slot, self, reg); ok {
 		return rec, true
 	}
 	var dead []paneRecord
 	for _, rec := range reg {
-		if rec.Slot != slot || !rec.Dead || rec.PaneID == self {
+		if rec.Slot != slot || !rec.Dead || rec.Ref == self {
 			continue
 		}
 		dead = append(dead, rec)
@@ -398,7 +390,7 @@ func (t *tmuxClient) closeCandidateLocked(
 		return paneRecord{}, false
 	}
 	sort.Slice(dead, func(i, j int) bool {
-		return paneIDNumber(dead[i].PaneID) < paneIDNumber(dead[j].PaneID)
+		return dead[i].Seq < dead[j].Seq
 	})
 	return dead[0], true
 }
@@ -423,29 +415,29 @@ func (t *tmuxClient) closeCandidateLocked(
 // into and never be able to identify again, which is worse than not adopting it.
 // Abandoning it also means undoing whatever part of the mark did stick, which is
 // adoptCandidateLocked's job and the reason that step is a function of its own.
-func (t *tmuxClient) acquirePaneLocked(
-	ctx context.Context, windowID string, reg map[string]paneRecord, slot int, self string,
-) (string, bool) {
-	panes, err := t.ListPanes(ctx, windowID)
+func (s *slots) acquirePaneLocked(
+	ctx context.Context, reg map[paneRef]paneRecord, slot int, self paneRef,
+) (paneRef, bool) {
+	panes, err := s.b.Siblings(ctx, self)
 	if err != nil {
-		return "", false
+		return paneRef{}, false
 	}
 	sort.Slice(panes, func(i, j int) bool {
-		return paneIDNumber(panes[i].ID) < paneIDNumber(panes[j].ID)
+		return panes[i].Seq < panes[j].Seq
 	})
 	for _, p := range panes {
-		if _, claimed := reg[p.ID]; claimed {
+		if _, claimed := reg[p.Ref]; claimed {
 			continue
 		}
-		if !t.canAcquire(ctx, p.ID, self) {
+		if !s.canAcquire(ctx, p.Ref, self) {
 			continue
 		}
-		if !t.adoptCandidateLocked(ctx, p.ID, slot) {
+		if !s.adoptCandidateLocked(ctx, p.Ref, slot) {
 			continue
 		}
-		return p.ID, true
+		return p.Ref, true
 	}
-	return "", false
+	return paneRef{}, false
 }
 
 // partialMarkUndoTimeout bounds the rollback in adoptCandidateLocked. It is
@@ -458,8 +450,7 @@ const partialMarkUndoTimeout = 2 * time.Second
 // ours-by-adoption, and leaves NOTHING behind if it cannot write all of them.
 // The caller must hold slotMu.
 //
-// markPaneOwnedAs writes witness → owner → slot and returns on the first
-// failure, so a cancelled context or one transient tmux error leaves a *prefix*
+// Claim writes witness → owner → slot and returns on the first failure, so a cancelled context or one transient tmux error leaves a *prefix*
 // of that sequence on the pane. Every prefix is inert to slot resolution — the
 // write order is chosen there precisely so a half-claimed pane can never steer a
 // later call — and "inert" was mistaken for "harmless", which it is not on a
@@ -487,18 +478,14 @@ const partialMarkUndoTimeout = 2 * time.Second
 // abandoned over one. This is also why the whole step is its own function —
 // a future edit that adds a fourth marker has one place to put it, and cannot
 // add it above the rollback by accident.
-func (t *tmuxClient) adoptCandidateLocked(ctx context.Context, paneID string, slot int) bool {
-	// markPaneOwnedAs is the one writer that takes socket and bare id
-	// separately, because its original callers are mid-creation and hold both;
-	// here they have to be split back out of the id ListPanes reported.
-	socket, bareID := parseTarget(paneID)
-	if err := t.markPaneOwnedAs(ctx, socket, bareID, ownerAcquired, slot); err != nil {
+func (s *slots) adoptCandidateLocked(ctx context.Context, pane paneRef, slot int) bool {
+	if err := s.b.Claim(ctx, pane, ownerAcquired, slot); err != nil {
 		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
 		defer cancel()
-		_ = t.clearPaneRegistration(undoCtx, paneID)
+		_ = s.b.ClearMarks(undoCtx, pane)
 		return false
 	}
-	_ = t.setPaneTitle(ctx, paneID, helperTitle(slot))
+	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
 	return true
 }
 
@@ -550,15 +537,15 @@ func (t *tmuxClient) adoptCandidateLocked(ctx context.Context, paneID string, sl
 // session, or one with AWS_PROFILE=production exported, passes every check here
 // — it is the right user, at a prompt, doing nothing. Our commands then run in
 // that context, with that environment, against that account.
-func (t *tmuxClient) canAcquire(ctx context.Context, paneID, selfPaneID string) bool {
-	if paneID == "" || paneID == selfPaneID {
+func (s *slots) canAcquire(ctx context.Context, pane, self paneRef) bool {
+	if pane.empty() || pane == self {
 		return false
 	}
-	owner, err := t.paneOwnerMark(ctx, paneID)
+	owner, err := s.b.OwnerMark(ctx, pane)
 	if err != nil || owner != "" {
 		return false
 	}
-	state, err := t.GetPaneState(ctx, paneID)
+	state, err := s.b.Foreground(ctx, pane)
 	if err != nil {
 		return false
 	}
@@ -599,14 +586,9 @@ func sameUIDAsAgent(state *PaneState) bool {
 	return real == me && effective == me
 }
 
-// helperPlacement is the server-decided geometry for a slot: which pane to
-// split, which way, and how big. The agent never passes a direction, and this is
-// where that decision lives instead.
-type helperPlacement struct {
-	anchor    string // the pane to split
-	direction string // "horizontal" | "vertical"
-	size      int    // percentage; 0 means tmux's default
-}
+// The server-decided geometry for a slot — which pane to split, which way, and
+// how big — is the port's placement type. The agent never passes a direction,
+// and this is where that decision lives instead.
 
 // placementForSlot decides where a new helper pane goes.
 //
@@ -646,21 +628,21 @@ type helperPlacement struct {
 // is where the fallback chain ends anyway; letting a cosmetic geometry decision
 // fail a resolution that is otherwise able to proceed would trade a slightly
 // worse layout for no pane at all.
-func (t *tmuxClient) placementForSlot(
-	ctx context.Context, windowID string, reg map[string]paneRecord, slot int, self string,
-) helperPlacement {
+func (s *slots) placementForSlot(
+	ctx context.Context, reg map[paneRef]paneRecord, slot int, self paneRef,
+) placement {
 	switch slot {
 	case 1:
-		return helperPlacement{anchor: self, direction: "horizontal", size: 50}
+		return placement{Anchor: self, Axis: splitBeside, SizePercent: 50}
 	case 2:
-		if rec, ok := aliveSlotPane(reg, slotDefault); ok && rec.Owner == ownerAgent && rec.PaneID != self {
-			return helperPlacement{anchor: rec.PaneID, direction: "vertical", size: 50}
+		if rec, ok := aliveSlotPane(reg, slotDefault); ok && rec.Owner == ownerAgent && rec.Ref != self {
+			return placement{Anchor: rec.Ref, Axis: splitBelow, SizePercent: 50}
 		}
-		return helperPlacement{anchor: t.anchorOrSelf(ctx, windowID, reg, self), direction: "vertical", size: 50}
+		return placement{Anchor: s.anchorOrSelf(ctx, reg, self), Axis: splitBelow, SizePercent: 50}
 	case 3:
-		return helperPlacement{anchor: self, direction: "vertical", size: 50}
+		return placement{Anchor: self, Axis: splitBelow, SizePercent: 50}
 	default:
-		return helperPlacement{anchor: t.anchorOrSelf(ctx, windowID, reg, self), direction: "vertical", size: 50}
+		return placement{Anchor: s.anchorOrSelf(ctx, reg, self), Axis: splitBelow, SizePercent: 50}
 	}
 }
 
@@ -671,7 +653,7 @@ func (t *tmuxClient) placementForSlot(
 // "Which pane holds this slot" and "may we split it" are two questions, and
 // answering the second one in here would hide it from the one place — placement
 // — where it decides whether the user's layout gets rearranged.
-func aliveSlotPane(reg map[string]paneRecord, slot int) (paneRecord, bool) {
+func aliveSlotPane(reg map[paneRef]paneRecord, slot int) (paneRecord, bool) {
 	for _, rec := range reg {
 		if rec.Slot == slot && !rec.Dead {
 			return rec, true
@@ -694,28 +676,29 @@ func aliveSlotPane(reg map[string]paneRecord, slot int) (paneRecord, bool) {
 // estate: we may type into it, because that is what acquisition means, but
 // halving it rearranges a layout the user built by hand, which is a visible
 // change nobody asked for. We split panes we made.
-func (t *tmuxClient) anchorOrSelf(
-	ctx context.Context, windowID string, reg map[string]paneRecord, self string,
-) string {
-	panes, err := t.ListPanes(ctx, windowID)
+func (s *slots) anchorOrSelf(
+	ctx context.Context, reg map[paneRef]paneRecord, self paneRef,
+) paneRef {
+	panes, err := s.b.Siblings(ctx, self)
 	if err != nil {
 		return self
 	}
-	best, bestArea := "", 0
+	var best paneRef
+	bestArea, bestSeq := 0, 0
 	for _, p := range panes {
-		rec, ok := reg[p.ID]
-		if !ok || rec.Owner != ownerAgent || rec.Dead || p.ID == self {
+		rec, ok := reg[p.Ref]
+		if !ok || rec.Owner != ownerAgent || rec.Dead || p.Ref == self {
 			continue
 		}
 		area := p.Width * p.Height
 		switch {
 		case area > bestArea:
-			best, bestArea = p.ID, area
-		case area == bestArea && best != "" && paneIDNumber(p.ID) < paneIDNumber(best):
-			best = p.ID
+			best, bestArea, bestSeq = p.Ref, area, p.Seq
+		case area == bestArea && !best.empty() && p.Seq < bestSeq:
+			best, bestSeq = p.Ref, p.Seq
 		}
 	}
-	if best == "" {
+	if best.empty() {
 		return self
 	}
 	return best
@@ -785,24 +768,28 @@ var errCloseSelfPane = errors.New("refusing to close this server's own pane")
 // kill-pane remains the deliberate way to destroy any pane, including this one.
 // It keeps its blunt signature — paneId required, no slot, no default — precisely
 // so that destroying something is never the accidental outcome of a tidy-up.
-func (t *tmuxClient) closeHelperLocked(ctx context.Context, rec paneRecord, self string) (string, error) {
-	if self != "" && rec.PaneID == self {
+func (s *slots) closeHelperLocked(ctx context.Context, rec paneRecord, self paneRef) (string, error) {
+	if !self.empty() && rec.Ref == self {
+		// The %s verbs below print "<pane>": closedPane.Detail carries this
+		// verbatim to the caller, so an id here would be an id in the model's
+		// context. Both sentences are replaced wholesale by the contract commit,
+		// which also removes the pointer to kill-pane.
 		return actionError, fmt.Errorf(
 			"%w: %s is the pane this server is running in, and closing it would kill the session "+
 				"this very request arrived through — the conversation and everything in it. A pane "+
 				"created by an outer agent carries a perfectly valid agent-owned record, so the "+
 				"record is not what makes a pane safe to close. Use kill-pane if destroying it is "+
 				"genuinely what you want",
-			errCloseSelfPane, rec.PaneID)
+			errCloseSelfPane, rec.Ref)
 	}
 	switch rec.Owner {
 	case ownerAgent:
-		if err := t.KillPane(ctx, rec.PaneID); err != nil {
+		if err := s.b.Close(ctx, rec.Ref); err != nil {
 			return actionError, err
 		}
 		return actionKilled, nil
 	case ownerAcquired:
-		if err := t.releaseAcquiredLocked(ctx, rec); err != nil {
+		if err := s.releaseAcquiredLocked(ctx, rec); err != nil {
 			return actionError, err
 		}
 		return actionReleased, nil
@@ -810,7 +797,7 @@ func (t *tmuxClient) closeHelperLocked(ctx context.Context, rec paneRecord, self
 		// Unreachable: every caller checks for a record first, and a record with
 		// an unrecognised owner never leaves the registry readers.
 		return actionNone, fmt.Errorf("pane %s has owner %q, which this binary does not manage",
-			rec.PaneID, rec.Owner)
+			rec.Ref, rec.Owner)
 	}
 }
 
@@ -838,16 +825,16 @@ func (t *tmuxClient) closeHelperLocked(ctx context.Context, rec paneRecord, self
 // claim to it is a lie to the user, but one that has cost them nothing, and it
 // must never be the reason a release reports failure. The label goes to empty
 // rather than back to whatever the user had, because we never saw what that was.
-func (t *tmuxClient) releaseAcquiredLocked(ctx context.Context, rec paneRecord) error {
+func (s *slots) releaseAcquiredLocked(ctx context.Context, rec paneRecord) error {
 	if !rec.Dead {
-		if err := t.SendKeys(ctx, rec.PaneID, "C-c", false, false); err != nil {
+		if err := s.b.SendKeys(ctx, rec.Ref, "C-c", false, false); err != nil {
 			return err
 		}
 	}
-	if err := t.clearPaneRegistration(ctx, rec.PaneID); err != nil {
+	if err := s.b.ClearMarks(ctx, rec.Ref); err != nil {
 		return err
 	}
-	_ = t.setPaneTitle(ctx, rec.PaneID, "")
+	_ = s.b.SetTitle(ctx, rec.Ref, "")
 	return nil
 }
 
@@ -855,9 +842,9 @@ func (t *tmuxClient) releaseAcquiredLocked(ctx context.Context, rec paneRecord) 
 // applies, in the order the tool documents: an explicit pane wins, then "all",
 // then a slot number (1 when the caller named nothing at all).
 type closeSelector struct {
-	PaneID string
-	All    bool
-	Slot   int
+	Pane paneRef
+	All  bool
+	Slot int
 }
 
 // closePanes performs every form of close-pane, and holding slotMu across the
@@ -886,16 +873,16 @@ type closeSelector struct {
 // stricter but matched on selector names rather than values — it could not see
 // the lock taken through a function variable, i.e. the case most likely to
 // reintroduce this.
-func (t *tmuxClient) closePanes(ctx context.Context, sel closeSelector) ([]closedPane, error) {
-	t.slotMu.Lock()
-	defer t.slotMu.Unlock()
+func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane, error) {
+	s.slotMu.Lock()
+	defer s.slotMu.Unlock()
 
 	// One read of "which pane am I", used for the guard in closeHelperLocked and
-	// for the window every slot is scoped to.
+	// as the scope every slot form is resolved around.
 	//
 	// Not being in tmux is fatal to the two window-scoped forms — there is no
-	// window to enumerate and no slot to resolve — but an explicit paneId names
-	// its pane absolutely and must keep working, because that is how a headless
+	// window to enumerate and no slot to resolve — but an explicit pane names
+	// itself absolutely and must keep working, because that is how a headless
 	// pane is closed by a server that was never in tmux to begin with. There is
 	// no own pane to protect in that case, so the guard has nothing to do.
 	//
@@ -903,19 +890,19 @@ func (t *tmuxClient) closePanes(ctx context.Context, sel closeSelector) ([]close
 	// we could not establish which pane is ours, and the self guard is the only
 	// thing standing between close-pane and the agent's own session: a guard that
 	// cannot be evaluated must not be skipped.
-	self, window, err := t.selfWindow(ctx)
+	self, err := s.b.Self(ctx)
 	if err != nil {
-		if sel.PaneID == "" || !errors.Is(err, errNotInTmux) {
+		if sel.Pane.empty() || !errors.Is(err, errNotInTmux) {
 			return nil, err
 		}
-		self, window = "", ""
+		self = paneRef{}
 	}
 
 	switch {
-	case sel.PaneID != "":
-		return t.closeExplicitLocked(ctx, sel.PaneID, self)
+	case !sel.Pane.empty():
+		return s.closeExplicitLocked(ctx, sel.Pane, self)
 	case sel.All:
-		recs, err := t.slottedHelpersInSelfWindowLocked(ctx, self, window)
+		recs, err := s.slottedHelpersInSelfWindowLocked(ctx, self)
 		if err != nil {
 			return nil, err
 		}
@@ -925,12 +912,12 @@ func (t *tmuxClient) closePanes(ctx context.Context, sel closeSelector) ([]close
 			// at the first problem leaves the caller worse off than one that
 			// continues and reports: the panes after the failure would stay open
 			// with no indication that they had not been considered.
-			entry, _ := t.closeOneLocked(ctx, rec, self)
+			entry, _ := s.closeOneLocked(ctx, rec, self)
 			closed = append(closed, entry)
 		}
 		return closed, nil
 	default:
-		rec, found, err := t.resolveHelperNoCreateLocked(ctx, sel.Slot, self, window)
+		rec, found, err := s.resolveHelperNoCreateLocked(ctx, sel.Slot, self)
 		if err != nil {
 			return nil, err
 		}
@@ -939,7 +926,7 @@ func (t *tmuxClient) closePanes(ctx context.Context, sel closeSelector) ([]close
 			// 2 was never opened is a request that has already been satisfied.
 			return []closedPane{{Slot: sel.Slot, Action: actionNone}}, nil
 		}
-		entry, _ := t.closeOneLocked(ctx, rec, self)
+		entry, _ := s.closeOneLocked(ctx, rec, self)
 		return []closedPane{entry}, nil
 	}
 }
@@ -954,18 +941,20 @@ func (t *tmuxClient) closePanes(ctx context.Context, sel closeSelector) ([]close
 // action:"error" could reasonably read the array as "teardown ran", whereas an
 // error is unmistakable. In a batch the same refusal stays an entry, because one
 // pane must not stop the sweep.
-func (t *tmuxClient) closeExplicitLocked(ctx context.Context, paneID, self string) ([]closedPane, error) {
-	rec, found, err := t.paneRecordFor(ctx, paneID)
+func (s *slots) closeExplicitLocked(ctx context.Context, pane, self paneRef) ([]closedPane, error) {
+	rec, found, err := s.b.RecordFor(ctx, pane)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read pane record: %w", err)
 	}
 	if !found {
+		// "<pane>", again by construction — see closeHelperLocked. This whole
+		// branch goes when the explicit-pane form does.
 		return nil, fmt.Errorf(
 			"pane %s is not one of this server's helper panes (it carries no "+
 				"@mcp_pane/@mcp_owner record) — refusing to close it; use kill-pane if you "+
-				"are certain", paneID)
+				"are certain", pane)
 	}
-	entry, err := t.closeOneLocked(ctx, rec, self)
+	entry, err := s.closeOneLocked(ctx, rec, self)
 	if errors.Is(err, errCloseSelfPane) {
 		return nil, err
 	}
@@ -977,9 +966,9 @@ func (t *tmuxClient) closeExplicitLocked(ctx context.Context, paneID, self strin
 // reports and carries on from, while the error is how the explicit branch tells
 // the self refusal apart from an ordinary tmux failure. The caller must hold
 // slotMu.
-func (t *tmuxClient) closeOneLocked(ctx context.Context, rec paneRecord, self string) (closedPane, error) {
-	action, err := t.closeHelperLocked(ctx, rec, self)
-	entry := closedPane{PaneID: rec.PaneID, Slot: rec.Slot, Action: action}
+func (s *slots) closeOneLocked(ctx context.Context, rec paneRecord, self paneRef) (closedPane, error) {
+	action, err := s.closeHelperLocked(ctx, rec, self)
+	entry := closedPane{PaneID: rec.Ref.target(), Slot: rec.Slot, Action: action}
 	if err != nil {
 		entry.Action = actionError
 		entry.Detail = err.Error()
@@ -989,8 +978,8 @@ func (t *tmuxClient) closeOneLocked(ctx context.Context, rec paneRecord, self st
 
 // slottedHelpersInSelfWindowLocked returns every slotted helper in the window
 // this server runs in, ordered by slot and then by pane id. It backs
-// close-pane({slot:"all"}). The caller must hold slotMu, and passes the self and
-// window it read from selfWindow inside that hold.
+// close-pane({slot:"all"}). The caller must hold slotMu, and passes the self it
+// read from the port inside that hold.
 //
 // Three scoping decisions live here, and none of them is arbitrary.
 //
@@ -1014,16 +1003,16 @@ func (t *tmuxClient) closeOneLocked(ctx context.Context, rec paneRecord, self st
 // It deliberately does NOT filter dead panes, and closeCandidateLocked was
 // taught to match rather than the reverse: a corpse is exactly what a teardown
 // is for. The reuse path is the one that must keep skipping them.
-func (t *tmuxClient) slottedHelpersInSelfWindowLocked(
-	ctx context.Context, self, window string,
+func (s *slots) slottedHelpersInSelfWindowLocked(
+	ctx context.Context, self paneRef,
 ) ([]paneRecord, error) {
-	reg, err := t.paneRegistryInWindow(ctx, window)
+	reg, err := s.b.Records(ctx, self)
 	if err != nil {
-		return nil, fmt.Errorf("read the pane registry of window %s: %w", window, err)
+		return nil, fmt.Errorf("read the pane registry: %w", err)
 	}
 	var recs []paneRecord
 	for _, rec := range reg {
-		if rec.Slot < slotDefault || rec.PaneID == self {
+		if rec.Slot < slotDefault || rec.Ref == self {
 			continue
 		}
 		recs = append(recs, rec)
@@ -1032,7 +1021,7 @@ func (t *tmuxClient) slottedHelpersInSelfWindowLocked(
 		if recs[i].Slot != recs[j].Slot {
 			return recs[i].Slot < recs[j].Slot
 		}
-		return paneIDNumber(recs[i].PaneID) < paneIDNumber(recs[j].PaneID)
+		return recs[i].Seq < recs[j].Seq
 	})
 	return recs, nil
 }
@@ -1062,14 +1051,14 @@ func (t *tmuxClient) slottedHelpersInSelfWindowLocked(
 // Only the creation path waits. Reuse does not need it — a pane is only a reuse
 // candidate because it was already found idle — and neither does acquisition,
 // where canAcquire has just proved the shell idle as its precondition.
-func (t *tmuxClient) waitForShellReady(ctx context.Context, paneID string) {
+func (s *slots) waitForShellReady(ctx context.Context, pane paneRef) {
 	const (
 		readyTimeout  = 2 * time.Second
 		readyInterval = 50 * time.Millisecond
 	)
 	deadline := time.Now().Add(readyTimeout)
 	for {
-		if state, err := t.GetPaneState(ctx, paneID); err == nil && paneIsIdleShell(state) {
+		if state, err := s.b.Foreground(ctx, pane); err == nil && paneIsIdleShell(state) {
 			return
 		}
 		if ctx.Err() != nil || time.Now().After(deadline) {

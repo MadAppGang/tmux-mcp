@@ -55,6 +55,11 @@ func main() {
 
 	client := newTmuxClient(*shellType)
 
+	// The policy layer holds the port and nothing else. The raw client survives
+	// alongside it only for the tools that still take a tmux id — they go with
+	// the contract change, and the client goes with them.
+	sl := newSlots(newTmuxBackend(client))
+
 	// Resource capabilities are NOT advertised: this server registers no
 	// resources. The two it used to serve were tmux://sessions and the
 	// tmux://pane/{paneId} template, and the template is a paneId in the
@@ -87,7 +92,7 @@ func main() {
 
 	emitter := newChannelEmitter(*channelMode, s)
 
-	registerAgenticScope(s, client, emitter)
+	registerAgenticScope(s, client, sl, emitter)
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("server error: %v", err)
@@ -104,23 +109,23 @@ func main() {
 // agent that wants to drive tmux directly already has the tmux CLI. A flag kept
 // alive to accept one value teaches its reader that the others existed and might
 // come back, which is the compatibility layer this change refuses to ship.
-func registerAgenticScope(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
+func registerAgenticScope(s *server.MCPServer, client *tmuxClient, sl *slots, emitter *ChannelEmitter) {
 	// Essential Layer 1 tools
 	registerListSessions(s, client)
 	registerListWindows(s, client)
 	registerListPanes(s, client)
 	registerCreateSession(s, client)
 	registerCreateHeadless(s, client)
-	registerSplitPane(s, client)
-	registerCapturePane(s, client)
-	registerSendKeys(s, client)
-	registerExecuteCommand(s, client)
+	registerSplitPane(s, client, sl)
+	registerCapturePane(s, sl)
+	registerSendKeys(s, sl)
+	registerExecuteCommand(s, client, sl)
 	registerKillSession(s, client)
 	registerKillHeadlessServer(s, client)
 	registerKillPane(s, client)
-	registerScreenshotPane(s, client)
+	registerScreenshotPane(s, sl)
 	// All Layer 2 tools
-	registerAgentTools(s, client, emitter)
+	registerAgentTools(s, client, sl, emitter)
 }
 
 // ---- Individual Layer 1 tool registrations ----
@@ -244,7 +249,7 @@ func registerListPanes(s *server.MCPServer, client *tmuxClient) {
 	})
 }
 
-func registerCapturePane(s *server.MCPServer, client *tmuxClient) {
+func registerCapturePane(s *server.MCPServer, sl *slots) {
 	s.AddTool(mcp.NewTool("capture-pane",
 		mcp.WithDescription("Capture terminal text content from a pane as plain text. Preferred tool for reading command output, logs, and text-based terminal content. Use screenshot-pane only when visual rendering (colors, layout, TUI graphics) matters. paneId is optional: with no paneId it reads helper slot 1, the pane this agent runs commands in."),
 		mcp.WithString("paneId",
@@ -274,13 +279,13 @@ func registerCapturePane(s *server.MCPServer, client *tmuxClient) {
 		// take an explicit target, create nothing, and keep the annotation
 		// honestly; the difference is the default, not the verb in the name.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		lines := req.GetInt("lines", 0)
 		colors := req.GetBool("colors", false)
-		content, err := client.CapturePane(ctx, tgt.PaneID, lines, colors)
+		content, err := sl.b.Capture(ctx, tgt.Ref, lines, colors)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to capture pane", err), nil
 		}
@@ -323,7 +328,7 @@ func registerCreateSession(s *server.MCPServer, client *tmuxClient) {
 	})
 }
 
-func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
+func registerSplitPane(s *server.MCPServer, client *tmuxClient, sl *slots) {
 	s.AddTool(mcp.NewTool("split-pane",
 		mcp.WithDescription("Get a pane to work in, beside the agent, in the window the user is already looking at. With no arguments it returns helper slot 1, creating it if needed; slot:2, slot:3 … give further panes. Repeated calls for the same slot return the SAME pane (\"reused\": true), so a process started there is still there next time. Pass paneId only to split a specific pane, in which case direction and size apply and the new pane is unslotted."),
 		mcp.WithString("paneId",
@@ -338,7 +343,7 @@ func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 		),
 		slotProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -347,9 +352,9 @@ func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 		// server's own rules. Reused is set from Created so a consumer that
 		// predates slots and keys on "reused" keeps reading a true answer.
 		if tgt.Resolved() {
-			windowID, _ := client.getWindowIDForPane(ctx, tgt.PaneID)
+			windowID, _ := client.getWindowIDForPane(ctx, tgt.Ref.target())
 			return jsonResult(&CreatedPane{
-				PaneID:   tgt.PaneID,
+				PaneID:   tgt.Ref.target(),
 				WindowID: windowID,
 				Reused:   !tgt.Created,
 				Slot:     tgt.Slot,
@@ -362,7 +367,7 @@ func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 		// SPLIT — an anchor — not the pane the caller wants back. That is why
 		// direction and size exist here and nowhere else, and why this branch
 		// does its own work instead of using tgt.PaneID as a destination.
-		paneID := tgt.PaneID
+		paneID := tgt.Ref.target()
 		direction := req.GetString("direction", "vertical")
 		size := req.GetInt("size", 0)
 
@@ -384,7 +389,7 @@ func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 	})
 }
 
-func registerSendKeys(s *server.MCPServer, client *tmuxClient) {
+func registerSendKeys(s *server.MCPServer, sl *slots) {
 	s.AddTool(mcp.NewTool("send-keys",
 		// Three facts an agent needs before its first bare send-keys, and the
 		// last of them is the one nobody expects: with no paneId this call can
@@ -416,20 +421,20 @@ func registerSendKeys(s *server.MCPServer, client *tmuxClient) {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		literal := req.GetBool("literal", true)
 		enter := req.GetBool("enter", false)
-		if err := client.SendKeys(ctx, tgt.PaneID, keys, literal, enter); err != nil {
+		if err := sl.b.SendKeys(ctx, tgt.Ref, keys, literal, enter); err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to send keys", err), nil
 		}
 		return jsonResult(tgt.resolution())
 	})
 }
 
-func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
+func registerExecuteCommand(s *server.MCPServer, client *tmuxClient, sl *slots) {
 	s.AddTool(mcp.NewTool("execute-command",
 		mcp.WithDescription("Run a shell command in a pane and wait for it to complete. Returns the full output and exit code. paneId is optional: with no paneId the command runs in helper slot 1, a pane beside the agent that is created or adopted on first use and reused after that — never the agent's own pane. When headless=true and no paneId is provided, a temporary isolated session is created instead, the command runs, and the session is cleaned up automatically (no paneId in response)."),
 		mcp.WithString("paneId",
@@ -458,7 +463,7 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 		// told it may not run a command without naming a pane goes looking for
 		// $TMUX_PANE and starts driving raw tmux. It delivers keystrokes like
 		// send-keys does, so it resolves like send-keys does.
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{AllowHeadless: true})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{AllowHeadless: true})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -482,7 +487,7 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 			defer func() {
 				_ = client.KillSession(context.Background(), created.SessionID)
 			}()
-			result, err := client.ExecuteCommand(ctx, created.PaneID, command)
+			result, err := sl.b.Exec(ctx, newPaneRef(created.PaneID), command)
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
 			}
@@ -494,12 +499,21 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 			}{Output: result.Output, ExitCode: result.ExitCode, TimedOut: result.TimedOut})
 		}
 
-		result, err := client.ExecuteCommand(ctx, tgt.PaneID, command)
+		outcome, err := sl.b.Exec(ctx, tgt.Ref, command)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
 		}
-		result.Slot, result.Created = tgt.Slot, tgt.Created
-		return jsonResult(result)
+		// The port answers in execOutcome, which carries no pane id; the wire
+		// still has one, so the handler is where the two meet. That field, and
+		// this assembly with it, go with the contract change.
+		return jsonResult(&CommandResult{
+			PaneID:   tgt.Ref.target(),
+			Output:   outcome.Output,
+			ExitCode: outcome.ExitCode,
+			TimedOut: outcome.TimedOut,
+			Slot:     tgt.Slot,
+			Created:  tgt.Created,
+		})
 	})
 }
 
@@ -547,7 +561,7 @@ func registerKillPane(s *server.MCPServer, client *tmuxClient) {
 	})
 }
 
-func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
+func registerScreenshotPane(s *server.MCPServer, sl *slots) {
 	s.AddTool(mcp.NewTool("screenshot-pane",
 		mcp.WithDescription("Render a visual PNG screenshot of a terminal pane with full ANSI colors, styles, and layout via xterm.js. Returns an image the model can see. Use ONLY when visual appearance matters (TUI layouts, color-coded output, ANSI art). For reading text content, prefer capture-pane instead. paneId is optional: with no paneId it renders helper slot 1."),
 		mcp.WithString("paneId",
@@ -566,14 +580,14 @@ func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
 		// back, and resolution can split the user's window, adopt one of their
 		// shells and rename a pane. See capture-pane for the full reason.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := client.resolvePaneArg(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolvePaneArg(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		theme := req.GetString("theme", "dark")
 		output := req.GetString("output", "")
 
-		res, err := handleScreenshotPane(ctx, client, tgt.PaneID, theme, output)
+		res, err := handleScreenshotPane(ctx, sl.b, tgt.Ref, theme, output)
 		if err != nil {
 			return res, err
 		}

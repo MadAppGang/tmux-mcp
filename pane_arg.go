@@ -161,10 +161,10 @@ func slotArgError(raw any) error {
 // empty, because "we did not look" and "we looked and found nothing" are
 // different facts.
 type paneTarget struct {
-	PaneID  string // concrete and non-empty on success, unless Headless
-	Slot    int    // 0 when the caller named a pane explicitly
-	Created bool   // this call created or adopted the pane
-	Owner   string // ownerAgent or ownerAcquired as read under slotMu during slot
+	Ref     paneRef // the handle; non-empty on success, unless Headless
+	Slot    int     // 0 when the caller named a pane explicitly
+	Created bool    // this call created or adopted the pane
+	Owner   string  // ownerAgent or ownerAcquired as read under slotMu during slot
 	// resolution; empty when the caller named the pane
 	Headless bool // caller asked for a headless pane and named none;
 	// only ever set for tools that declare AllowHeadless
@@ -190,8 +190,13 @@ type paneArgSpec struct {
 func (tgt paneTarget) Resolved() bool { return tgt.Slot != 0 }
 
 // resolution projects a target into the fields tools put in their responses.
+//
+// This is the one place outside backend_tmux.go that turns a handle back into an
+// id, and it is here because the WIRE still carries paneId: every response type
+// below has the field. It dies with that field, in the commit that makes the
+// slot the only handle a caller ever sees.
 func (tgt paneTarget) resolution() paneResolution {
-	return paneResolution{PaneID: tgt.PaneID, Slot: tgt.Slot, Created: tgt.Created}
+	return paneResolution{PaneID: tgt.Ref.target(), Slot: tgt.Slot, Created: tgt.Created}
 }
 
 // paneResolution is embedded in tool responses so a caller that named no pane
@@ -307,7 +312,7 @@ func parseCloseSlotArg(req mcp.CallToolRequest) (slot int, all bool, present boo
 // slot 1. A caller that passes both paneId and slot gets the pane it named, and
 // the response reports slot 0 — the slot is not resolved at all, so no pane is
 // created for it.
-func (t *tmuxClient) resolvePaneArg(
+func (s *slots) resolvePaneArg(
 	ctx context.Context, req mcp.CallToolRequest, spec paneArgSpec,
 ) (paneTarget, error) {
 	slot, hasSlot, err := parseSlotArg(req)
@@ -328,7 +333,7 @@ func (t *tmuxClient) resolvePaneArg(
 		// consumer that needs an owner on this path reads it itself, knowing it is
 		// reading it now rather than at resolution time; clearForDisplay does
 		// exactly that, and says why it is safe there.
-		return paneTarget{PaneID: paneID}, nil
+		return paneTarget{Ref: newPaneRef(paneID)}, nil
 	}
 	if headless {
 		return paneTarget{Headless: true}, nil
@@ -337,9 +342,9 @@ func (t *tmuxClient) resolvePaneArg(
 	if !hasSlot {
 		slot = slotDefault
 	}
-	paneID, resolved, created, owner, err := t.resolveHelper(ctx, slot)
+	pane, resolved, created, owner, err := s.resolveHelper(ctx, slot)
 	if err != nil {
 		return paneTarget{}, err
 	}
-	return paneTarget{PaneID: paneID, Slot: resolved, Created: created, Owner: owner}, nil
+	return paneTarget{Ref: pane, Slot: resolved, Created: created, Owner: owner}, nil
 }
