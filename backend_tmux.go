@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"strconv"
@@ -198,6 +199,25 @@ func parseTarget(target string) (socket string, id string) {
 // -f by position. "tmux -f /dev/null new-session" names a config file, but
 // "new-session -f /dev/null" would parse /dev/null as the new session's *client
 // flags*, and "split-window -f" is a full-width split.
+
+// paneIDNumber extracts the numeric part of a tmux pane id ("%12" → 12).
+//
+// Sorting pane ids as strings is wrong in a way that only appears after a
+// session has been running a while: "%10" sorts before "%9" lexically, so the
+// "keep the lowest id" rules in helper_panes.go — which mean "keep the oldest
+// pane", the one most likely to have the caller's process in it — would start
+// preferring the newest pane once the window had passed ten panes. An
+// unparseable id sorts last, so a pane we cannot rank can never win a tie-break
+// by accident.
+func paneIDNumber(paneID string) int {
+	_, bare := parseTarget(paneID)
+	n, err := strconv.Atoi(strings.TrimPrefix(bare, "%"))
+	if err != nil {
+		return math.MaxInt
+	}
+	return n
+}
+
 func socketArgs(socket string) []string {
 	if socket == "" {
 		return nil
@@ -862,11 +882,65 @@ func (t *tmuxClient) KillHeadlessServer(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// Bell reports the multiplexer's CURRENT bell indication for the pane's window.
+//
+// It is NOT read-and-clear, and the name is the trap: tmux does not clear
+// #{window_bell_flag} when a client reads it, and neither does this. The bell
+// trigger fires on every poll until something else clears the flag, which is
+// what the code has always done — the contract is written down here so the next
+// reader does not infer a consume from the verb.
+//
+// A tmux failure is reported as an error and never as "no bell": the trigger
+// that owns the decision is the one place that knows a failed read must not be
+// mistaken for a quiet pane.
+func (t *tmuxClient) Bell(ctx context.Context, paneID string) (bool, error) {
+	socket, bareID := parseTarget(paneID)
+	out, err := t.runWithSocket(ctx, socket, "display-message", "-p", "-t", bareID,
+		"#{window_bell_flag}")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == "1", nil
+}
+
 // DisplayMessage shows a transient message in the tmux status bar.
 // durationMs controls how long (in milliseconds) the message is shown.
 func (t *tmuxClient) DisplayMessage(ctx context.Context, message string, durationMs int) error {
 	_, err := t.run(ctx, "display-message", "-d", strconv.Itoa(durationMs), message)
 	return err
+}
+
+// screen is one visual snapshot of a pane: what it is showing, and how big it
+// is. It exists so the two tmux commands behind a screenshot stay on this side
+// of the file boundary.
+type screen struct {
+	ANSI       string
+	Cols, Rows int
+}
+
+// Screen takes the snapshot the screenshot renderer works from.
+//
+// It is BEST-EFFORT and explicitly NOT atomic: two tmux commands behind one
+// method are still two commands, and a pane resized between them yields a
+// capture measured against the wrong geometry. Saying so here is cheaper than
+// implying an atomicity the tmux CLI cannot give.
+//
+// The failure behaviour is the renderer's, moved verbatim rather than
+// redesigned: a dimension failure falls back to 80x24, because a screenshot at
+// the wrong size beats no screenshot; a capture failure is fatal, because there
+// is nothing left to draw. Keeping both here is what lets "-N" (preserve
+// trailing whitespace, without which the layout collapses) stay a detail of this
+// file instead of becoming a boolean flag every caller has to know about.
+func (t *tmuxClient) Screen(ctx context.Context, paneID string) (screen, error) {
+	cols, rows, err := t.GetPaneDimensions(ctx, paneID)
+	if err != nil {
+		cols, rows = 80, 24
+	}
+	ansi, err := t.CapturePaneRaw(ctx, paneID)
+	if err != nil {
+		return screen{}, err
+	}
+	return screen{ANSI: ansi, Cols: cols, Rows: rows}, nil
 }
 
 // CapturePaneRaw captures pane content with ANSI escape codes and preserved
@@ -1155,6 +1229,61 @@ func (t *tmuxClient) findIdlePaneInWindow(ctx context.Context, sourcePaneID stri
 	}
 
 	return "", nil
+}
+
+// GetPaneState returns the native OS-level state of the process in a tmux pane.
+// It queries tmux for the pane's PID, dead flag, and dead status in a single
+// call, then uses OS-specific inspection to determine whether the foreground
+// process is alive and waiting for input.
+func (t *tmuxClient) GetPaneState(ctx context.Context, paneID string) (*PaneState, error) {
+	socket, bareID := parseTarget(paneID)
+	// Query pid, dead flag, and dead exit status in a single tmux call.
+	out, err := t.runWithSocket(ctx, socket, "display-message", "-p", "-t", bareID,
+		"#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}")
+	if err != nil {
+		return nil, fmt.Errorf("get pane state: %w", err)
+	}
+
+	// run() already strips trailing newlines; split on tab to get the three fields.
+	// Do NOT TrimSpace the whole string since the trailing tab (empty dead_status)
+	// would be stripped, yielding only 2 fields instead of 3.
+	parts := strings.SplitN(out, "\t", 3)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("unexpected tmux output for pane state: %q", out)
+	}
+
+	pidStr := strings.TrimSpace(parts[0])
+	deadFlag := strings.TrimSpace(parts[1])
+	deadStatusStr := strings.TrimSpace(parts[2])
+
+	// If the pane PID is empty the pane does not exist.
+	if pidStr == "" {
+		return nil, fmt.Errorf("pane %s does not exist or has no PID", paneID)
+	}
+
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse pane pid %q: %w", pidStr, err)
+	}
+
+	// If the pane is dead, return immediately without OS-level process inspection.
+	if deadFlag == "1" {
+		exitCode, _ := strconv.Atoi(deadStatusStr)
+		return &PaneState{
+			PanePID:  pid,
+			IsAlive:  false,
+			ExitCode: exitCode,
+		}, nil
+	}
+
+	state := &PaneState{PanePID: pid}
+	if err := fillPaneState(ctx, state); err != nil {
+		// Treat inspection errors as "alive, no input-wait detected" rather
+		// than hard failures — the pane is still usable even if we cannot
+		// determine the precise state.
+		state.IsAlive = true
+	}
+	return state, nil
 }
 
 // paneIsIdleShell reports whether a pane is an idle shell at its prompt: alive,

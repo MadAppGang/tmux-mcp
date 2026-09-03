@@ -450,7 +450,7 @@ func drainNotifications(c *mcpClient) {
 
 // waitForPaneIdle polls pane-state until the pane is an idle shell at its
 // prompt — the exact condition split-pane's reuse logic checks. It mirrors
-// paneIsIdleShell in tmux.go: a shell foreground process that is also the
+// paneIsIdleShell in backend_tmux.go: a shell foreground process that is also the
 // pane's own process (no child command running). It does NOT key off
 // waitingForInput, which is unreliable across platforms (an idle shell reports
 // false on Linux, true on macOS). Fatal on timeout so a stuck pane surfaces as

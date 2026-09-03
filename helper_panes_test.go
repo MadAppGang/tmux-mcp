@@ -724,6 +724,24 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 // The one thing still required is that SOMETHING asks. A package where nothing
 // resolves its own pane cannot be excluding it either, and this test would then
 // be passing over a resolver that no longer knows what to leave out.
+//
+// # The second rule: who may run a command at all
+//
+// The same walk answers a wider question, because it is the same kind of
+// question and the same parse. Only backend_tmux.go may talk to the
+// multiplexer, and os/exec is the only way to talk to it, so an import of
+// os/exec anywhere else in the package is either a second tmux call site or the
+// start of one.
+//
+// screenshot.go is the one exception and it is not a tmux exception: it runs
+// headless Chrome to render a PNG, and `open`/`xdg-open` to show one. Those are
+// not multiplexer access, which is why the permitted set below carries a reason
+// per file rather than a bare list — a future entry has to justify itself in
+// the same sentence.
+//
+// The rule matters more than a tidiness rule would, because the id policy must
+// never see is a tmux id: a file that can run tmux can read one, and every leak
+// this design guards against starts there.
 func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 	permitted := map[string]string{
 		"selfWindow":                       "the single accessor resolution and teardown share, to exclude the pane",
@@ -735,6 +753,12 @@ func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 		"slottedHelpersInSelfWindowLocked": "the \"all\" sweep, which excludes this server's own pane",
 		"registerSplitPane":                "split-pane's default (§4): a split delivers no keystrokes",
 	}
+
+	permittedExecImporters := map[string]string{
+		"backend_tmux.go": "the only file that runs tmux; every multiplexer call in the package is here",
+		"screenshot.go":   "headless Chrome and open/xdg-open, which are rendering, not multiplexer access",
+	}
+	execImporters := map[string]bool{}
 
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -751,6 +775,11 @@ func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
+		}
+		for _, imp := range file.Imports {
+			if imp.Path.Value == `"os/exec"` {
+				execImporters[path] = true
+			}
 		}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
@@ -802,6 +831,18 @@ func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 		t.Errorf("nothing in this package asks which pane this server runs in, so nothing can be "+
 			"excluding it either — resolution has stopped knowing what not to hand back, and this "+
 			"test is guarding an empty set (permitted callers: %v)", permittedNames(permitted))
+	}
+
+	for path := range execImporters {
+		if _, ok := permittedExecImporters[path]; !ok {
+			t.Errorf("%s imports os/exec, and only %v may: a file that can run a command can run "+
+				"tmux, and a second tmux call site is how a raw pane id gets back into policy "+
+				"code", path, permittedNames(permittedExecImporters))
+		}
+	}
+	if !execImporters["backend_tmux.go"] {
+		t.Error("backend_tmux.go does not import os/exec, so it is not the file running tmux any " +
+			"more — whichever file now is, this test is no longer looking at it")
 	}
 }
 

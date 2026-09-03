@@ -226,15 +226,14 @@ func buildTrigger(name string, client *tmuxClient) *Trigger {
 		return &Trigger{
 			Name: "bell",
 			Check: func(ctx context.Context, s *MonitorState) (bool, string) {
-				socket, bareID := parseTarget(s.PaneID)
-				out, err := client.runWithSocket(ctx, socket, "display-message", "-p", "-t", bareID, "#{window_bell_flag}")
-				if err != nil {
+				// A failed read is not a quiet pane, but it is not a reason to
+				// abort a watch either: the trigger reports "no bell" and the
+				// next poll asks again, which is what this has always done.
+				rang, err := client.Bell(ctx, s.PaneID)
+				if err != nil || !rang {
 					return false, ""
 				}
-				if strings.TrimSpace(out) == "1" {
-					return true, "tmux window bell received"
-				}
-				return false, ""
+				return true, "tmux window bell received"
 			},
 		}
 

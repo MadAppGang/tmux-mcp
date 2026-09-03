@@ -4,21 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 )
 
 // This file holds helper-pane *policy*: which pane the agent gets, where it is
-// placed, and under what conditions an existing pane may be adopted. tmux.go is
-// a thin wrapper over the tmux CLI — everything in it is a command with
-// arguments — and mixing policy into it would spread the safety-critical
-// decisions across a 900-line client. The low-level option reads and writes stay
-// there, next to the witness constant that explains them; the rules about what
-// to do with those records live here, findable as a unit.
+// placed, and under what conditions an existing pane may be adopted.
+// backend_tmux.go is a thin wrapper over the tmux CLI — everything in it is a
+// command with arguments — and mixing policy into it would spread the
+// safety-critical decisions across a 900-line client. The low-level option reads
+// and writes stay there, next to the witness constant that explains them; the
+// rules about what to do with those records live here, findable as a unit.
+//
+// The file boundary is now the thing being enforced rather than merely observed:
+// every tmux invocation in the package is in backend_tmux.go, so this file's
+// tmux vocabulary is exactly what a later commit has to replace with a port.
 
 // selfPane returns the pane this server process runs in, or "" when the server
 // was not started inside tmux.
@@ -107,23 +108,6 @@ func helperTitle(slot int) string {
 		return "agent"
 	}
 	return fmt.Sprintf("agent:%d", slot)
-}
-
-// paneIDNumber extracts the numeric part of a tmux pane id ("%12" → 12).
-//
-// Sorting pane ids as strings is wrong in a way that only appears after a
-// session has been running a while: "%10" sorts before "%9" lexically, so the
-// "keep the lowest id" rules below — which mean "keep the oldest pane", the one
-// most likely to have the caller's process in it — would start preferring the
-// newest pane once the window had passed ten panes. An unparseable id sorts
-// last, so a pane we cannot rank can never win a tie-break by accident.
-func paneIDNumber(paneID string) int {
-	_, bare := parseTarget(paneID)
-	n, err := strconv.Atoi(strings.TrimPrefix(bare, "%"))
-	if err != nil {
-		return math.MaxInt
-	}
-	return n
 }
 
 // resolveHelper returns the helper pane for the given slot in the window this
