@@ -624,10 +624,11 @@ func TestClearForDisplayTrustsTheOwnerCapturedUnderTheLock(t *testing.T) {
 	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-c", dir, "-t", self.target(), "-P", "-F", "#{pane_id}"))
 	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	pane, slot, created, owner, err := sl.resolveHelper(ctx, slotDefault)
+	tgt16, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	pane, slot, created, owner := tgt16.Ref, tgt16.Slot, tgt16.Created, tgt16.Owner
 	if pane != usersPane || owner != ownerAcquired {
 		t.Fatalf("the fixture did not exercise adoption: slot 1 resolved to %s (owner %q), want the "+
 			"user's pane %s adopted as %q", pane.target(), owner, usersPane.target(), ownerAcquired)

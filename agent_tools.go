@@ -128,6 +128,7 @@ func registerSendKeys(s *server.MCPServer, sl *slots) {
 			mcp.Description("Append an Enter keystroke after the keys (default false)"),
 		),
 		slotProperty(),
+		isolatedProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		// keys is validated before the pane is resolved, and the order matters:
 		// resolution can CREATE a pane, and a call that is going to be rejected
@@ -169,6 +170,7 @@ func registerRunInREPL(s *server.MCPServer, sl *slots) {
 			mcp.Description("Seconds to wait for prompt to reappear (default 10)"),
 		),
 		slotProperty(),
+		isolatedProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		// Every required argument is validated, and the prompt regex compiled,
 		// before the pane is resolved: resolution can create a pane, and a call
@@ -296,6 +298,7 @@ func registerExecuteCommand(s *server.MCPServer, sl *slots) {
 				"with timedOut:true and partial output (default: no timeout)"),
 		),
 		slotProperty(),
+		isolatedProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		// command first: resolution can create a pane, and a call that will be
 		// rejected for a missing argument must not leave a split behind.
@@ -303,7 +306,11 @@ func registerExecuteCommand(s *server.MCPServer, sl *slots) {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{})
+		// This is the ONE tool that allows isolated with no slot, and the reason
+		// is that it is the one tool whose work is over when it returns: a
+		// command runs to completion and its output comes back. Nothing is left
+		// running, so nothing needs a number to be reached by again.
+		tgt, ephemeral, err := sl.resolveSlotOrEphemeral(ctx, req, paneArgSpec{AllowEphemeral: true})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -318,6 +325,10 @@ func registerExecuteCommand(s *server.MCPServer, sl *slots) {
 			defer cancel()
 		}
 
+		if ephemeral {
+			return runOneShot(ctx, sl, command)
+		}
+
 		outcome, err := sl.b.Exec(ctx, tgt.Ref, command)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
@@ -328,6 +339,55 @@ func registerExecuteCommand(s *server.MCPServer, sl *slots) {
 			ExitCode:       outcome.ExitCode,
 			TimedOut:       outcome.TimedOut,
 		})
+	})
+}
+
+// oneShotCleanupTimeout bounds the teardown of an ephemeral pane. It is short
+// because it is one kill-pane against a pane we have just been talking to, and
+// long enough that a busy machine still gets the command out.
+const oneShotCleanupTimeout = 5 * time.Second
+
+// runOneShot opens an invisible pane, runs one command in it, and destroys it —
+// all inside this call, and with no registry entry at any point.
+//
+// The pane is never claimed, and that is deliberate rather than an omission: a
+// slot marker is what makes a pane addressable again, and this pane must not be.
+// The consequence is that list-slots cannot see it, which is why the leak this
+// function could produce is caught by probing the isolated socket directly
+// rather than by listing slots.
+//
+// waitForShellReady is not optional. OpenIsolated takes no initial command, so
+// Exec would otherwise send into a shell that may still be sourcing its rc
+// files — keystrokes delivered then can be mangled or dropped outright, which
+// produces the worst failure this server can have: a command that looks sent,
+// leaves a plausible pane, and never ran.
+//
+// The close runs on a context DETACHED from the caller's. The likeliest reason
+// this handler is unwinding early is that the caller's context expired — a
+// timeout is a documented outcome of this tool — and a kill issued on that same
+// dead context is a command that does not run, leaving a live shell nobody can
+// see, list or reach for the lifetime of the machine.
+func runOneShot(ctx context.Context, sl *slots, command string) (*mcp.CallToolResult, error) {
+	pane, err := sl.b.OpenIsolated(ctx)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("failed to open a pane for the command", err), nil
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), oneShotCleanupTimeout)
+		defer cancel()
+		_ = sl.b.Close(closeCtx, pane)
+	}()
+
+	sl.waitForShellReady(ctx, pane)
+
+	outcome, err := sl.b.Exec(ctx, pane, command)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
+	}
+	return jsonResult(oneShotResult{
+		Output:   outcome.Output,
+		ExitCode: outcome.ExitCode,
+		TimedOut: outcome.TimedOut,
 	})
 }
 
@@ -359,6 +419,7 @@ func registerStartAndWatch(s *server.MCPServer, sl *slots, emitter *ChannelEmitt
 			mcp.Description("Max seconds to watch before giving up (default 60)"),
 		),
 		slotProperty(),
+		isolatedProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		command, err := req.RequireString("command")
 		if err != nil {
@@ -459,6 +520,7 @@ func registerWriteToDisplay(s *server.MCPServer, sl *slots) {
 			mcp.Description("Clear the pane before writing (default false). On a pane the server created this also wipes whatever is sitting unsubmitted in its line buffer, so each write replaces the last. On a pane adopted from the user it never does: a half-typed command line belongs to them, so the screen is redrawn around it and successive writes append instead."),
 		),
 		slotProperty(),
+		isolatedProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		// text is validated before the pane is resolved, and the order matters:
 		// resolution can CREATE a pane, and a call that is going to be rejected
@@ -566,6 +628,14 @@ func registerWriteToDisplay(s *server.MCPServer, sl *slots) {
 //
 // The dangerous direction is only ever "thought it was ours, it is actually
 // theirs", and a value read while the slot was held cannot produce it.
+//
+// # An isolated pane needs no special case, and that is the point
+//
+// Every isolated pane is ownerAgent — nothing is ever adopted on that socket,
+// because there is no user there to adopt from — so the destructive branch is
+// the one it takes, and correctly: there is no half-typed command line of
+// anyone's to destroy. The rule is stated in terms of OWNERSHIP rather than
+// visibility, which is why the invisible case needed no clause of its own.
 func (s *slots) clearForDisplay(ctx context.Context, tgt paneTarget) error {
 	if !clearKillsTheLine(tgt.Owner) {
 		return s.b.SendKeys(ctx, tgt.Ref, "C-l", false, false)
@@ -612,14 +682,19 @@ func registerOpenPane(s *server.MCPServer, sl *slots) {
 		mcp.WithDescription("Get a pane to work in, beside the agent, in the window the user is "+
 			"already looking at. With no arguments it returns helper slot 1, creating it if "+
 			"needed; slot:2, slot:3 … give further panes. Repeated calls for the same slot return "+
-			"the SAME pane (created:false), so a process started there is still there next time."),
+			"the SAME pane (created:false), so a process started there is still there next time. "+
+			"With isolated:true the pane is opened where nobody can see it instead."),
 		slotProperty(),
+		isolatedProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return jsonResult(slotResolution{Slot: tgt.Slot, Created: creating(tgt.Created)})
+		return jsonResult(openedPane{
+			slotResolution: slotResolution{Slot: tgt.Slot, Created: creating(tgt.Created)},
+			Isolated:       tgt.Isolated,
+		})
 	})
 }
 
@@ -651,7 +726,7 @@ func registerCapturePane(s *server.MCPServer, sl *slots) {
 		// terminal in order to answer a question about it, which is the one thing
 		// the hint promises cannot happen.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{NoCreate: true})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -698,7 +773,7 @@ func registerScreenshotPane(s *server.MCPServer, sl *slots) {
 		// No readOnlyHint: resolving a slot can split the user's window, adopt one
 		// of their shells and rename a pane. See capture-pane for the full reason.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{NoCreate: true})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -729,7 +804,7 @@ func registerPaneState(s *server.MCPServer, sl *slots) {
 		slotProperty(),
 		// No readOnlyHint: see capture-pane.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{NoCreate: true})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -769,7 +844,7 @@ func registerWatchPane(s *server.MCPServer, sl *slots, emitter *ChannelEmitter) 
 		slotProperty(),
 		// No readOnlyHint: see capture-pane.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{})
+		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{NoCreate: true})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -816,8 +891,8 @@ func registerClosePane(s *server.MCPServer, sl *slots) {
 		mcp.WithDescription("Close a helper pane the agent is finished with. Panes this server "+
 			"created are killed; panes it adopted from the user are interrupted (C-c) and "+
 			"released, never killed. With no arguments it closes helper slot 1; slot:\"all\" "+
-			"closes every helper pane this server opened. Closing a slot that was never opened is "+
-			"not an error."),
+			"closes every helper pane this server opened, visible and isolated alike. Closing a "+
+			"slot that was never opened is not an error."),
 		closeSlotProperty(),
 		mcp.WithDestructiveHintAnnotation(true),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -847,9 +922,9 @@ func registerListSlots(s *server.MCPServer, sl *slots) {
 	addAgenticTool(s, mcp.NewTool("list-slots",
 		mcp.WithDescription("List the helper slots this agent has open, with what is running in "+
 			"each. origin is \"created\" for a pane this server opened and \"adopted\" for one it "+
-			"took over from an idle shell of the user's. Panes belonging to other agents, and the "+
-			"user's own panes, are not listed — this is what THIS agent has, not what is on "+
-			"screen."),
+			"took over from an idle shell of the user's, and isolated tells the panes nobody can "+
+			"see from the ones beside the user. Panes belonging to other agents, and the user's "+
+			"own panes, are not listed — this is what THIS agent has, not what is on screen."),
 		// No readOnlyHint, and here the reason is not the one capture-pane gives.
 		// Reading the registry is mildly MUTATING by design: it clears a stale
 		// slot marker off this server's own pane and heals duplicate claims,

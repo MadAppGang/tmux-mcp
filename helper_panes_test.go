@@ -115,10 +115,11 @@ func TestResolveSlotIsIdempotent(t *testing.T) {
 	sl, self := slotFixture(t)
 	ctx := context.Background()
 
-	first, slot, created, owner, err := sl.resolveHelper(ctx, slotDefault)
+	tgt1, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("first resolveHelper: %v", err)
 	}
+	first, slot, created, owner := tgt1.Ref, tgt1.Slot, tgt1.Created, tgt1.Owner
 	if first == self {
 		t.Fatalf("resolveHelper returned the server's own pane %s", first)
 	}
@@ -136,10 +137,11 @@ func TestResolveSlotIsIdempotent(t *testing.T) {
 		t.Errorf("a pane this server split reported owner %q, want %q", owner, ownerAgent)
 	}
 
-	second, slot, created, owner, err := sl.resolveHelper(ctx, slotDefault)
+	tgt2, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("second resolveHelper: %v", err)
 	}
+	second, slot, created, owner := tgt2.Ref, tgt2.Slot, tgt2.Created, tgt2.Owner
 	if second != first {
 		t.Errorf("second resolveHelper returned %s, want the same pane %s", second, first)
 	}
@@ -170,18 +172,20 @@ func TestResolveSlotAfterKillCreatesAgain(t *testing.T) {
 	sl, _ := slotFixture(t)
 	ctx := context.Background()
 
-	first, _, _, _, err := sl.resolveHelper(ctx, slotDefault)
+	tgt3, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("first resolveHelper: %v", err)
 	}
+	first, _, _, _ := tgt3.Ref, tgt3.Slot, tgt3.Created, tgt3.Owner
 	if err := sl.b.Close(ctx, first); err != nil {
 		t.Fatalf("kill helper pane: %v", err)
 	}
 
-	second, _, created, _, err := sl.resolveHelper(ctx, slotDefault)
+	tgt4, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("second resolveHelper: %v", err)
 	}
+	second, _, created, _ := tgt4.Ref, tgt4.Slot, tgt4.Created, tgt4.Owner
 	if second == first {
 		t.Fatalf("resolveHelper returned the killed pane %s", second)
 	}
@@ -200,14 +204,16 @@ func TestSlotPlacement(t *testing.T) {
 	sl, self := slotFixture(t)
 	ctx := context.Background()
 
-	one, _, _, _, err := sl.resolveHelper(ctx, 1)
+	tgt5, err := sl.resolveHelper(ctx, 1, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolve slot 1: %v", err)
 	}
-	two, slot, _, _, err := sl.resolveHelper(ctx, 2)
+	one, _, _, _ := tgt5.Ref, tgt5.Slot, tgt5.Created, tgt5.Owner
+	tgt6, err := sl.resolveHelper(ctx, 2, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolve slot 2: %v", err)
 	}
+	two, slot, _, _ := tgt6.Ref, tgt6.Slot, tgt6.Created, tgt6.Owner
 	if slot != 2 {
 		t.Errorf("slot 2 resolution reported slot %d", slot)
 	}
@@ -262,20 +268,22 @@ func TestSlotTwoNeverSplitsAnAdoptedPane(t *testing.T) {
 	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
 	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	one, _, _, owner, err := sl.resolveHelper(ctx, slotDefault)
+	tgt7, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolve slot 1: %v", err)
 	}
+	one, _, _, owner := tgt7.Ref, tgt7.Slot, tgt7.Created, tgt7.Owner
 	if one != usersPane || owner != ownerAcquired {
 		t.Fatalf("the fixture did not exercise adoption: slot 1 resolved to %s (owner %q), want the "+
 			"user's pane %s adopted as %q", one.target(), owner, usersPane.target(), ownerAcquired)
 	}
 	beforeW, beforeH := paneSize(t, usersPane)
 
-	two, slot, _, _, err := sl.resolveHelper(ctx, 2)
+	tgt8, err := sl.resolveHelper(ctx, 2, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolve slot 2: %v", err)
 	}
+	two, slot, _, _ := tgt8.Ref, tgt8.Slot, tgt8.Created, tgt8.Owner
 	if slot != 2 {
 		t.Errorf("slot 2 resolution reported slot %d", slot)
 	}
@@ -315,10 +323,11 @@ func TestNumberedSlotsAreIndependent(t *testing.T) {
 
 	seen := map[paneRef]int{}
 	for _, want := range []int{1, 2, 3} {
-		pane, slot, created, _, err := sl.resolveHelper(ctx, want)
+		tgt9, err := sl.resolveHelper(ctx, want, kindUnstated)
 		if err != nil {
 			t.Fatalf("resolve slot %d: %v", want, err)
 		}
+		pane, slot, created, _ := tgt9.Ref, tgt9.Slot, tgt9.Created, tgt9.Owner
 		if slot != want {
 			t.Errorf("resolve slot %d reported slot %d", want, slot)
 		}
@@ -358,10 +367,11 @@ func TestResolveHelperNeverReturnsSelf(t *testing.T) {
 		t.Fatalf("fixture is not exercising the case: self carries no slot-1 record (found=%v rec=%+v)", found, rec)
 	}
 
-	pane, _, created, _, err := sl.resolveHelper(ctx, slotDefault)
+	tgt10, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	pane, _, created, _ := tgt10.Ref, tgt10.Slot, tgt10.Created, tgt10.Owner
 	if pane == self {
 		t.Fatalf("resolveHelper returned the server's own pane %s — the agent would type into its own session",
 			pane.target())
@@ -428,9 +438,9 @@ func TestSlotWitnessSurvivesSessionScopedLeak(t *testing.T) {
 		t.Fatalf("a session-scoped @mcp_slot produced %d registry records; the witness must reject all of them", len(reg))
 	}
 
-	rec, found, err := sl.resolveHelperNoCreate(ctx, slotDefault)
+	rec, found, err := sl.lookupSlot(ctx, slotDefault, kindUnstated)
 	if err != nil {
-		t.Fatalf("resolveHelperNoCreate: %v", err)
+		t.Fatalf("lookupSlot: %v", err)
 	}
 	if found {
 		t.Fatalf("slot 1 resolved to pane %s off a leaked option — that is one of the user's shells",
@@ -470,10 +480,11 @@ func TestAcquireIdleUnownedPane(t *testing.T) {
 	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
 	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	pane, _, created, _, err := sl.resolveHelper(ctx, slotDefault)
+	tgt11, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	pane, _, created, _ := tgt11.Ref, tgt11.Slot, tgt11.Created, tgt11.Owner
 	if pane != usersPane {
 		t.Fatalf("resolveHelper returned %s instead of adopting the idle pane %s",
 			pane.target(), usersPane.target())
@@ -613,10 +624,11 @@ func TestAcquireRejectsPaneRunningCat(t *testing.T) {
 		t.Error("canAcquire accepted a pane running cat; the shell is not the foreground process")
 	}
 
-	pane, _, _, _, err := sl.resolveHelper(ctx, slotDefault)
+	tgt12, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	pane, _, _, _ := tgt12.Ref, tgt12.Slot, tgt12.Created, tgt12.Owner
 	if pane == busy {
 		t.Fatalf("resolveHelper adopted the busy pane %s", pane.target())
 	}
@@ -680,10 +692,11 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 		}
 	}
 
-	winner, _, _, _, err := sl.resolveHelper(ctx, slotDefault)
+	tgt13, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	winner, _, _, _ := tgt13.Ref, tgt13.Slot, tgt13.Created, tgt13.Owner
 	if winner != first {
 		t.Fatalf("resolveHelper kept %s, want the oldest pane %s", winner.target(), first.target())
 	}
@@ -915,10 +928,10 @@ func (a *audit) inspect(name string, file *ast.File) {
 // prevent elsewhere.
 func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 	permitted := map[string]string{
-		"resolveHelperLocked":   "resolution starts from the pane it must not return",
-		"resolveHelperNoCreate": "the same, for the lookup close-pane performs",
-		"closePanes":            "teardown, which must not close the pane the request arrived through",
-		"listSlots":             "the registry read is scoped to the window this server's pane is in",
+		"resolveHelperLocked": "resolution starts from the pane it must not return",
+		"lookupSlot":          "the same, for the lookup close-pane and the reading tools perform",
+		"closePanes":          "teardown, which must not close the pane the request arrived through",
+		"listSlots":           "the registry read is scoped to the window this server's pane is in",
 	}
 
 	permittedExecImporters := map[string]string{
@@ -1124,7 +1137,8 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 			go func(slot int) {
 				defer wg.Done()
 				<-release // so they arrive together rather than in start order
-				pane, got, created, _, err := sl.resolveHelper(ctx, slot)
+				tgt14, err := sl.resolveHelper(ctx, slot, kindUnstated)
+				pane, got, created, _ := tgt14.Ref, tgt14.Slot, tgt14.Created, tgt14.Owner
 				first <- resolution{asked: slot, got: got, pane: pane, created: created, err: err}
 			}(slot)
 		}
@@ -1214,7 +1228,8 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 			go func(slot int) {
 				defer wg2.Done()
 				<-release2
-				pane, got, created, _, err := sl.resolveHelper(ctx, slot)
+				tgt15, err := sl.resolveHelper(ctx, slot, kindUnstated)
+				pane, got, created, _ := tgt15.Ref, tgt15.Slot, tgt15.Created, tgt15.Owner
 				second <- resolution{asked: slot, got: got, pane: pane, created: created, err: err}
 			}(slot)
 		}

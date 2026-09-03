@@ -184,8 +184,10 @@ func TestNoResponseCarriesAnId(t *testing.T) {
 			Slot: 2, Created: creating(false), Event: "exit", Detail: realFailure,
 			Output: "...", PaneState: &PaneState{PanePID: 7},
 		},
-		"closedPane":  closedPane{Slot: 1, Action: actionError, Detail: realFailure},
-		"slotListing": slotListing{Slot: 1, Origin: originAdopted, ForegroundCmd: "zsh", IsAlive: true},
+		"closedPane":    closedPane{Slot: 1, Action: actionError, Detail: realFailure},
+		"slotListing":   slotListing{Slot: 2, Isolated: true, Origin: originCreated, ForegroundCmd: "python3", IsAlive: true},
+		"openedPane":    openedPane{slotResolution: slotResolution{Slot: 2, Created: creating(true)}, Isolated: true},
+		"oneShotResult": oneShotResult{Output: "x", ExitCode: 0, TimedOut: false},
 	} {
 		data, err := json.Marshal(response)
 		if err != nil {
@@ -549,22 +551,72 @@ func TestChannelEventNamesTheSlot(t *testing.T) {
 	}
 }
 
-// ---- The isolated socket is not touched by any of this ----
+// ---- The isolated socket is reached only when it is asked for ----
 
-// TestNoToolReachesTheIsolatedSocket is the negative space around the surface:
-// with no isolated slots in this release, nothing a tool does may start a server
-// on that socket. It is cheap, and it is the probe the isolated-slot commit
-// extends rather than invents.
-func TestNoToolReachesTheIsolatedSocket(t *testing.T) {
+// TestVisibleCallsNeverReachTheIsolatedSocket is the negative space around the
+// isolated half: a call that names no kind, on a server with no isolated slots,
+// must leave that socket alone.
+//
+// It matters more now than when nothing could reach that socket at all. The
+// resolver consults the isolated registry on the way past — that is how an
+// omitted kind finds an invisible slot — and CONSULTING must never be
+// CREATING. A read that started the isolated server would put a second tmux
+// server on every developer's machine for the lifetime of every agent session
+// that ever ran one command.
+func TestVisibleCallsNeverReachTheIsolatedSocket(t *testing.T) {
 	c, _ := agentPaneFixture(t)
 	_ = exec.Command("tmux", "-L", headlessSocket, "kill-server").Run()
 
 	c.callToolJSON(t, "execute-command", map[string]any{"command": "echo visible-only"},
 		&map[string]any{})
+	c.callToolJSON(t, "list-slots", map[string]any{}, &[]map[string]any{})
 
 	out, err := exec.Command("tmux", append(socketArgs(headlessSocket), "list-sessions")...).Output()
 	if err == nil && strings.TrimSpace(string(out)) != "" {
-		t.Errorf("a tool started a session on the isolated socket:\n%s", out)
+		t.Errorf("a call that asked for nothing invisible started a session on the isolated "+
+			"socket:\n%s", out)
+	}
+}
+
+// ---- isolated is on the creating tools and nowhere else ----
+
+// TestIsolatedIsDeclaredOnCreatingToolsOnly reads the property off tools/list,
+// because tools/list is what teaches the model which arguments exist.
+//
+// A reading tool that advertised isolated would be advertising a read that
+// creates. A creating tool that did not advertise it would leave the invisible
+// half of the contract undiscoverable — the model would have to be told about it
+// out of band, which is the situation the whole surface exists to remove.
+func TestIsolatedIsDeclaredOnCreatingToolsOnly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires tmux")
+	}
+	creating := []string{
+		"send-keys", "run-in-repl", "execute-command",
+		"start-and-watch", "write-to-display", "open-pane",
+	}
+
+	c := newMCPClient(t)
+	for name, schema := range toolSchemas(t, c) {
+		props, _ := schema["properties"].(map[string]any)
+		_, declared := props["isolated"]
+		want := containsString(creating, name)
+		if declared != want {
+			t.Errorf("%s declares isolated=%v, want %v (the six tools that can open a pane declare "+
+				"it; the four reading tools and the two registry tools do not)", name, declared, want)
+		}
+	}
+
+	// The rejection is the other half, and it is what stops "not in the schema"
+	// from meaning "silently ignored". A reading tool handed isolated:true would
+	// otherwise answer about a visible pane and report success.
+	res := callTool(t, c, "capture-pane", map[string]any{"slot": 1, "isolated": true})
+	if !res.IsError {
+		t.Fatalf("capture-pane accepted isolated: a caller that asked for an invisible pane and "+
+			"was answered about a visible one has been told its request succeeded: %v", res)
+	}
+	if got := res.text(t, "capture-pane"); got != isolatedNotAcceptedText {
+		t.Errorf("capture-pane refused isolated with %q, want exactly %q", got, isolatedNotAcceptedText)
 	}
 }
 

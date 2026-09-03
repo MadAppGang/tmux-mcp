@@ -72,11 +72,13 @@ func main() {
 		log.Fatalf("unknown backend %q: this build implements %q", *backendName, backendTmux)
 	}
 
-	// Clean up any stale headless socket from a previous crash.
-	CleanStaleHeadlessSocket()
-
 	// The policy layer holds the port and nothing else, so no handler can reach
 	// a tmux command even by accident.
+	//
+	// Constructing the backend also fixes this server's isolated namespace and
+	// reclaims the namespaces of servers that are gone — see
+	// reapOrphanedNamespaces. That replaces the stale-socket cleanup this line
+	// used to perform, which ran kill-server on a socket other servers share.
 	sl := newSlots(newTmuxBackend(newTmuxClient(*shellType)))
 
 	// Resource capabilities are NOT advertised: this server registers no

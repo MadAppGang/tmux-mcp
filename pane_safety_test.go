@@ -170,34 +170,73 @@ func TestDropEcho(t *testing.T) {
 	}
 }
 
-// TestCreateWindowMarksItsPane closes the last gap in the ownership invariant:
-// every pane the server creates must be marked, or it can never be reused.
-// SplitPane and createSessionOnSocket did this; CreateWindow did not.
-func TestCreateWindowMarksItsPane(t *testing.T) {
+// TestEveryPaneWeMakeIsAttributable is the ownership invariant at both of the
+// two places this server can now produce a pane, which is the whole of it: a
+// visible split, and an isolated session.
+//
+// It replaces a test that pinned create-window, a path that no longer exists —
+// the tool went with the primitives surface and the client method went with it.
+// The invariant did not go anywhere, and neither did the reason: a pane we made
+// that carries no attribution can never be reused, never be listed, and never be
+// closed by the tool whose job that is.
+//
+// The two halves are attributed by DIFFERENT mechanisms, which is why both are
+// asserted here rather than either standing for the other. A split is attributed
+// by pane options written after the fact, so the assertion is that the marks are
+// there. An isolated pane is attributed by the NAME of the session it is created
+// in, atomically with its creation, and carries no marks at all until Claim
+// writes them — so asserting marks on it would be asserting the wrong thing.
+func TestEveryPaneWeMakeIsAttributable(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
 	client := newTmuxClient("bash")
+	backend := newTmuxBackend(client)
 	ctx := context.Background()
 
 	name := uniqueSession(t)
-	sess, err := client.CreateSession(ctx, name)
-	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
+	tmuxExec(t, "new-session", "-d", "-x", "200", "-y", "50", "-s", name)
 	defer exec.Command("tmux", "kill-session", "-t", name).Run() //nolint:errcheck
+	anchor := tmuxExec(t, "display-message", "-p", "-t", name, "#{pane_id}")
 
-	win, err := client.CreateWindow(ctx, sess.SessionID, "work")
+	split, err := client.SplitPane(ctx, anchor, "vertical", 50)
 	if err != nil {
-		t.Fatalf("create window: %v", err)
+		t.Fatalf("split pane: %v", err)
 	}
-
-	owned, err := client.ownedPanesInWindow(ctx, win.WindowID)
+	owned, err := client.ownedPanesInWindow(ctx, anchor)
 	if err != nil {
 		t.Fatalf("ownedPanesInWindow: %v", err)
 	}
-	if !owned[win.PaneID] {
-		t.Errorf("pane %s came from create-window, so it is ours, but it is not marked owned", win.PaneID)
+	if !owned[split.PaneID] {
+		t.Errorf("a pane this server split is not marked owned, so nothing can ever reuse, list "+
+			"or close it: %v", owned)
+	}
+
+	pane, err := backend.OpenIsolated(ctx)
+	if err != nil {
+		t.Fatalf("open an isolated pane: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close(context.Background(), pane) })
+
+	panes, err := backend.IsolatedPanes(ctx)
+	if err != nil {
+		t.Fatalf("list this namespace's panes: %v", err)
+	}
+	if !slices.Contains(panes, pane) {
+		t.Errorf("an isolated pane this server opened is not in its own namespace, so the sweep "+
+			"that reclaims unclaimed panes would never find it: %v", panes)
+	}
+
+	// And it carries no marks yet, which is the half that is easy to "fix" into
+	// a second mark writer. Attribution here is the session name; Claim is the
+	// one thing that writes an option, and it has not run.
+	records, err := backend.IsolatedRecords(ctx)
+	if err != nil {
+		t.Fatalf("read this namespace's registry: %v", err)
+	}
+	if _, claimed := records[pane]; claimed {
+		t.Error("a freshly opened isolated pane already carries registry marks: something other " +
+			"than Claim is writing them, which is what makes the write order unanalysable")
 	}
 }
 
@@ -533,11 +572,11 @@ func TestOwnershipSurvivesSessionScopedOptionLeak(t *testing.T) {
 // being isolated, and a sweep that iterates and closes every pane it finds there
 // starts closing the user's real work.
 //
-// It drives the client rather than a tool: create-headless, list-sessions and
-// kill-headless-server are all deleted by this release, and the invariant is
-// about the socket rather than about any tool. The isolated-slot commit puts a
-// tool surface back over this same socket.
-func TestHeadlessServerIgnoresUserConfig(t *testing.T) {
+// It drives the backend rather than a tool, because the invariant is about the
+// SOCKET and not about any one tool: every isolated slot on the surface reaches
+// this socket through OpenIsolated, so proving it here proves it for all of
+// them.
+func TestIsolatedServerIgnoresUserConfig(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
@@ -552,17 +591,20 @@ func TestHeadlessServerIgnoresUserConfig(t *testing.T) {
 
 	// The isolated server may already be up from an earlier test, in which case
 	// it would not re-read any config. Tear it down so this test observes a real
-	// server start.
+	// server start. This is the ONE place that kills that server, and it is a
+	// test on an isolated TMUX_TMPDIR: the product never does it, because the
+	// socket is shared and the window in which "is it up?" fails is exactly the
+	// window in which a neighbour is starting one.
 	_ = exec.Command("tmux", "-L", headlessSocket, "kill-server").Run()
 
 	// tmux resolves ~ from $HOME.
 	t.Setenv("HOME", home)
 
-	client := newTmuxClient("bash")
+	backend := newTmuxBackend(newTmuxClient("bash"))
 	ctx := context.Background()
-	created, err := client.CreateHeadlessSession(ctx, "", "")
+	pane, err := backend.OpenIsolated(ctx)
 	if err != nil {
-		t.Fatalf("create isolated session: %v", err)
+		t.Fatalf("open an isolated pane: %v", err)
 	}
 	t.Cleanup(func() { _ = exec.Command("tmux", "-L", headlessSocket, "kill-server").Run() })
 
@@ -579,8 +621,13 @@ func TestHeadlessServerIgnoresUserConfig(t *testing.T) {
 		}
 	}
 	if len(names) != 1 {
-		t.Fatalf("the isolated server should hold exactly the 1 session we created (%s), got %d: %v",
-			created.SessionName, len(names), names)
+		t.Fatalf("the isolated server should hold exactly the 1 session opening %v created, got %d: %v",
+			pane, len(names), names)
+	}
+	if !strings.HasPrefix(names[0], backend.namespacePrefix()) {
+		t.Errorf("the session is named %q, which does not carry this server's namespace %q — "+
+			"attribution is the session name, so a pane in a session we cannot recognise is a "+
+			"pane no sweep will ever reclaim", names[0], backend.namespacePrefix())
 	}
 }
 
@@ -611,38 +658,34 @@ func TestSplitDoesNotStealFocus(t *testing.T) {
 // readiness patterns that expect their match on a single line — a failure that
 // looks like the pattern being wrong rather than the pane being narrow.
 //
-// It drives the client rather than a tool: the tools that created a session by
-// name are deleted, and the sizing rule belongs to createSessionOnSocket, which
-// the isolated-slot commit builds on.
+// Every detached session this server creates is now an ISOLATED one — that is
+// the only path left that creates a session at all — so the test drives
+// OpenIsolated. The sizing rule and the failure it prevents are unchanged; only
+// the caller is.
 func TestDetachedSessionIsNotEightyColumns(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	client := newTmuxClient("bash")
+	backend := newTmuxBackend(newTmuxClient("bash"))
 	ctx := context.Background()
 
-	name := uniqueSession(t)
-	sess, err := client.CreateSession(ctx, name)
+	pane, err := backend.OpenIsolated(ctx)
 	if err != nil {
-		t.Fatalf("create session: %v", err)
+		t.Fatalf("open an isolated pane: %v", err)
 	}
-	defer exec.Command("tmux", "kill-session", "-t", name).Run() //nolint:errcheck
+	t.Cleanup(func() { _ = backend.Close(context.Background(), pane) })
 
-	panes, err := client.ListPanes(ctx, sess.WindowID)
+	cols, rows, err := backend.c.GetPaneDimensions(ctx, pane.target())
 	if err != nil {
-		t.Fatalf("list panes: %v", err)
+		t.Fatalf("read the pane's dimensions: %v", err)
 	}
-	if len(panes) != 1 {
-		t.Fatalf("expected 1 pane, got %d", len(panes))
-	}
-
-	if panes[0].Width != detachedWidth {
+	if cols != detachedWidth {
 		t.Errorf("detached pane is %d columns wide, want %d (80 wraps long output lines)",
-			panes[0].Width, detachedWidth)
+			cols, detachedWidth)
 	}
-	if panes[0].Height != detachedHeight {
+	if rows != detachedHeight {
 		t.Errorf("detached pane is %d rows tall, want %d (24 gives almost no scrollback to read)",
-			panes[0].Height, detachedHeight)
+			rows, detachedHeight)
 	}
 }
 

@@ -119,6 +119,14 @@ func isolateTmux() (func(), error) {
 
 	cleanup := func() {
 		_ = exec.Command("tmux", "kill-session", "-t", keepalive).Run()
+		// The isolated server is a SECOND tmux server, on its own socket under
+		// the same TMUX_TMPDIR, and nothing in the product ever kills a server —
+		// panes go, and tmux exits when the last one does. A suite that leaves
+		// isolated panes behind would therefore leave a live tmux process
+		// pointing at a socket in the directory removed on the next line. This is
+		// safe precisely because TMUX_TMPDIR still points at the private
+		// directory: it can reach no server but ours.
+		_ = exec.Command("tmux", append(socketArgs(headlessSocket), "kill-server")...).Run()
 		os.RemoveAll(tmuxTmp)
 		os.RemoveAll(zdotDir)
 	}

@@ -11,19 +11,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// The four types below carry NO json tags, and their absence is the point.
+// The two types below carry NO json tags, and their absence is the point.
 //
-// Every one of them used to be a tool response — list-panes answered with Pane,
-// create-session with CreatedSession, split-pane with CreatedPane — which is why
-// three of them carried a `json:"paneId"` field. Those tools are gone, and
-// nothing in this package marshals these types any more: they are the adapter's
-// own vocabulary for what tmux just told it, and they reach policy only as
-// paneRef and paneInfo.
+// Both of them used to be a tool response — list-panes answered with Pane,
+// split-pane with CreatedPane — which is why they carried a `json:"paneId"`
+// field. Those tools are gone, and nothing in this package marshals these types
+// any more: they are the adapter's own vocabulary for what tmux just told it,
+// and they reach policy only as paneRef and paneInfo.
 //
 // Leaving the tags would leave a response shape lying around with a pane id
 // already named in it, one `jsonResult(...)` away from being on the wire again.
@@ -41,21 +41,6 @@ type Pane struct {
 	CurrentPath    string
 }
 
-// CreatedSession holds the IDs tmux returns when a new session is created.
-type CreatedSession struct {
-	SessionID   string
-	SessionName string
-	WindowID    string
-	PaneID      string
-}
-
-// CreatedWindow holds the IDs tmux returns when a new window is created.
-type CreatedWindow struct {
-	WindowID   string
-	WindowName string
-	PaneID     string
-}
-
 // CreatedPane holds the IDs tmux returns when a new pane is created.
 //
 // Reused, Slot and Created went with the tags: they existed to shape split-pane's
@@ -71,35 +56,28 @@ type CreatedPane struct {
 // has — instead of the adapter naming the pane.
 var errPaneGone = errors.New("the pane is gone")
 
-// headlessSocket is the tmux socket name used for isolated headless sessions.
+// headlessSocket is the tmux socket every isolated pane lives on: a second tmux
+// server, with no client attached and no window anyone can see.
+//
+// It is SHARED between the several tmux-mcp servers a machine may be running,
+// which is what makes the namespace in a session name (see namespacePrefix) load
+// bearing rather than decorative. Nothing here may ever run kill-server on it:
+// the window in which "is the server up?" fails is exactly the window in which a
+// neighbour is starting one, and killing it takes that neighbour's panes with it.
 const headlessSocket = "mcp-headless"
 
-// Size given to sessions we create detached. tmux would otherwise use
-// default-size (80x24), which wraps long output lines. See createSessionOnSocket.
+// Size given to isolated sessions, which are created detached. tmux would
+// otherwise use default-size (80x24), and at 80 columns a dev server's output
+// wraps mid-line — which silently breaks readiness regexes that expect their
+// match on one line, and looks like the pattern being wrong rather than the pane
+// being narrow. Measured; keep it. See openIsolatedSession.
 const (
 	detachedWidth  = 200
 	detachedHeight = 50
 )
 
-// CleanStaleHeadlessSocket checks if the headless tmux socket exists but the
-// server behind it is dead (e.g. after a crash). If so, it runs kill-server to
-// clean up the stale socket so a fresh server can be started.
-func CleanStaleHeadlessSocket() {
-	// Try to list sessions on the headless socket. If the server is alive this
-	// succeeds (or returns "no sessions"). If the socket is stale, tmux returns
-	// an error like "no server running on ...".
-	//
-	// Both commands go through socketArgs because either can be the one that
-	// starts the server, and a server started without -f /dev/null would load
-	// the user's config. See socketArgs.
-	cmd := exec.Command("tmux", append(socketArgs(headlessSocket), "list-sessions")...)
-	if err := cmd.Run(); err != nil {
-		// Server is not running — kill-server will clean up any stale socket file.
-		_ = exec.Command("tmux", append(socketArgs(headlessSocket), "kill-server")...).Run()
-	}
-}
-
-// headlessPrefix is the ID prefix that identifies headless targets.
+// headlessPrefix is the ID prefix that identifies isolated targets, so that one
+// paneRef can address either server and parseTarget routes it.
 const headlessPrefix = "headless:"
 
 // Pane options we set on every pane we create. They are read back to decide
@@ -140,6 +118,28 @@ const (
 	ownerAgent     = "agent"
 	ownerAcquired  = "acquired" // the user opened the pane; we adopted it
 )
+
+// markOrder is the write order, expressed as DATA rather than as statement
+// order, so "does the slot marker still go last?" is a question a test can ask
+// instead of a property a reviewer has to notice. TestMarkWriteOrder asserts the
+// whole slice — not its ends, which would pass with the middle two swapped — and
+// asserts that the single set-option in each walker is driven by this slice.
+//
+// tmux cannot set several options atomically, so every PREFIX of this sequence
+// is a state a crashed or cancelled process can leave behind, and the order is
+// chosen so that every prefix is inert. Resolution requires all three, so
+// witness-only and witness+owner can never steer a later call towards a
+// half-claimed pane. The reverse order would publish a slot marker on a pane of
+// unknown ownership, and the teardown rule keys off exactly that owner value to
+// decide whether a pane may be killed or must merely be released: a slotted pane
+// nobody can attribute is the one record this server must never produce.
+//
+// There are exactly THREE marks. The isolated namespace is deliberately not a
+// fourth: it is the NAME of the session an isolated pane lives in, so no path
+// that claims a pane in the user's window can write one — see namespacePrefix,
+// where the alternative (a fourth pane option, stamped by the same single
+// walker) would have landed a namespace on adopted USER panes.
+var markOrder = []string{paneOptWitness, paneOptOwner, paneOptSlot}
 
 // tmuxClient wraps tmux CLI interactions.
 type tmuxClient struct {
@@ -354,75 +354,6 @@ func (t *tmuxClient) CapturePane(ctx context.Context, paneID string, lines int, 
 	return t.runWithSocket(ctx, socket, args...)
 }
 
-// CreateSession creates a new detached tmux session.
-// Returns a CreatedSession with the session, window, and pane IDs.
-func (t *tmuxClient) CreateSession(ctx context.Context, name string) (*CreatedSession, error) {
-	return t.createSessionOnSocket(ctx, "", name, "")
-}
-
-// CreateHeadlessSession creates a new detached session on the headless tmux
-// server. The returned IDs are prefixed with "headless:" so all subsequent
-// tool calls are routed to the correct socket automatically.
-func (t *tmuxClient) CreateHeadlessSession(ctx context.Context, name, command string) (*CreatedSession, error) {
-	sess, err := t.createSessionOnSocket(ctx, headlessSocket, name, command)
-	if err != nil {
-		return nil, err
-	}
-	sess.SessionID = headlessPrefix + sess.SessionID
-	sess.WindowID = headlessPrefix + sess.WindowID
-	sess.PaneID = headlessPrefix + sess.PaneID
-	return sess, nil
-}
-
-// createSessionOnSocket is the shared implementation for session creation.
-// socket selects the tmux server; empty means the default server.
-// command, if non-empty, is passed to the shell as the initial command.
-// If a session with the given name already exists, it returns the existing
-// session's IDs instead of erroring (idempotent create).
-func (t *tmuxClient) createSessionOnSocket(ctx context.Context, socket, name, command string) (*CreatedSession, error) {
-	// If a name was given, check if a session with that name already exists.
-	if name != "" {
-		if existing, err := t.findSessionByName(ctx, socket, name); err == nil {
-			return existing, nil
-		}
-	}
-
-	// A detached session has no client to take its size from, so tmux falls back
-	// to default-size (80x24). At 80 columns a dev server's output wraps, which
-	// silently breaks readiness regexes that expect a match on one line. Ask for
-	// a size that behaves like a real terminal instead.
-	args := []string{
-		"new-session", "-d",
-		"-x", strconv.Itoa(detachedWidth),
-		"-y", strconv.Itoa(detachedHeight),
-		"-P", "-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{pane_id}",
-	}
-	if name != "" {
-		args = append(args, "-s", name)
-	}
-	if command != "" {
-		args = append(args, command)
-	}
-	out, err := t.runWithSocket(ctx, socket, args...)
-	if err != nil {
-		return nil, err
-	}
-	parts := strings.Split(out, "\t")
-	if len(parts) != 4 {
-		return nil, fmt.Errorf("unexpected tmux output: %q", out)
-	}
-	created := &CreatedSession{
-		SessionID:   parts[0],
-		SessionName: parts[1],
-		WindowID:    parts[2],
-		PaneID:      parts[3],
-	}
-	// We made this pane, so claim it. Failure is not fatal: the pane works, it
-	// just won't be a reuse candidate later.
-	_ = t.markPaneOwned(ctx, socket, created.PaneID)
-	return created, nil
-}
-
 // markPaneOwned records that we created a pane, so that reuse and teardown can
 // tell our panes from the user's. tmux itself stores no creator.
 //
@@ -438,21 +369,21 @@ func (t *tmuxClient) markPaneOwned(ctx context.Context, socket, paneID string) e
 }
 
 // markPaneOwnedAs records a pane in the registry under a given owner and slot.
+// It is the ONE walker of markOrder, and the port calls it Claim.
 //
-// The write order is witness → owner → slot, and it is not arbitrary. tmux gives
-// no way to set several options atomically, so any *prefix* of this sequence is
-// a state a crashed or cancelled process can leave behind, and the order is
-// chosen so that every prefix is inert. Witness-only, and witness+owner, are
-// both rejected by slot resolution — which requires all three — so neither can
-// steer a later call towards a pane that is only half claimed. The reverse order
-// would publish a slot marker on a pane with no recorded owner, and the teardown
-// rule keys off exactly that owner value to decide whether a pane may be killed
-// or must merely be released: a slotted pane of unknown ownership is the one
-// record we must never produce.
+// The order is not restated here: it is markOrder, as data, with the whole
+// argument for it written on the variable. What matters at this call site is
+// that the loop is the only way an option gets written, so a future edit that
+// adds a fourth mark has to add it to the slice — where the prefix argument is —
+// rather than as a fourth statement nobody re-derives the safety of.
+//
+// It returns on the FIRST failure, so a cancelled context or one transient tmux
+// error leaves a prefix of markOrder on the pane. Callers that claim a pane the
+// user owns must undo that prefix; see adoptCandidateLocked.
 //
 // slot <= 0 writes no slot marker at all rather than clearing one. A pane being
-// claimed for the first time has nothing to clear, and adding an unconditional
-// unset would put a third tmux call on every pane creation for no gain;
+// claimed for the first time has nothing to clear, and an unconditional unset
+// would put a third tmux call on every pane creation for no gain;
 // setPaneSlot(id, 0) is the explicit way to remove a marker from a pane that has
 // one.
 //
@@ -465,20 +396,25 @@ func (t *tmuxClient) markPaneOwned(ctx context.Context, socket, paneID string) e
 // permanently invisible to the registry), which is why it is restated on all
 // five functions rather than assumed.
 func (t *tmuxClient) markPaneOwnedAs(ctx context.Context, socket, paneID, owner string, slot int) error {
-	if _, err := t.runWithSocket(ctx, socket,
-		"set-option", "-p", "-t", paneID, paneOptWitness, paneID); err != nil {
-		return err
+	for _, opt := range markOrder {
+		var value string
+		switch opt {
+		case paneOptWitness:
+			value = paneID
+		case paneOptOwner:
+			value = owner
+		case paneOptSlot:
+			if slot <= 0 {
+				continue
+			}
+			value = strconv.Itoa(slot)
+		}
+		if _, err := t.runWithSocket(ctx, socket,
+			"set-option", "-p", "-t", paneID, opt, value); err != nil {
+			return err
+		}
 	}
-	if _, err := t.runWithSocket(ctx, socket,
-		"set-option", "-p", "-t", paneID, paneOptOwner, owner); err != nil {
-		return err
-	}
-	if slot <= 0 {
-		return nil
-	}
-	_, err := t.runWithSocket(ctx, socket,
-		"set-option", "-p", "-t", paneID, paneOptSlot, strconv.Itoa(slot))
-	return err
+	return nil
 }
 
 // setPaneSlot sets or (slot <= 0) unsets the slot marker on an already-owned
@@ -504,11 +440,15 @@ func (t *tmuxClient) setPaneSlot(ctx context.Context, paneID string, slot int) e
 	return err
 }
 
-// clearPaneRegistration removes all three markers, in the reverse of the write
-// order — slot, then owner, then witness — for the same reason markPaneOwnedAs
-// writes them forwards: every prefix of the teardown leaves the pane less
-// claimed than before, never more. Stopping halfway can only ever produce a pane
-// we have given up on, never one we still steer.
+// clearPaneRegistration removes every marker, walking markOrder in REVERSE for
+// the same reason markPaneOwnedAs walks it forwards: every prefix of the
+// teardown leaves the pane less claimed than before, never more. Stopping
+// halfway can only ever produce a pane we have given up on, never one we still
+// steer.
+//
+// Deriving the order from the same slice rather than restating it is what makes
+// that guarantee survive a fourth mark: reversing a hand-written list is a step
+// a future edit can forget, and the forgetting looks like nothing.
 //
 // It is used when releasing an acquired pane. Clearing all three, rather than
 // only the slot, is the truthful state: we no longer own the pane. Leaving
@@ -520,9 +460,9 @@ func (t *tmuxClient) setPaneSlot(ctx context.Context, paneID string, slot int) e
 // paneID is the prefixed ID as responses report it; parseTarget routes it.
 func (t *tmuxClient) clearPaneRegistration(ctx context.Context, paneID string) error {
 	socket, bareID := parseTarget(paneID)
-	for _, opt := range []string{paneOptSlot, paneOptOwner, paneOptWitness} {
+	for i := len(markOrder) - 1; i >= 0; i-- {
 		if _, err := t.runWithSocket(ctx, socket,
-			"set-option", "-p", "-u", "-t", bareID, opt); err != nil {
+			"set-option", "-p", "-u", "-t", bareID, markOrder[i]); err != nil {
 			return err
 		}
 	}
@@ -544,65 +484,6 @@ func (t *tmuxClient) setPaneTitle(ctx context.Context, paneID, title string) err
 	socket, bareID := parseTarget(paneID)
 	_, err := t.runWithSocket(ctx, socket, "select-pane", "-t", bareID, "-T", title)
 	return err
-}
-
-// findSessionByName looks up a session by name on the given socket.
-// Returns the session's IDs if found.
-func (t *tmuxClient) findSessionByName(ctx context.Context, socket, name string) (*CreatedSession, error) {
-	out, err := t.runWithSocket(ctx, socket, "list-sessions",
-		"-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{pane_id}",
-		"-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
-	if err != nil {
-		return nil, err
-	}
-	if out == "" {
-		return nil, fmt.Errorf("session not found: %s", name)
-	}
-	// Take the first matching line.
-	line := strings.Split(out, "\n")[0]
-	parts := strings.Split(line, "\t")
-	if len(parts) != 4 {
-		return nil, fmt.Errorf("unexpected tmux output: %q", line)
-	}
-	return &CreatedSession{
-		SessionID:   parts[0],
-		SessionName: parts[1],
-		WindowID:    parts[2],
-		PaneID:      parts[3],
-	}, nil
-}
-
-// CreateWindow creates a new window in the given session.
-// Returns a CreatedWindow with the window and pane IDs.
-func (t *tmuxClient) CreateWindow(ctx context.Context, sessionID, name string) (*CreatedWindow, error) {
-	socket, bareID := parseTarget(sessionID)
-	args := []string{"new-window", "-t", bareID, "-P", "-F", "#{window_id}\t#{window_name}\t#{pane_id}"}
-	if name != "" {
-		args = append(args, "-n", name)
-	}
-	out, err := t.runWithSocket(ctx, socket, args...)
-	if err != nil {
-		return nil, err
-	}
-	parts := strings.Split(out, "\t")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("unexpected tmux output: %q", out)
-	}
-	// A new window comes with a pane, and we made it — claim it, exactly as
-	// SplitPane and createSessionOnSocket do. Without this the pane is
-	// indistinguishable from one of the user's, so it could never be reused.
-	// markPaneOwned wants the bare ID, so call it before prefixing.
-	_ = t.markPaneOwned(ctx, socket, parts[2])
-
-	prefix := ""
-	if socket != "" {
-		prefix = headlessPrefix
-	}
-	return &CreatedWindow{
-		WindowID:   prefix + parts[0],
-		WindowName: parts[1],
-		PaneID:     prefix + parts[2],
-	}, nil
 }
 
 // SplitPane splits the given pane. direction is "horizontal" or "vertical".
@@ -1020,6 +901,236 @@ func (t *tmuxClient) paneOwnerMark(ctx context.Context, paneID string) (string, 
 	return strings.TrimSpace(out), nil
 }
 
+// ---- The isolated namespace ----
+
+// Isolated panes are namespaced by the NAME of the session they live in, not by
+// a pane option, and that is what makes the namespace isolated-only by
+// construction rather than by convention.
+//
+// Three things follow, and each was a defect in the design this replaces:
+//
+//  1. There is no fourth mark, so markOrder is exactly what it has always been —
+//     witness, owner, slot — with one walker. No path that claims a pane in the
+//     USER'S window can write a namespace, because there is no namespace to
+//     write. The earlier design made it a fourth pane option stamped by that
+//     same single walker, which would have landed a namespace on every pane the
+//     adopter touched, including the user's own shells.
+//  2. Attribution is ATOMIC with creation. The session name is set by the same
+//     new-session command that makes the pane, so there is no window in which a
+//     live isolated pane exists that nobody can attribute. A pane option cannot
+//     achieve that: it is always a second command, and a process that dies
+//     between the two leaves a shell no tool can see or reach.
+//  3. A session name cannot leak down the option scope chain. The witness exists
+//     because pane options inherit when interpolated in a pane-context format,
+//     so one set-option that forgets -p makes every pane in a session look
+//     owned. A session has exactly one name and a pane belongs to exactly one
+//     session, so "panes whose session name carries our prefix" is structurally
+//     one-to-one and needs no witness to be trustworthy.
+//
+// The witness still guards the OWNER and SLOT marks on those panes, exactly as
+// it does in the user's window, because those marks are still pane options.
+func (b *tmuxBackend) namespacePrefix() string { return "mcp-" + b.nsKey + "-" }
+
+// newNamespaceKey identifies this server among the several that share the
+// isolated socket. It is "<pid>-<nonce>", fixed at construction.
+//
+// It does NOT read $TMUX_PANE, which is the obvious alternative. Two reasons,
+// and the second is the one that decides it. A pane id does not identify a tmux
+// server, so the same %N is reissued by a restarted or a different server and
+// the key collides anyway — it is not a better key. And reading TMUX_PANE here
+// would add a second reader of "which pane am I", which is exactly the closed
+// set Invariant S exists to keep closed; a namespace generator is a poor reason
+// to widen it. TestOnlyPolicyCodeKnowsOurOwnPane is what keeps that set closed.
+//
+// The nonce is what makes inheritance impossible. A pid alone is reusable: a
+// server that restarts can be handed a dead server's pid, inherit its slots, and
+// then close-pane("all") kills panes it never created while a send-keys to
+// slot 1 types into another session's REPL. Orphaning — old panes nobody
+// reclaims — is a resource leak; inheritance is a wrong-pane write. The nonce
+// trades the second for the first, which is the safe direction, and it keeps the
+// pid in the name so reapOrphanedNamespaces can ask whether that process is
+// still alive.
+func newNamespaceKey() string {
+	return fmt.Sprintf("%d-%s", os.Getpid(), strings.SplitN(uuid.New().String(), "-", 2)[0])
+}
+
+// namespaceReapTimeout bounds the startup sweep. It is short because the sweep
+// runs before the server answers its first request and must never be the reason
+// a session takes visibly long to start; an orphan that survives one start is
+// reaped by the next.
+const namespaceReapTimeout = 3 * time.Second
+
+// reapOrphanedNamespaces closes isolated namespaces whose server process is
+// gone. It runs once, at construction.
+//
+// An isolated namespace outlives the server that made it: a crashed or killed
+// server leaves live shells in a named session that nothing reclaims until the
+// machine reboots. Nobody can see them — there is no window — and no tool can
+// reach them, because the nonce in the name means no later server inherits the
+// namespace.
+//
+// It fails safe in the only direction that matters. A live server's pid is by
+// definition running, so a live namespace is never reaped. The residual risk is
+// pid REUSE by an unrelated process, which can only make the reaper DECLINE and
+// leave the orphan — the same outcome as not reaping at all.
+//
+// This is what CleanStaleHeadlessSocket used to do, minus the kill-server that
+// made it dangerous: that ran list-sessions on the shared socket and, if it
+// failed, killed the server — and the window in which list-sessions fails is
+// exactly the window in which a neighbour is starting one. Under a design whose
+// premise is several servers sharing this socket, that is the routine case.
+// Nothing in this file runs kill-server.
+func (b *tmuxBackend) reapOrphanedNamespaces() {
+	ctx, cancel := context.WithTimeout(context.Background(), namespaceReapTimeout)
+	defer cancel()
+
+	// A failure here means "no server on that socket", which is the ordinary
+	// case on a machine that has not used an isolated slot yet. It is not
+	// reported: this server speaks JSON-RPC on stdout and shares the host
+	// agent's stderr, where a stray line is noise in someone else's log.
+	out, err := b.c.runWithSocket(ctx, headlessSocket, "list-sessions", "-F", "#{session_name}")
+	if err != nil || out == "" {
+		return
+	}
+	for _, name := range strings.Split(out, "\n") {
+		pid, ok := namespacePID(name)
+		if !ok || processIsRunning(pid) {
+			continue
+		}
+		_, _ = b.c.runWithSocket(ctx, headlessSocket, "kill-session", "-t", name)
+	}
+}
+
+// namespacePID extracts the pid from a session name this package wrote —
+// "mcp-<pid>-<nonce>-<uuid>". ok is false for any name that is not ours,
+// including a session some other program happens to have created on this socket:
+// an unrecognised name is left alone, because the only thing this file knows
+// about a name it did not write is that it must not touch it.
+func namespacePID(session string) (int, bool) {
+	rest, ok := strings.CutPrefix(session, "mcp-")
+	if !ok {
+		return 0, false
+	}
+	digits, _, ok := strings.Cut(rest, "-")
+	if !ok || digits == "" {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(digits)
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// processIsRunning reports whether a pid names a live process.
+//
+// Signal 0 is the portable "does this exist?" probe: it performs the permission
+// check and delivers nothing. A permission error is an ANSWER, not a failure —
+// the process exists and belongs to someone else — and it is reported as alive,
+// which is the safe direction for every caller here: the cost of a false "alive"
+// is one orphan left behind, and the cost of a false "dead" is killing a live
+// server's panes.
+func processIsRunning(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = proc.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EPERM)
+}
+
+// openIsolatedSession creates one detached session on the isolated socket whose
+// NAME carries this server's namespace, and returns the pane inside it.
+//
+// It writes NO registry marks. Claiming is markPaneOwnedAs's job and there must
+// be one walker of markOrder: the session creator this replaces wrote
+// witness → owner before returning, which produced the total order
+// witness → owner → … → slot from two different writers and made the prefix
+// argument on markOrder unanalysable.
+//
+// The pane id comes back prefixed, so one paneRef addresses either server and
+// parseTarget routes every later command to the right socket.
+func (t *tmuxClient) openIsolatedSession(ctx context.Context, session string) (string, error) {
+	out, err := t.runWithSocket(ctx, headlessSocket,
+		"new-session", "-d",
+		"-s", session,
+		"-x", strconv.Itoa(detachedWidth),
+		"-y", strconv.Itoa(detachedHeight),
+		"-P", "-F", "#{pane_id}")
+	if err != nil {
+		return "", err
+	}
+	if out == "" {
+		return "", fmt.Errorf("tmux new-session reported no pane for session %q", session)
+	}
+	return headlessPrefix + out, nil
+}
+
+// isolatedFormat prefixes registryFormat with the session name, so one
+// list-panes answers both questions this file asks of that socket: which panes
+// are in our namespace, and which of those carry a registry record.
+func isolatedFormat() string {
+	return "#{session_name}\t" + registryFormat()
+}
+
+// scanNamespace reads every pane in this server's namespace in ONE tmux call,
+// and returns both views of it.
+//
+// panes is EVERY pane in the namespace, marked or not: on this socket every pane
+// in our namespace is ours by construction — the same argument that abolishes
+// adoption there — so a pane whose marks are missing or partial is still ours to
+// close. Without that view, a process that died between creating a pane and
+// claiming it leaves a live shell no tool can see or reach.
+//
+// records is the witnessed subset, parsed exactly as the visible registry is:
+// the same registryFormat, the same parseRegistryLine, the same rejection of a
+// line whose witness is not the pane's own id. There is one format expression in
+// this file naming the three options, which is what makes the witness impossible
+// to drop from one reader and not the other.
+func (b *tmuxBackend) scanNamespace(ctx context.Context) ([]paneRef, map[paneRef]paneRecord, error) {
+	out, err := b.c.runWithSocket(ctx, headlessSocket, "list-panes", "-a", "-F", isolatedFormat())
+	if err != nil {
+		// "No server running on that socket" is not a failure: it is what "this
+		// agent has opened no invisible panes" looks like, and it is the state
+		// every machine starts in. tmux reports it as an ordinary command
+		// failure, indistinguishable at this layer from a transient one.
+		//
+		// So EVERY failure is read as "empty", and the alternative is worse in a
+		// way that is easy to miss: an unstated kind consults this registry on
+		// its way past, so returning an error here would fail a plain
+		// send-keys — the most common call this server serves — on any machine
+		// that has never used an isolated slot.
+		//
+		// Reading a transient failure as "empty" costs a duplicate pane and
+		// nothing else, and the duplicate repairs itself: the next successful
+		// read finds two panes claiming one slot, keeps the oldest and CLOSES the
+		// other, and close-pane({slot:"all"}) sweeps the namespace whatever its
+		// marks say.
+		return nil, map[paneRef]paneRecord{}, nil
+	}
+	prefix := b.namespacePrefix()
+	var panes []paneRef
+	records := map[paneRef]paneRecord{}
+	for _, line := range strings.Split(out, "\n") {
+		session, rest, ok := strings.Cut(line, "\t")
+		if !ok || !strings.HasPrefix(session, prefix) {
+			continue
+		}
+		bareID, _, _ := strings.Cut(rest, "\t")
+		if bareID == "" {
+			continue
+		}
+		panes = append(panes, newPaneRef(headlessPrefix+bareID))
+		if rec, ok := parseRegistryLine(rest, headlessPrefix); ok {
+			records[rec.Ref] = rec
+		}
+	}
+	return panes, records, nil
+}
+
 // ownedPanesInWindow returns the panes in the window that we *created*, keyed by
 // the same (possibly "headless:"-prefixed) ID that ListPanes reports.
 //
@@ -1207,6 +1318,16 @@ type Backend interface {
 	// ---- Structure ----
 
 	OpenBeside(ctx context.Context, place placement) (paneRef, error)
+
+	// OpenIsolated creates a pane with no window, inside a namespace that
+	// belongs to this server. It writes no registry marks: Claim is the single
+	// mark writer, and a second writer is what made the previous design's write
+	// order unanalysable.
+	//
+	// It returns a non-empty ref whenever the pane was created, even if a later
+	// step of creation failed, so the caller can always clean up what exists.
+	OpenIsolated(ctx context.Context) (paneRef, error)
+
 	Close(ctx context.Context, p paneRef) error
 
 	// ---- Discovery ----
@@ -1219,6 +1340,18 @@ type Backend interface {
 
 	// Records is the witnessed registry of the window around the given pane.
 	Records(ctx context.Context, of paneRef) (map[paneRef]paneRecord, error)
+
+	// IsolatedRecords is the witnessed registry of this server's isolated
+	// namespace — the same question Records answers, asked of the panes nobody
+	// can see.
+	IsolatedRecords(ctx context.Context) (map[paneRef]paneRecord, error)
+
+	// IsolatedPanes returns EVERY pane in this server's namespace, marked or
+	// not. It is the reclamation view: on that socket every pane in our
+	// namespace is ours by construction, so a pane whose marks are missing or
+	// partial is still ours to close. Without it, a process that died between
+	// creating a pane and claiming it leaves a live shell no tool can reach.
+	IsolatedPanes(ctx context.Context) ([]paneRef, error)
 
 	// OwnerMark asks the OPPOSITE question from Records and is deliberately not
 	// witnessed: not "is this pane ours?" but "is it wholly unclaimed?", where
@@ -1266,9 +1399,25 @@ type Backend interface {
 // would be two overlapping APIs on one receiver, which is exactly the ambiguity
 // the seam exists to remove — a policy author would have a stringly-typed
 // escape hatch on the same value.
-type tmuxBackend struct{ c *tmuxClient }
+type tmuxBackend struct {
+	c *tmuxClient
 
-func newTmuxBackend(c *tmuxClient) *tmuxBackend { return &tmuxBackend{c: c} }
+	// nsKey is this server's isolated namespace, fixed for the process
+	// lifetime. See newNamespaceKey for why it is "<pid>-<nonce>" and why it
+	// does not read TMUX_PANE.
+	nsKey string
+}
+
+// newTmuxBackend fixes the namespace and reclaims the orphans of servers that
+// are gone. Both happen HERE, once, rather than lazily on first use: a namespace
+// that could change mid-process would make close-pane("all") sweep a different
+// set than the one it created, and a reaper that ran on first use would run
+// while another resolution held the slot lock.
+func newTmuxBackend(c *tmuxClient) *tmuxBackend {
+	b := &tmuxBackend{c: c, nsKey: newNamespaceKey()}
+	b.reapOrphanedNamespaces()
+	return b
+}
 
 // Compile-time proof that the adapter still satisfies the port. Without it, a
 // method whose signature drifts produces an error at the construction site in
@@ -1311,6 +1460,20 @@ func (b *tmuxBackend) OpenBeside(ctx context.Context, place placement) (paneRef,
 	return newPaneRef(cp.PaneID), nil
 }
 
+// OpenIsolated names the session after the namespace and a fresh uuid, so two
+// isolated slots in one namespace are two sessions rather than two panes in one:
+// killing the last pane of a session ends that session, and tmux exits the
+// server by itself when its last session goes — which is how the isolated server
+// is reclaimed without anyone running kill-server on a socket other servers
+// share.
+func (b *tmuxBackend) OpenIsolated(ctx context.Context) (paneRef, error) {
+	id, err := b.c.openIsolatedSession(ctx, b.namespacePrefix()+uuid.New().String())
+	if err != nil {
+		return paneRef{}, err
+	}
+	return newPaneRef(id), nil
+}
+
 func (b *tmuxBackend) Close(ctx context.Context, p paneRef) error {
 	return b.c.KillPane(ctx, p.target())
 }
@@ -1337,6 +1500,16 @@ func (b *tmuxBackend) Siblings(ctx context.Context, of paneRef) ([]paneInfo, err
 
 func (b *tmuxBackend) Records(ctx context.Context, of paneRef) (map[paneRef]paneRecord, error) {
 	return b.c.paneRegistryAround(ctx, of.target())
+}
+
+func (b *tmuxBackend) IsolatedRecords(ctx context.Context) (map[paneRef]paneRecord, error) {
+	_, records, err := b.scanNamespace(ctx)
+	return records, err
+}
+
+func (b *tmuxBackend) IsolatedPanes(ctx context.Context) ([]paneRef, error) {
+	panes, _, err := b.scanNamespace(ctx)
+	return panes, err
 }
 
 func (b *tmuxBackend) OwnerMark(ctx context.Context, p paneRef) (string, error) {

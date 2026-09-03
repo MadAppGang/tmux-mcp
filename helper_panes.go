@@ -113,12 +113,48 @@ const (
 // helperTitle is the pane title we hang on a helper so the user can see, in the
 // pane border or in list-panes, which panes belong to the agent. Slot 1 is the
 // unnumbered "agent" because it is the one almost every session has.
+//
+// Isolated panes are titled the same way, and consistency is the whole reason:
+// nothing reads the title of a pane nobody can see. One place decides what a
+// helper pane is called, and a special case here would be a second.
 func helperTitle(slot int) string {
 	if slot <= slotDefault {
 		return "agent"
 	}
 	return fmt.Sprintf("agent:%d", slot)
 }
+
+// kindRequest is what the CALLER said about the kind of pane it wants, which is
+// three answers and not two.
+//
+// "isolated was omitted" and "isolated was false" are different requests.
+// Omission means "I am addressing a slot, whatever kind it is" — the only thing
+// a reading tool can mean, since reading tools have no isolated argument at all.
+// An explicit false means "I want the visible one", which is a claim that can
+// conflict with what the slot already holds.
+//
+// Reading the omission as false is the mistake this type exists to make
+// unwritable: it would make every isolated slot unaddressable by its own number
+// the moment the creating call was over, which is the entire contract.
+type kindRequest int
+
+const (
+	kindUnstated kindRequest = iota // isolated absent: accept whichever kind owns the slot
+	kindVisible                     // isolated: false
+	kindIsolated                    // isolated: true
+)
+
+// The two kind-conflict sentences. A slot is one pane, so a request for the
+// other kind of it is a refusal and never a second pane: silently creating an
+// invisible slot 2 beside a visible slot 2 would give the agent two panes
+// answering to one number, and the next call could not say which it meant.
+//
+// Both name the way out, because an error that only says "no" is what sends an
+// agent looking for another route into the terminal.
+const (
+	kindIsVisibleText  = "slot %d is a visible pane; close it or use another slot"
+	kindIsIsolatedText = "slot %d is an isolated pane; close it or use another slot"
+)
 
 // resolveHelper returns the helper pane for the given slot in the window this
 // server's own pane lives in, reusing or creating one as needed. The returned
@@ -152,106 +188,188 @@ func helperTitle(slot int) string {
 // it back to the user, leaving no record at all, and a second read cannot tell
 // "released a millisecond ago" from "never claimed". See clearForDisplay, where
 // that difference is the user's half-typed command line.
-func (s *slots) resolveHelper(
-	ctx context.Context, slot int,
-) (pane paneRef, resolved int, created bool, owner string, err error) {
+func (s *slots) resolveHelper(ctx context.Context, slot int, kind kindRequest) (paneTarget, error) {
 	s.slotMu.Lock()
 	defer s.slotMu.Unlock()
-	return s.resolveHelperLocked(ctx, slot)
+	return s.resolveHelperLocked(ctx, slot, kind)
 }
 
-// resolveHelperNoCreate finds the pane occupying a slot without creating or
-// adopting one. close-pane needs it: creating a pane in order to close it would
-// be absurd, and adopting one in order to release it would touch a pane the user
-// owns for no reason at all.
-//
-// It runs the same self-exclusion and duplicate healing as the full resolver,
-// because those are repairs to state that is already wrong — leaving them to the
-// create path would mean a window could only be healed by growing.
+// lookupSlot finds the pane occupying a slot without creating or adopting one.
 //
 // This is the lock-taking wrapper, kept because it is the honest way to ask the
 // question from outside a lock hold. The teardown that close-pane actually
 // performs goes through closePanes, which holds slotMu across the lookup AND the
 // mutations that follow it and therefore calls the ...Locked body directly — see
 // closePanes for why the split is mandatory rather than tidy.
-func (s *slots) resolveHelperNoCreate(ctx context.Context, slot int) (paneRecord, bool, error) {
+func (s *slots) lookupSlot(ctx context.Context, slot int, kind kindRequest) (paneRecord, bool, error) {
 	s.slotMu.Lock()
 	defer s.slotMu.Unlock()
 
 	self, err := s.b.Self(ctx)
-	if err != nil {
+	if err != nil && !errors.Is(err, errNoWindow) {
 		return paneRecord{}, false, err
 	}
-	return s.resolveHelperNoCreateLocked(ctx, slot, self)
+	return s.lookupSlotLocked(ctx, slot, kind, self)
 }
 
-// resolveHelperNoCreateLocked is the body of the above. The caller must hold
-// slotMu, and must have read self from the port inside that hold — passing it in
-// rather than re-reading it is what keeps one teardown call to a single answer
-// about which pane is ours.
-func (s *slots) resolveHelperNoCreateLocked(
-	ctx context.Context, slot int, self paneRef,
+// lookupSlotLocked finds the pane occupying a slot WITHOUT creating or adopting
+// one, in BOTH registries. The caller must hold slotMu and pass the self it read
+// inside that hold — an empty self meaning "there is no window", which is not an
+// error here.
+//
+// It is one function because close-pane and the reading tools have to agree
+// about what "slot 2" means. They previously did not: this lookup read only the
+// visible window, so a read of an isolated slot would have answered "slot 2 does
+// not exist" — a lie, and one that sends an agent to re-create a pane it already
+// has.
+//
+// The two callers differ only in what a MISS means, and that difference is the
+// caller's: a reading tool errors, close-pane answers {action:"none"}, because
+// "close slot 2" when slot 2 was never opened is a request that has already been
+// satisfied.
+//
+// Both repairs the full resolver performs happen here too — self-exclusion and
+// duplicate healing — because those fix state that is already wrong, and leaving
+// them to the create path would mean a window could only be healed by growing.
+//
+// Creating one pane in order to close it would be absurd, and adopting one in
+// order to release it would touch a pane the user owns for no reason at all.
+func (s *slots) lookupSlotLocked(
+	ctx context.Context, slot int, kind kindRequest, self paneRef,
 ) (paneRecord, bool, error) {
-	reg, err := s.b.Records(ctx, self)
-	if err != nil {
-		return paneRecord{}, false, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
-	}
+	if kind != kindIsolated && !self.empty() {
+		reg, err := s.b.Records(ctx, self)
+		if err != nil {
+			return paneRecord{}, false, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
+		}
 
-	// The server's own pane is CONSIDERED here, and teardown is the only lookup
-	// that considers it. Every other path excludes it — reuse must never hand it
-	// back, acquisition must never claim it, the "all" sweep must never touch it,
-	// list-slots must not report it — and here exclusion is wrong for a reason
-	// that does not apply to any of those.
-	//
-	// A subagent started into an outer agent's slot-1 pane inherits a valid
-	// agent-owned record on the pane it is running in. Skipping it makes
-	// close-pane({slot:1}) answer {"action":"none"}, which says "slot 1 is
-	// empty" — and what an agent does next with an empty slot is open one. The
-	// truth is the opposite: slot 1 is the pane this request arrived through, and
-	// closeHelperLocked is where that is said, in the sentence written for it.
-	// Routing the record there rather than dropping it is what keeps that guard
-	// reachable now that close-pane({paneId}) — its only other route — is gone.
-	//
-	// It is returned WITHOUT clearing the stale marker, because unslotting is a
-	// mutation and a refused teardown must not leave one behind. The next
-	// resolution clears it through slotCandidateLocked, which is where the
-	// healing belongs.
-	if !self.empty() {
+		// The server's own pane is CONSIDERED here, and teardown is the only
+		// lookup that considers it. Every other path excludes it — reuse must
+		// never hand it back, acquisition must never claim it, the "all" sweep
+		// must never touch it, list-slots must not report it — and here exclusion
+		// is wrong for a reason that does not apply to any of those.
+		//
+		// A subagent started into an outer agent's slot-1 pane inherits a valid
+		// agent-owned record on the pane it is running in. Skipping it makes
+		// close-pane({slot:1}) answer {"action":"none"}, which says "slot 1 is
+		// empty" — and what an agent does next with an empty slot is open one. The
+		// truth is the opposite: slot 1 is the pane this request arrived through,
+		// and closeHelperLocked is where that is said, in the sentence written for
+		// it. Routing the record there rather than dropping it is what keeps that
+		// guard reachable now that close-pane({paneId}) — its only other route —
+		// is gone.
+		//
+		// It is returned WITHOUT clearing the stale marker, because unslotting is
+		// a mutation and a refused teardown must not leave one behind. The next
+		// resolution clears it through slotCandidateLocked, which is where the
+		// healing belongs.
 		if rec, ok := reg[self]; ok && rec.Slot == slot {
+			return rec, true, nil
+		}
+		if rec, ok := s.closeCandidateLocked(ctx, slot, self, reg, false); ok {
 			return rec, true, nil
 		}
 	}
 
-	rec, ok := s.closeCandidateLocked(ctx, slot, self, reg)
+	if kind == kindVisible {
+		return paneRecord{}, false, nil
+	}
+	iso, err := s.b.IsolatedRecords(ctx)
+	if err != nil {
+		return paneRecord{}, false, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
+	}
+	rec, ok := s.closeCandidateLocked(ctx, slot, paneRef{}, iso, true)
 	return rec, ok, nil
 }
 
-// resolveHelperLocked is the body of both entry points above. The caller must
-// hold slotMu.
+// resolveHelperLocked is the body of resolveHelper. The caller must hold slotMu.
 //
-// Splitting it out is what keeps the whole decision on one registry read. Every
-// branch below — reuse, adopt, create — is chosen from the same `reg` snapshot
-// and acts while the lock still holds it, so no concurrent caller can claim the
-// slot between the read that found it free and the write that takes it.
+// Splitting it out is what keeps the whole decision on one registry read per
+// kind. Every branch below — reuse, adopt, create — is chosen from a snapshot
+// taken inside this lock hold and acts while the lock still holds it, so no
+// concurrent caller in this process can claim the slot between the read that
+// found it free and the write that takes it.
 //
-// Each branch also states the owner it is handing back, and each of the three
-// knows it for certain: reuse carries the record it chose from, adoption has
-// just written ownerAcquired, and a pane we split is ours. See resolveHelper for
-// what the value is for.
-func (s *slots) resolveHelperLocked(ctx context.Context, slot int) (paneRef, int, bool, string, error) {
+// Each branch also states the owner it is handing back, and each knows it for
+// certain: reuse carries the record it chose from, adoption has just written
+// ownerAcquired, and a pane we made is ours. See resolveHelper for what the
+// value is for.
+//
+// # No window is not a failure here
+//
+// errNoWindow means this server is not running inside tmux, and an ISOLATED slot
+// needs no window: it lives on a second server with no client attached. So the
+// sentinel is tolerated, the visible registry read is SKIPPED entirely — calling
+// Records with an empty self would run `list-panes -t ""` and fail — and only a
+// request that has to end in a visible pane turns it into a message. Any other
+// failure of Self refuses everything: we could not establish which pane is ours,
+// and every self-exclusion below is then unevaluable.
+func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequest) (paneTarget, error) {
 	self, err := s.b.Self(ctx)
-	if err != nil {
-		return paneRef{}, 0, false, "", err
+	noWindow := errors.Is(err, errNoWindow)
+	if err != nil && !noWindow {
+		return paneTarget{}, err
 	}
 
-	reg, err := s.b.Records(ctx, self)
-	if err != nil {
-		return paneRef{}, 0, false, "", fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
+	var reg map[paneRef]paneRecord
+	if !noWindow {
+		reg, err = s.b.Records(ctx, self)
+		if err != nil {
+			return paneTarget{}, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
+		}
 	}
 
-	// Reuse.
-	if rec, ok := s.slotCandidateLocked(ctx, slot, self, reg); ok {
-		return s.helperResult(rec.Ref, self, slot, false, rec.Owner)
+	// Reuse, visible. It runs first for an unstated kind because a visible pane
+	// is the one the user can see, and because finding one here saves the second
+	// registry read below on the overwhelmingly common path.
+	if kind != kindIsolated {
+		if rec, ok := s.slotCandidateLocked(ctx, slot, self, reg, false); ok {
+			return s.helperResult(rec.Ref, self, slot, false, rec.Owner, false)
+		}
+	}
+
+	// Reuse, isolated. Self-exclusion is vacuous on that socket — this server
+	// does not run there — and is not special-cased, for the same reason
+	// helperResult's self check is not: a guard that costs one comparison and
+	// cannot be wrong is cheaper than a branch explaining why it was removed.
+	var iso map[paneRef]paneRecord
+	if kind != kindVisible {
+		iso, err = s.b.IsolatedRecords(ctx)
+		if err != nil {
+			return paneTarget{}, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
+		}
+		if rec, ok := s.slotCandidateLocked(ctx, slot, paneRef{}, iso, true); ok {
+			return s.helperResult(rec.Ref, self, slot, false, rec.Owner, true)
+		}
+	}
+
+	// A slot is ONE pane. An EXPLICIT kind that disagrees with what the slot
+	// already holds is refused rather than satisfied with a second pane, because
+	// two panes answering to one number make the next call ambiguous. A DEAD
+	// holder counts: it is still on the user's screen under remain-on-exit, and
+	// close-pane({slot:N}) is how it is reaped.
+	//
+	// An unstated kind reaches neither refusal, which is the whole point of the
+	// tri-state: it accepts whichever kind owns the slot, and both reuse branches
+	// above have already had their chance to say so.
+	if kind == kindIsolated && slotOccupied(reg, slot) {
+		return paneTarget{}, fmt.Errorf(kindIsVisibleText, slot)
+	}
+	if kind == kindVisible {
+		iso, err = s.b.IsolatedRecords(ctx)
+		if err != nil {
+			return paneTarget{}, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
+		}
+		if slotOccupied(iso, slot) {
+			return paneTarget{}, fmt.Errorf(kindIsIsolatedText, slot)
+		}
+	}
+
+	if kind == kindIsolated {
+		return s.createIsolatedLocked(ctx, slot, self)
+	}
+	if noWindow {
+		return paneTarget{}, errNoWindow
 	}
 
 	// Adopt. The registry lookup here is the "unowned" half of the acquisition
@@ -260,23 +378,83 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int) (paneRef, int
 	// owner mark for the panes that reach it, because absence from this map means
 	// "no record we recognise", which is not the same as "unclaimed".
 	if pane, ok := s.acquirePaneLocked(ctx, reg, slot, self); ok {
-		return s.helperResult(pane, self, slot, true, ownerAcquired)
+		return s.helperResult(pane, self, slot, true, ownerAcquired, false)
 	}
 
 	// Create. Failures of the two markers below are deliberately not fatal, for
-	// the same reason createSessionOnSocket ignores its own: the pane exists and
-	// works, it just will not be found again as a reuse candidate, so the caller
-	// loses nothing now and at worst gets a second pane later. Returning an error
-	// here would abandon a pane that has already been created.
+	// the same reason SplitPane ignores its own: the pane exists and works, it
+	// just will not be found again as a reuse candidate, so the caller loses
+	// nothing now and at worst gets a second pane later. Returning an error here
+	// would abandon a pane that has already been created — and the user can SEE
+	// this one, which is what makes the isolated create path below decide the
+	// other way.
 	place := s.placementForSlot(ctx, reg, slot, self)
 	pane, err := s.b.OpenBeside(ctx, place)
 	if err != nil {
-		return paneRef{}, 0, false, "", fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
+		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
 	_ = s.b.SetSlot(ctx, pane, slot)
 	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
 	s.waitForShellReady(ctx, pane)
-	return s.helperResult(pane, self, slot, true, ownerAgent)
+	return s.helperResult(pane, self, slot, true, ownerAgent, false)
+}
+
+// slotOccupied reports whether any record in a registry claims the slot, dead or
+// alive. It is the kind-conflict question, which is deliberately broader than
+// the reuse question: a corpse still holds the number, still sits on the user's
+// screen under remain-on-exit, and is still what close-pane({slot:N}) reaps.
+func slotOccupied(reg map[paneRef]paneRecord, slot int) bool {
+	for _, rec := range reg {
+		if rec.Slot == slot {
+			return true
+		}
+	}
+	return false
+}
+
+// createIsolatedLocked opens a pane nobody can see and claims it. The caller
+// must hold slotMu.
+//
+// # There is no adoption branch, and its absence is a decision
+//
+// Adoption exists to reuse a shell the USER left idle in the window they are
+// looking at. This socket has no user and no window, and every pane on it was
+// created by an agent. A predicate that could adopt here would be a predicate
+// that could type into ANOTHER SERVER'S pane, with the namespace filter as the
+// only thing preventing it — and it must not become the only thing.
+//
+// # A failed claim CLOSES the pane, where the visible path shrugs
+//
+// The visible create path treats a failed marker as cosmetic: the pane exists,
+// the user can see it, and at worst they close it by hand. Here nobody can see
+// it. An unclaimed isolated pane is a live shell that no tool can list, reach or
+// reap for the lifetime of the machine, so the pane is destroyed and the failure
+// reported.
+//
+// The cleanup runs on a context DETACHED from the caller's, and that is the
+// point rather than a detail: the likeliest reason a mark write failed is that
+// the caller's context expired, and a kill issued on that same dead context is a
+// command that does not run — leaving exactly the stranded shell this branch
+// exists to prevent. It is the same reasoning adoptCandidateLocked's rollback
+// states, with a heavier consequence.
+//
+// waitForShellReady is not optional here. OpenIsolated takes no initial command,
+// so whatever the caller does next sends into a shell that may still be sourcing
+// its rc files — the failure that wait exists to prevent.
+func (s *slots) createIsolatedLocked(ctx context.Context, slot int, self paneRef) (paneTarget, error) {
+	pane, err := s.b.OpenIsolated(ctx)
+	if err != nil {
+		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
+	}
+	if err := s.b.Claim(ctx, pane, ownerAgent, slot); err != nil {
+		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
+		defer cancel()
+		_ = s.b.Close(undoCtx, pane)
+		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
+	}
+	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
+	s.waitForShellReady(ctx, pane)
+	return s.helperResult(pane, self, slot, true, ownerAgent, true)
 }
 
 // helperResult is the single exit through which every resolution passes, and it
@@ -293,21 +471,21 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int) (paneRef, int
 //
 // It is also the single exit the owner passes through, which is what makes
 // "every resolution reports whose pane it handed back" a property of one
-// function rather than a habit three branches share. A refusal reports no owner
+// function rather than a habit four branches share. A refusal reports no owner
 // at all: there is no pane, so there is nothing to be the owner of, and an empty
 // value is the one clearForDisplay treats as "do not touch the line".
 func (s *slots) helperResult(
-	pane, self paneRef, slot int, created bool, owner string,
-) (paneRef, int, bool, string, error) {
+	pane, self paneRef, slot int, created bool, owner string, isolated bool,
+) (paneTarget, error) {
 	if pane == self {
 		// The slot number is the whole handle: the pane is not named here, because
 		// this sentence reaches the model and a pane id in it is a pane id in the
 		// model's context. (paneRef's String prints "<pane>" as a second line of
 		// defence, so even a careless %s here could not leak one.)
-		return paneRef{}, 0, false, "", fmt.Errorf(
+		return paneTarget{}, fmt.Errorf(
 			"internal error: slot %d resolved to this server's own pane; refusing to return it", slot)
 	}
-	return pane, slot, created, owner, nil
+	return paneTarget{Ref: pane, Slot: slot, Created: created, Owner: owner, Isolated: isolated}, nil
 }
 
 // slotCandidateLocked returns the pane currently holding slot, and repairs the
@@ -327,12 +505,18 @@ func (s *slots) helperResult(
 //
 // Duplicate healing. Two server processes sharing one window can both create a
 // pane for the same slot, because tmux has no compare-and-set on options (see
-// resolveHelper). The lowest-numbered — oldest — pane wins, and the others have
-// their slot markers cleared: they stay agent-owned panes, they simply stop
-// answering to a slot. Keeping the oldest is the choice that preserves whatever
-// long-running process the caller already started.
+// resolveHelper). The lowest-numbered — oldest — pane wins, and the losers are
+// retired. Keeping the oldest is the choice that preserves whatever long-running
+// process the caller already started.
+//
+// isolated says which registry this is, and it is a parameter rather than a fact
+// read off the record because it changes what retiring a loser MEANS — see
+// retireDuplicateLocked, where the two rules are deliberately in one function so
+// neither can be edited without seeing the other. On the isolated registry
+// self-exclusion is vacuous: this server does not run on that socket, so no
+// record there can be self.
 func (s *slots) slotCandidateLocked(
-	ctx context.Context, slot int, self paneRef, reg map[paneRef]paneRecord,
+	ctx context.Context, slot int, self paneRef, reg map[paneRef]paneRecord, isolated bool,
 ) (paneRecord, bool) {
 	var candidates []paneRecord
 	for _, rec := range reg {
@@ -343,7 +527,7 @@ func (s *slots) slotCandidateLocked(
 		if rec.Slot != slot || rec.Dead {
 			continue
 		}
-		if rec.Ref == self {
+		if !self.empty() && rec.Ref == self {
 			_ = s.b.SetSlot(ctx, rec.Ref, 0)
 			continue
 		}
@@ -356,7 +540,7 @@ func (s *slots) slotCandidateLocked(
 		return candidates[i].Seq < candidates[j].Seq
 	})
 	for _, dup := range candidates[1:] {
-		s.retireDuplicateLocked(ctx, dup)
+		s.retireDuplicateLocked(ctx, dup, isolated)
 	}
 	return candidates[0], true
 }
@@ -381,9 +565,23 @@ func (s *slots) slotCandidateLocked(
 // is trapped inside it, and it may well be running the long process whose
 // survival is the whole reason the OLDEST pane wins this race — killing it here,
 // from inside a resolution nobody asked to destroy anything, would throw that
-// away. It becomes an unslotted agent pane, which is kill-pane territory, and
-// that is the documented cost of the cross-process race this healing repairs.
-func (s *slots) retireDuplicateLocked(ctx context.Context, rec paneRecord) {
+// away. It becomes an unslotted agent pane the user can close by hand, and that
+// is the documented cost of the cross-process race this healing repairs.
+//
+// # The isolated rule is the opposite, and the difference is visibility
+//
+// An unslotted loser on the isolated socket is not a pane the user can close by
+// hand: nobody can see it, no tool can reach it, and it pins a live shell and
+// the server behind it until the machine reboots. So an isolated loser is
+// CLOSED. The two rules live in one function on purpose — the visible rule reads
+// as the safe, conservative one, and applying it to a pane nobody can see is
+// exactly the mistake that produced the stranded shells this branch exists to
+// prevent.
+func (s *slots) retireDuplicateLocked(ctx context.Context, rec paneRecord, isolated bool) {
+	if isolated {
+		_ = s.b.Close(ctx, rec.Ref)
+		return
+	}
 	if rec.Owner == ownerAcquired {
 		_ = s.releaseAcquiredLocked(ctx, rec)
 		return
@@ -421,14 +619,14 @@ func (s *slots) retireDuplicateLocked(ctx context.Context, rec paneRecord) {
 // corpse holds it gets a fresh pane rather than the body — the corpse is only
 // reachable through close-pane, whose entire job is disposing of it.
 func (s *slots) closeCandidateLocked(
-	ctx context.Context, slot int, self paneRef, reg map[paneRef]paneRecord,
+	ctx context.Context, slot int, self paneRef, reg map[paneRef]paneRecord, isolated bool,
 ) (paneRecord, bool) {
-	if rec, ok := s.slotCandidateLocked(ctx, slot, self, reg); ok {
+	if rec, ok := s.slotCandidateLocked(ctx, slot, self, reg, isolated); ok {
 		return rec, true
 	}
 	var dead []paneRecord
 	for _, rec := range reg {
-		if rec.Slot != slot || !rec.Dead || rec.Ref == self {
+		if rec.Slot != slot || !rec.Dead || (!self.empty() && rec.Ref == self) {
 			continue
 		}
 		dead = append(dead, rec)
@@ -926,43 +1124,54 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 	defer s.slotMu.Unlock()
 
 	// One read of "which pane am I", used for the guard in closeHelperLocked and
-	// as the scope every slot form is resolved around.
+	// as the scope the visible half is resolved around.
 	//
-	// Every failure refuses, and both halves of that have a reason. Without a
-	// window there is nothing to enumerate and no slot to resolve, so neither
-	// form could be satisfied by anything; and any other failure means we could
-	// not establish which pane is ours, where the self guard is the only thing
-	// standing between close-pane and the agent's own session — a guard that
-	// cannot be evaluated must not be skipped.
+	// No window SKIPS the visible half rather than refusing the call. There is no
+	// window to enumerate and no visible slot to resolve — Records with an empty
+	// self would run `list-panes -t ""` and fail — but a server that was never
+	// inside tmux still has isolated panes of its own to close, and those are the
+	// only panes it can have. Refusing here would make the one mode that works
+	// outside tmux impossible to tidy up after.
 	//
-	// The no-window half becomes a SKIP rather than a refusal once invisible
-	// slots exist: those live on a socket with no window at all, so a server that
-	// was never in tmux still has panes of its own to close. Until then, skipping
-	// would report success for a request nothing could have acted on. The
-	// tolerated case this replaces was the explicit paneId form, which is how a
-	// headless pane used to be closed from outside tmux, and it is gone with it.
+	// Any OTHER failure of Self refuses every form. It means we could not
+	// establish which pane is ours, and the self guard in closeHelperLocked is
+	// the only thing standing between close-pane and the agent's own session: a
+	// guard that cannot be evaluated must not be skipped.
 	self, err := s.b.Self(ctx)
-	if err != nil {
+	if err != nil && !errors.Is(err, errNoWindow) {
 		return nil, visibleError(err)
 	}
 
 	switch {
 	case sel.All:
-		recs, err := s.slottedHelpersInSelfWindowLocked(ctx, self)
+		var closed []closedPane
+		if !self.empty() {
+			recs, err := s.visibleSlotsLocked(ctx, self)
+			if err != nil {
+				return nil, err
+			}
+			for _, rec := range recs {
+				// A failure on one pane does not abort the loop. Teardown that
+				// stops at the first problem leaves the caller worse off than one
+				// that continues and reports: the panes after the failure would
+				// stay open with no indication that they had not been considered.
+				closed = append(closed, s.closeOneLocked(ctx, rec, self))
+			}
+		}
+		swept, err := s.sweepNamespaceLocked(ctx)
 		if err != nil {
 			return nil, err
 		}
-		closed := make([]closedPane, 0, len(recs))
-		for _, rec := range recs {
-			// A failure on one pane does not abort the loop. Teardown that stops
-			// at the first problem leaves the caller worse off than one that
-			// continues and reports: the panes after the failure would stay open
-			// with no indication that they had not been considered.
-			closed = append(closed, s.closeOneLocked(ctx, rec, self))
+		closed = append(closed, swept...)
+		if closed == nil {
+			// A bare array, never null. "There was nothing to close" is a
+			// perfectly ordinary answer, and a caller that gets null for it has
+			// to special-case the value before iterating — which some will not.
+			return []closedPane{}, nil
 		}
 		return closed, nil
 	default:
-		rec, found, err := s.resolveHelperNoCreateLocked(ctx, sel.Slot, self)
+		rec, found, err := s.lookupSlotLocked(ctx, sel.Slot, kindUnstated, self)
 		if err != nil {
 			return nil, err
 		}
@@ -973,6 +1182,58 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 		}
 		return []closedPane{s.closeOneLocked(ctx, rec, self)}, nil
 	}
+}
+
+// sweepNamespaceLocked closes EVERY pane in this server's isolated namespace,
+// slotted or not. The caller must hold slotMu.
+//
+// It is namespace-scoped where the visible half is slot-scoped, and the
+// asymmetry is the same argument that abolishes adoption on that socket: every
+// pane in our namespace was created by this process, so a pane whose marks are
+// missing or partial is still ours to close. In the user's window the opposite
+// holds — an unmarked pane there is presumed the user's, and killing it is the
+// one unrecoverable action in this design.
+//
+// Without this, a process that died between OpenIsolated and Claim leaves a live
+// shell that nothing can list, reach or reap. It cannot be closed by hand
+// either, because there is no window to close it in.
+//
+// No kill-server is issued, here or anywhere. tmux exits a server when its last
+// pane dies, so closing our panes reclaims the server by itself — and a
+// kill-server on this socket would be a cross-namespace kill, taking the panes
+// of every other agent on the machine with it.
+func (s *slots) sweepNamespaceLocked(ctx context.Context) ([]closedPane, error) {
+	panes, err := s.b.IsolatedPanes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(panes) == 0 {
+		return nil, nil
+	}
+	records, err := s.b.IsolatedRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	closed := make([]closedPane, 0, len(panes))
+	for _, pane := range panes {
+		rec, claimed := records[pane]
+		entry := closedPane{Slot: rec.Slot, Action: actionKilled}
+		if !claimed || rec.Slot < slotDefault {
+			// Slot 0 is not a slot, and saying so is better than inventing one:
+			// this pane never finished being claimed, so no number ever named it.
+			// The detail is what stops that entry reading as a bug.
+			entry.Slot = 0
+			entry.Detail = "an isolated pane this server opened but never finished claiming"
+		}
+		if err := s.b.Close(ctx, pane); err != nil {
+			entry.Action = actionError
+			entry.Detail = err.Error()
+		}
+		closed = append(closed, entry)
+	}
+	sort.Slice(closed, func(i, j int) bool { return closed[i].Slot < closed[j].Slot })
+	return closed, nil
 }
 
 // closeOneLocked turns one record into one response entry. The caller must hold
@@ -994,10 +1255,10 @@ func (s *slots) closeOneLocked(ctx context.Context, rec paneRecord, self paneRef
 	return entry
 }
 
-// slottedHelpersInSelfWindowLocked returns every slotted helper in the window
-// this server runs in, ordered by slot and then by pane id. It backs
-// close-pane({slot:"all"}). The caller must hold slotMu, and passes the self it
-// read from the port inside that hold.
+// visibleSlotsLocked returns every slotted helper in the window this server runs
+// in, ordered by slot and then by pane id. It is the visible half of
+// close-pane({slot:"all"}); sweepNamespaceLocked is the other. The caller must
+// hold slotMu, and passes the self it read from the port inside that hold.
 //
 // Three scoping decisions live here, and none of them is arbitrary.
 //
@@ -1005,10 +1266,13 @@ func (s *slots) closeOneLocked(ctx context.Context, rec paneRecord, self paneRef
 // did, and the resolver never reaches outside this window. An agent tearing down
 // must not be able to touch the user's other windows.
 //
-// It covers SLOTTED records only. An agent-owned pane with no slot was created
-// by an explicit split-pane({paneId}) call, whose lifecycle belongs to the caller
-// that named the pane; close-pane is the inverse of resolveHelper and should
-// undo exactly what resolveHelper did. kill-pane remains available for the rest.
+// It covers SLOTTED records only, which is the one scoping rule the isolated
+// sweep deliberately inverts. An unslotted agent-owned pane in the USER'S window
+// is one they can see and close by hand — most often a duplicate-race loser this
+// server unslotted rather than killed — and close-pane is the inverse of
+// resolveHelper, so it undoes exactly what resolveHelper did. On the isolated
+// socket nobody can see anything, so the sweep there takes every pane in the
+// namespace; see sweepNamespaceLocked.
 //
 // It EXCLUDES this server's own pane, which is not a formality. A server whose
 // pane was created by an outer agent can inherit a stale slot marker, and "close
@@ -1021,7 +1285,7 @@ func (s *slots) closeOneLocked(ctx context.Context, rec paneRecord, self paneRef
 // It deliberately does NOT filter dead panes, and closeCandidateLocked was
 // taught to match rather than the reverse: a corpse is exactly what a teardown
 // is for. The reuse path is the one that must keep skipping them.
-func (s *slots) slottedHelpersInSelfWindowLocked(
+func (s *slots) visibleSlotsLocked(
 	ctx context.Context, self paneRef,
 ) ([]paneRecord, error) {
 	reg, err := s.b.Records(ctx, self)
@@ -1061,8 +1325,13 @@ func (s *slots) listSlots(ctx context.Context) ([]slotListing, error) {
 	s.slotMu.Lock()
 	defer s.slotMu.Unlock()
 
+	// No window skips the visible half, exactly as it does in closePanes and in
+	// resolveHelper. A server outside tmux can still have isolated slots, and
+	// they are the only slots it can have — answering "not running inside tmux"
+	// there would make list-slots useless in precisely the mode isolated slots
+	// exist for.
 	self, err := s.b.Self(ctx)
-	if err != nil {
+	if err != nil && !errors.Is(err, errNoWindow) {
 		return nil, visibleError(err)
 	}
 	return s.listSlotsLocked(ctx, self)
@@ -1088,12 +1357,48 @@ func (s *slots) listSlots(ctx context.Context) ([]slotListing, error) {
 // what the user is looking at and what close-pane exists to reap; answering
 // "slot 2 is empty" would conflate a slot that was never opened with one whose
 // process died, and those are the two facts a caller most needs to tell apart.
+//
+// Both registries are listed, and both entries survive in the degenerate case
+// where one number is claimed on each side. Hiding one would tell the agent a
+// kind of pane it still has is gone, and close-pane({slot:N}) would then find
+// something the listing said was not there. isolated is what tells them apart,
+// which is why that field carries no omitempty.
 func (s *slots) listSlotsLocked(ctx context.Context, self paneRef) ([]slotListing, error) {
-	reg, err := s.b.Records(ctx, self)
+	var listings []slotListing
+
+	if !self.empty() {
+		reg, err := s.b.Records(ctx, self)
+		if err != nil {
+			return nil, fmt.Errorf("could not read the pane registry: %w", err)
+		}
+		listings = append(listings, s.canonicalListingsLocked(ctx, reg, self, false)...)
+	}
+
+	iso, err := s.b.IsolatedRecords(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("could not read the pane registry: %w", err)
 	}
+	listings = append(listings, s.canonicalListingsLocked(ctx, iso, paneRef{}, true)...)
 
+	sort.Slice(listings, func(i, j int) bool {
+		if listings[i].Slot != listings[j].Slot {
+			return listings[i].Slot < listings[j].Slot
+		}
+		return !listings[i].Isolated && listings[j].Isolated
+	})
+	if listings == nil {
+		// A bare array, never null: a caller that gets null for "nothing open"
+		// has to special-case it before iterating, and some will not.
+		return []slotListing{}, nil
+	}
+	return listings, nil
+}
+
+// canonicalListingsLocked turns one registry into one entry per occupied slot,
+// applying the same two repairs resolution applies. The caller must hold slotMu.
+func (s *slots) canonicalListingsLocked(
+	ctx context.Context, reg map[paneRef]paneRecord, self paneRef, isolated bool,
+) []slotListing {
 	// Every slot number the registry mentions, including any carried by our own
 	// pane: those reach closeCandidateLocked precisely so the stale marker is
 	// cleared rather than skipped and left to steer a later call.
@@ -1110,13 +1415,13 @@ func (s *slots) listSlotsLocked(ctx context.Context, self paneRef) ([]slotListin
 
 	listings := make([]slotListing, 0, len(numbers))
 	for _, slot := range numbers {
-		rec, ok := s.closeCandidateLocked(ctx, slot, self, reg)
+		rec, ok := s.closeCandidateLocked(ctx, slot, self, reg, isolated)
 		if !ok {
 			continue
 		}
-		listings = append(listings, s.listingFor(ctx, rec))
+		listings = append(listings, s.listingFor(ctx, rec, isolated))
 	}
-	return listings, nil
+	return listings
 }
 
 // listingFor describes one slot for the caller.
@@ -1127,8 +1432,8 @@ func (s *slots) listSlotsLocked(ctx context.Context, self paneRef) ([]slotListin
 // what the caller started in it has exited. A failed process read leaves the
 // record's answer standing, because "we could not look" must not be reported as
 // "it is gone".
-func (s *slots) listingFor(ctx context.Context, rec paneRecord) slotListing {
-	entry := slotListing{Slot: rec.Slot, Origin: originCreated, IsAlive: !rec.Dead}
+func (s *slots) listingFor(ctx context.Context, rec paneRecord, isolated bool) slotListing {
+	entry := slotListing{Slot: rec.Slot, Isolated: isolated, Origin: originCreated, IsAlive: !rec.Dead}
 	if rec.Owner == ownerAcquired {
 		entry.Origin = originAdopted
 	}
