@@ -3,94 +3,13 @@ package main
 // missing_tests_test.go covers the 11 gaps identified by multi-model review.
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
-
-// newMCPClientCustomScope starts a fresh tmux-mcp process with a specific
-// --scope value instead of the hard-coded --scope=all used by newMCPClient.
-// It performs the full MCP initialize handshake and returns a ready-to-use client.
-func newMCPClientCustomScope(t *testing.T, scope string, extraArgs ...string) *mcpClient {
-	t.Helper()
-
-	shellType := "zsh"
-	if s := os.Getenv("SHELL"); strings.Contains(s, "bash") {
-		shellType = "bash"
-	} else if strings.Contains(s, "fish") {
-		shellType = "fish"
-	}
-
-	args := append([]string{"--shell-type=" + shellType, "--scope=" + scope}, extraArgs...)
-	cmd := exec.Command(testBinaryPath, args...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("stdin pipe: %v", err)
-	}
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start process: %v", err)
-	}
-
-	c := &mcpClient{
-		cmd:                  cmd,
-		stdin:                stdin,
-		pending:              make(map[int64]*pendingCall),
-		channelNotifications: make(chan map[string]any, 64),
-	}
-
-	go c.readLoop(bufio.NewReader(stdoutPipe))
-
-	// MCP initialize handshake.
-	c.call(t, "initialize", map[string]any{
-		"protocolVersion": "2025-06-18",
-		"capabilities":    map[string]any{},
-		"clientInfo": map[string]any{
-			"name":    "e2e-test",
-			"version": "1.0.0",
-		},
-	})
-
-	// Send initialized notification.
-	notif := map[string]any{
-		"jsonrpc": "2.0",
-		"method":  "notifications/initialized",
-	}
-	data, _ := json.Marshal(notif)
-	_, _ = fmt.Fprintf(c.stdin, "%s\n", data)
-
-	t.Cleanup(func() { c.close() })
-	return c
-}
-
-// toolNames calls tools/list and returns a set of tool name strings.
-func toolNames(t *testing.T, c *mcpClient) map[string]bool {
-	t.Helper()
-	raw := c.call(t, "tools/list", map[string]any{})
-	var result struct {
-		Tools []struct {
-			Name string `json:"name"`
-		} `json:"tools"`
-	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		t.Fatalf("unmarshal tools/list result: %v\nraw: %s", err, raw)
-	}
-	names := make(map[string]bool, len(result.Tools))
-	for _, tool := range result.Tools {
-		names[tool.Name] = true
-	}
-	return names
-}
 
 // ---- 1. TestExecuteCommandTimeout ----
 
@@ -222,85 +141,23 @@ func TestKillSessionByName(t *testing.T) {
 	}
 }
 
-// ---- 5. TestScopeAgentic ----
-
-func TestScopeAgentic(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClientCustomScope(t, "agentic")
-	names := toolNames(t, c)
-
-	agenticRequired := []string{
-		// Layer 1 (13 essential primitives)
-		"list-sessions",
-		"list-windows",
-		"list-panes",
-		"create-session",
-		"create-headless",
-		"split-pane",
-		"capture-pane",
-		"send-keys",
-		"execute-command",
-		"kill-session",
-		"kill-headless-server",
-		"kill-pane",
-		"screenshot-pane",
-		// Layer 2 (7 agent workflow tools)
-		"start-and-watch",
-		"watch-pane",
-		"pane-state",
-		"run-in-repl",
-		"write-to-display",
-		"display-message",
-		// close-pane is the owner-aware inverse of slot resolution, and belongs
-		// in Layer 2 rather than beside kill-pane: it is a workflow tool that
-		// knows which panes are the agent's, not a primitive that destroys what
-		// it is pointed at.
-		"close-pane",
-	}
-	for _, tool := range agenticRequired {
-		if !names[tool] {
-			t.Errorf("agentic scope: expected tool %q to be present, but it is missing", tool)
-		}
-	}
-
-	primitiveOnly := []string{
-		"resize-pane",
-		"rename-session",
-		"create-window",
-		"kill-window",
-	}
-	for _, tool := range primitiveOnly {
-		if names[tool] {
-			t.Errorf("agentic scope: expected tool %q to be absent (primitives only), but it is present", tool)
-		}
-	}
-
-	// Verify exact tool count to catch accidental additions/removals.
-	expectedCount := len(agenticRequired)
-	actualCount := len(names)
-	if actualCount != expectedCount {
-		t.Errorf("agentic scope: expected %d tools, got %d", expectedCount, actualCount)
-	}
-}
-
 // ---- 5b. TestAgenticSplitAndList ----
 // Validates the real agent workflow: create session, split pane, list panes,
-// execute command in split — all within agentic scope.
+// execute command in split. It used to prove those tools were reachable at
+// -scope agentic; with one surface left it proves the workflow itself.
 
 func TestAgenticSplitAndList(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	c := newMCPClientCustomScope(t, "agentic")
+	c := newMCPClient(t)
 
 	// Create session.
 	sess := createSession(t, c, uniqueSession(t))
 	paneID := sess["paneId"].(string)
 	sessionID := sess["sessionId"].(string)
 
-	// Split pane — this was previously missing from agentic scope.
+	// Split pane.
 	var split map[string]any
 	c.callToolJSON(t, "split-pane", map[string]any{
 		"paneId":    paneID,
@@ -314,7 +171,7 @@ func TestAgenticSplitAndList(t *testing.T) {
 		t.Fatal("split-pane returned the same paneId as the original")
 	}
 
-	// List windows — also previously missing from agentic scope.
+	// List windows.
 	var windows []map[string]any
 	c.callToolJSON(t, "list-windows", map[string]any{"sessionId": sessionID}, &windows)
 	if len(windows) == 0 {
@@ -344,7 +201,7 @@ func TestAgenticSplitAndList(t *testing.T) {
 		t.Fatalf("expected exit code 0, got %d", exitCode)
 	}
 
-	// Kill the split pane — also previously missing from agentic scope.
+	// Kill the split pane.
 	c.callToolJSON(t, "kill-pane", map[string]any{"paneId": splitPaneID}, &map[string]any{})
 
 	// Verify only original pane remains.
@@ -352,31 +209,6 @@ func TestAgenticSplitAndList(t *testing.T) {
 	c.callToolJSON(t, "list-panes", map[string]any{"windowId": windowID}, &panesAfter)
 	if len(panesAfter) != 1 {
 		t.Fatalf("expected 1 pane after kill, got %d", len(panesAfter))
-	}
-}
-
-// ---- 6. TestScopePrimitives ----
-
-func TestScopePrimitives(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClientCustomScope(t, "primitives")
-	names := toolNames(t, c)
-
-	if !names["send-keys"] {
-		t.Error("primitives scope: expected 'send-keys' to be present")
-	}
-
-	agenticOnly := []string{
-		"start-and-watch",
-		"watch-pane",
-		"close-pane",
-	}
-	for _, tool := range agenticOnly {
-		if names[tool] {
-			t.Errorf("primitives scope: expected tool %q to be absent (agentic only), but it is present", tool)
-		}
 	}
 }
 

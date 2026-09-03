@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -42,7 +41,6 @@ func resolveVersion() string {
 
 func main() {
 	shellType := flag.String("shell-type", "bash", "Shell type for exit code capture (bash/zsh/fish)")
-	scope := flag.String("scope", "", "Tool scope: agentic (default), primitives, or all")
 	channelMode := flag.Bool("channel", false, "Enable Claude Code channel mode: push tmux events as channel notifications")
 	showVersion := flag.Bool("version", false, "Print the version and exit")
 	flag.Parse()
@@ -52,31 +50,19 @@ func main() {
 		return
 	}
 
-	// Resolve scope: flag > env > default
-	scopeVal := *scope
-	if scopeVal == "" {
-		scopeVal = os.Getenv("TMUX_MCP_SCOPE")
-	}
-	if scopeVal == "" {
-		scopeVal = "agentic"
-	}
-
-	switch scopeVal {
-	case "agentic", "primitives", "all":
-		// valid
-	default:
-		log.Fatalf("invalid scope %q: must be one of agentic, primitives, or all", scopeVal)
-	}
-
 	// Clean up any stale headless socket from a previous crash.
 	CleanStaleHeadlessSocket()
 
 	client := newTmuxClient(*shellType)
 
+	// Resource capabilities are NOT advertised: this server registers no
+	// resources. The two it used to serve were tmux://sessions and the
+	// tmux://pane/{paneId} template, and the template is a paneId in the
+	// surface — the one thing this contract does not have. Advertising an empty
+	// capability would tell a client to call resources/list for nothing.
 	var serverOpts []server.ServerOption
 	serverOpts = append(serverOpts,
 		server.WithToolCapabilities(true),
-		server.WithResourceCapabilities(true, true),
 	)
 
 	if *channelMode {
@@ -101,17 +87,7 @@ func main() {
 
 	emitter := newChannelEmitter(*channelMode, s)
 
-	switch scopeVal {
-	case "primitives":
-		registerTools(s, client, emitter)
-	case "agentic":
-		registerAgenticScope(s, client, emitter)
-	case "all":
-		registerTools(s, client, emitter)
-		registerAgentTools(s, client, emitter)
-	}
-
-	registerResources(s, client)
+	registerAgenticScope(s, client, emitter)
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("server error: %v", err)
@@ -120,29 +96,14 @@ func main() {
 
 // ---- Tool registration ----
 
-// registerTools registers all 17 Layer 1 (primitive) tools.
-func registerTools(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
-	registerListSessions(s, client)
-	registerCreateHeadless(s, client)
-	registerKillHeadlessServer(s, client)
-	registerListWindows(s, client)
-	registerListPanes(s, client)
-	registerCapturePane(s, client)
-	registerCreateSession(s, client)
-	registerCreateWindow(s, client)
-	registerSplitPane(s, client)
-	registerSendKeys(s, client)
-	registerExecuteCommand(s, client)
-	registerResizePane(s, client)
-	registerRenameSession(s, client)
-	registerKillSession(s, client)
-	registerKillWindow(s, client)
-	registerKillPane(s, client)
-	registerScreenshotPane(s, client)
-}
-
-// registerAgenticScope registers the 7 Layer 2 tools plus essential Layer 1
-// tools. This is the default scope.
+// registerAgenticScope is the ONE registration path. The binary serves a single
+// surface, so there is nothing to choose between and nothing to dispatch on.
+//
+// The `-scope` flag, TMUX_MCP_SCOPE and the seventeen raw-tmux tools they
+// selected are gone, not disabled: the raw surface was an experiment, and an
+// agent that wants to drive tmux directly already has the tmux CLI. A flag kept
+// alive to accept one value teaches its reader that the others existed and might
+// come back, which is the compatibility layer this change refuses to ship.
 func registerAgenticScope(s *server.MCPServer, client *tmuxClient, emitter *ChannelEmitter) {
 	// Essential Layer 1 tools
 	registerListSessions(s, client)
@@ -362,30 +323,6 @@ func registerCreateSession(s *server.MCPServer, client *tmuxClient) {
 	})
 }
 
-func registerCreateWindow(s *server.MCPServer, client *tmuxClient) {
-	s.AddTool(mcp.NewTool("create-window",
-		mcp.WithDescription("Create a new window in a tmux session"),
-		mcp.WithString("sessionId",
-			mcp.Required(),
-			mcp.Description("Session ID or name"),
-		),
-		mcp.WithString("name",
-			mcp.Description("Window name (optional)"),
-		),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sessionID, err := req.RequireString("sessionId")
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		name := req.GetString("name", "")
-		created, err := client.CreateWindow(ctx, sessionID, name)
-		if err != nil {
-			return mcp.NewToolResultErrorFromErr("failed to create window", err), nil
-		}
-		return jsonResult(created)
-	})
-}
-
 func registerSplitPane(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("split-pane",
 		mcp.WithDescription("Get a pane to work in, beside the agent, in the window the user is already looking at. With no arguments it returns helper slot 1, creating it if needed; slot:2, slot:3 … give further panes. Repeated calls for the same slot return the SAME pane (\"reused\": true), so a process started there is still there next time. Pass paneId only to split a specific pane, in which case direction and size apply and the new pane is unslotted."),
@@ -566,91 +503,6 @@ func registerExecuteCommand(s *server.MCPServer, client *tmuxClient) {
 	})
 }
 
-func registerResizePane(s *server.MCPServer, client *tmuxClient) {
-	s.AddTool(mcp.NewTool("resize-pane",
-		mcp.WithDescription("Resize a tmux pane. Use width+height for absolute size, or direction+amount for relative adjustment"),
-		mcp.WithString("paneId",
-			mcp.Required(),
-			mcp.Description("Pane ID to resize"),
-		),
-		mcp.WithNumber("width",
-			mcp.Description("Absolute width in columns (use with height for absolute resize)"),
-		),
-		mcp.WithNumber("height",
-			mcp.Description("Absolute height in rows (use with width for absolute resize)"),
-		),
-		mcp.WithString("direction",
-			mcp.Description("Resize direction for relative resize: U (up), D (down), L (left), R (right)"),
-			mcp.Enum("U", "D", "L", "R"),
-		),
-		mcp.WithNumber("amount",
-			mcp.Description("Amount of cells to resize by (for relative resize, default 5)"),
-		),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		paneID, err := req.RequireString("paneId")
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		args := req.GetArguments()
-		_, hasWidth := args["width"]
-		_, hasHeight := args["height"]
-		_, hasDirection := args["direction"]
-
-		switch {
-		case hasWidth && hasHeight:
-			width := req.GetInt("width", 0)
-			height := req.GetInt("height", 0)
-			if width <= 0 || height <= 0 {
-				return mcp.NewToolResultError("width and height must be positive integers"), nil
-			}
-			if err := client.ResizePaneAbsolute(ctx, paneID, width, height); err != nil {
-				return mcp.NewToolResultErrorFromErr("failed to resize pane", err), nil
-			}
-		case hasDirection:
-			direction, _ := req.RequireString("direction")
-			amount := req.GetInt("amount", 5)
-			if err := client.ResizePaneRelative(ctx, paneID, direction, amount); err != nil {
-				return mcp.NewToolResultErrorFromErr("failed to resize pane", err), nil
-			}
-		default:
-			return mcp.NewToolResultError("provide either width+height (absolute) or direction+amount (relative)"), nil
-		}
-		return jsonResult(struct {
-			PaneID string `json:"paneId"`
-		}{PaneID: paneID})
-	})
-}
-
-func registerRenameSession(s *server.MCPServer, client *tmuxClient) {
-	s.AddTool(mcp.NewTool("rename-session",
-		mcp.WithDescription("Rename a tmux session"),
-		mcp.WithString("sessionId",
-			mcp.Required(),
-			mcp.Description("Session ID or current name"),
-		),
-		mcp.WithString("newName",
-			mcp.Required(),
-			mcp.Description("New session name"),
-		),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sessionID, err := req.RequireString("sessionId")
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		newName, err := req.RequireString("newName")
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		if err := client.RenameSession(ctx, sessionID, newName); err != nil {
-			return mcp.NewToolResultErrorFromErr("failed to rename session", err), nil
-		}
-		return jsonResult(struct {
-			SessionID string `json:"sessionId"`
-			Name      string `json:"name"`
-		}{SessionID: sessionID, Name: newName})
-	})
-}
-
 func registerKillSession(s *server.MCPServer, client *tmuxClient) {
 	s.AddTool(mcp.NewTool("kill-session",
 		mcp.WithDescription("Kill a tmux session and all its windows and panes"),
@@ -670,28 +522,6 @@ func registerKillSession(s *server.MCPServer, client *tmuxClient) {
 		return jsonResult(struct {
 			Killed string `json:"killed"`
 		}{Killed: sessionID})
-	})
-}
-
-func registerKillWindow(s *server.MCPServer, client *tmuxClient) {
-	s.AddTool(mcp.NewTool("kill-window",
-		mcp.WithDescription("Kill a tmux window and all its panes"),
-		mcp.WithString("windowId",
-			mcp.Required(),
-			mcp.Description("Window ID or target to kill"),
-		),
-		mcp.WithDestructiveHintAnnotation(true),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		windowID, err := req.RequireString("windowId")
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		if err := client.KillWindow(ctx, windowID); err != nil {
-			return mcp.NewToolResultErrorFromErr("failed to kill window", err), nil
-		}
-		return jsonResult(struct {
-			Killed string `json:"killed"`
-		}{Killed: windowID})
 	})
 }
 
@@ -758,60 +588,6 @@ func registerScreenshotPane(s *server.MCPServer, client *tmuxClient) {
 	})
 }
 
-// ---- Resource registration ----
-
-func registerResources(s *server.MCPServer, client *tmuxClient) {
-	// tmux://sessions — static resource
-	s.AddResource(
-		mcp.NewResource("tmux://sessions", "tmux sessions",
-			mcp.WithResourceDescription("List of all active tmux sessions"),
-			mcp.WithMIMEType("application/json"),
-		),
-		func(ctx context.Context, _ mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-			sessions, err := client.ListSessions(ctx)
-			if err != nil {
-				return nil, err
-			}
-			data, err := json.Marshal(sessions)
-			if err != nil {
-				return nil, fmt.Errorf("marshal sessions: %w", err)
-			}
-			return []mcp.ResourceContents{
-				mcp.TextResourceContents{
-					URI:      "tmux://sessions",
-					MIMEType: "application/json",
-					Text:     string(data),
-				},
-			}, nil
-		},
-	)
-
-	// tmux://pane/{paneId} — template resource
-	s.AddResourceTemplate(
-		mcp.NewResourceTemplate("tmux://pane/{paneId}", "tmux pane content",
-			mcp.WithTemplateDescription("Current terminal content of a tmux pane"),
-			mcp.WithTemplateMIMEType("text/plain"),
-		),
-		func(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-			paneID := extractTemplateVar(req.Params.URI, "tmux://pane/")
-			if paneID == "" {
-				return nil, fmt.Errorf("missing pane ID in URI: %s", req.Params.URI)
-			}
-			content, err := client.CapturePane(ctx, paneID, 0, false)
-			if err != nil {
-				return nil, err
-			}
-			return []mcp.ResourceContents{
-				mcp.TextResourceContents{
-					URI:      req.Params.URI,
-					MIMEType: "text/plain",
-					Text:     content,
-				},
-			}, nil
-		},
-	)
-}
-
 // ---- Helpers ----
 
 // jsonResult marshals v to indented JSON and returns it as a tool result.
@@ -821,12 +597,4 @@ func jsonResult(v any) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultErrorFromErr("failed to serialize result", err), nil
 	}
 	return mcp.NewToolResultText(string(data)), nil
-}
-
-// extractTemplateVar strips a URI prefix to obtain the variable portion.
-func extractTemplateVar(uri, prefix string) string {
-	if len(uri) <= len(prefix) {
-		return ""
-	}
-	return uri[len(prefix):]
 }

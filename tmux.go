@@ -799,30 +799,6 @@ func (t *tmuxClient) wrapCommand(command, outFile, exitFile, waitChannel string)
 	}
 }
 
-// ResizePaneAbsolute resizes a pane to exact dimensions in columns and rows.
-func (t *tmuxClient) ResizePaneAbsolute(ctx context.Context, paneID string, width, height int) error {
-	socket, bareID := parseTarget(paneID)
-	_, err := t.runWithSocket(ctx, socket, "resize-pane", "-t", bareID,
-		"-x", strconv.Itoa(width),
-		"-y", strconv.Itoa(height))
-	return err
-}
-
-// ResizePaneRelative adjusts a pane size in the given direction.
-// direction must be one of U, D, L, R.
-func (t *tmuxClient) ResizePaneRelative(ctx context.Context, paneID, direction string, amount int) error {
-	socket, bareID := parseTarget(paneID)
-	_, err := t.runWithSocket(ctx, socket, "resize-pane", "-t", bareID, "-"+strings.ToUpper(direction), strconv.Itoa(amount))
-	return err
-}
-
-// RenameSession renames a tmux session.
-func (t *tmuxClient) RenameSession(ctx context.Context, sessionID, newName string) error {
-	socket, bareID := parseTarget(sessionID)
-	_, err := t.runWithSocket(ctx, socket, "rename-session", "-t", bareID, newName)
-	return err
-}
-
 // KillSession kills a tmux session and all its windows.
 // It accepts session IDs ($N), prefixed IDs (headless:$N), or session names.
 func (t *tmuxClient) KillSession(ctx context.Context, sessionID string) error {
@@ -857,13 +833,6 @@ func (t *tmuxClient) resolveSessionTarget(ctx context.Context, socket, target st
 		}
 	}
 	return "", fmt.Errorf("session not found: %s", target)
-}
-
-// KillWindow kills a tmux window and all its panes.
-func (t *tmuxClient) KillWindow(ctx context.Context, windowID string) error {
-	socket, bareID := parseTarget(windowID)
-	_, err := t.runWithSocket(ctx, socket, "kill-window", "-t", bareID)
-	return err
 }
 
 // KillPane kills a tmux pane.

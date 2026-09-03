@@ -206,7 +206,7 @@ func startMCPClient(t *testing.T, extraEnv []string, extraArgs ...string) *mcpCl
 		shellType = "fish"
 	}
 
-	args := append([]string{"--shell-type=" + shellType, "--scope=all"}, extraArgs...)
+	args := append([]string{"--shell-type=" + shellType}, extraArgs...)
 	cmd := exec.Command(testBinaryPath, args...)
 	if len(extraEnv) > 0 {
 		cmd.Env = append(os.Environ(), extraEnv...)
@@ -530,27 +530,6 @@ func TestCreateAndKillSession(t *testing.T) {
 	}
 }
 
-func TestCreateWindow(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-
-	var win map[string]any
-	c.callToolJSON(t, "create-window", map[string]any{
-		"sessionId": sess["sessionId"],
-		"name":      "test-win",
-	}, &win)
-
-	if win["windowId"] == nil {
-		t.Fatal("no windowId returned from create-window")
-	}
-	if win["paneId"] == nil {
-		t.Fatal("no paneId returned from create-window")
-	}
-}
-
 func TestSplitPane(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
@@ -723,87 +702,6 @@ func TestCapturePane(t *testing.T) {
 	text := c.callToolText(t, "capture-pane", map[string]any{"paneId": paneID})
 	if !strings.Contains(text, "capture-test-marker") {
 		t.Fatalf("capture-pane result does not contain 'capture-test-marker'\noutput:\n%s", text)
-	}
-}
-
-func TestResizePane(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
-	windowID := sess["windowId"].(string)
-
-	// Vertical split (top-bottom) so both width and height can be adjusted.
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneID,
-		"direction": "vertical",
-	}, &split)
-	splitPaneID := split["paneId"].(string)
-
-	// Resize the lower pane to 40 columns wide and 10 rows tall using absolute
-	// dimensions. In a vertical split panes share width; tmux will honour the
-	// height request and clamp width to the window width.
-	c.callToolJSON(t, "resize-pane", map[string]any{
-		"paneId": splitPaneID,
-		"width":  40,
-		"height": 10,
-	}, &map[string]any{})
-
-	// list-panes to verify new height (width is clamped by tmux to window width).
-	var panes []map[string]any
-	c.callToolJSON(t, "list-panes", map[string]any{"windowId": windowID}, &panes)
-
-	var resizedPane map[string]any
-	for _, p := range panes {
-		if p["id"] == splitPaneID {
-			resizedPane = p
-			break
-		}
-	}
-	if resizedPane == nil {
-		t.Fatal("resized pane not found in list-panes")
-	}
-	h, _ := resizedPane["height"].(float64)
-	if int(h) != 10 {
-		t.Fatalf("expected height 10, got %v", h)
-	}
-}
-
-func TestRenameSession(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	origName := uniqueSession(t)
-	sess := createSession(t, c, origName)
-	sessionID := sess["sessionId"].(string)
-
-	newName := origName + "-renamed"
-	var renamed map[string]any
-	c.callToolJSON(t, "rename-session", map[string]any{
-		"sessionId": sessionID,
-		"newName":   newName,
-	}, &renamed)
-
-	if renamed["name"] != newName {
-		t.Fatalf("expected name %q, got %q", newName, renamed["name"])
-	}
-
-	// Verify the new name appears in list-sessions.
-	var sessions []map[string]any
-	c.callToolJSON(t, "list-sessions", map[string]any{}, &sessions)
-	found := false
-	for _, s := range sessions {
-		if s["name"] == newName {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("session with new name %q not found in list-sessions", newName)
 	}
 }
 
@@ -1361,7 +1259,7 @@ func startMCPProcess(t *testing.T, extraArgs ...string) *mcpClient {
 		shellType = "fish"
 	}
 
-	args := append([]string{"--shell-type=" + shellType, "--scope=all"}, extraArgs...)
+	args := append([]string{"--shell-type=" + shellType}, extraArgs...)
 	cmd := exec.Command(testBinaryPath, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
