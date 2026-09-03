@@ -42,18 +42,39 @@ type slots struct {
 
 func newSlots(b Backend) *slots { return &slots{b: b} }
 
-// errNotInTmux is returned whenever a call needs the server's own pane and there
-// is none.
+// errNoWindow is returned whenever a call needs the server's own pane and there
+// is none. It is an INTERNAL sentinel: its text never reaches a caller, because
+// "there is no window" is not by itself a failure — a pane with no window is
+// exactly what an invisible slot is — and only a request that needed a VISIBLE
+// pane turns it into a message.
 //
-// The message names the two alternatives on purpose. The incident this design
-// comes from began with an agent that could not tell "I am not in tmux" from "I
-// passed the wrong argument", and responded by shelling out to raw tmux to find
-// out — which is the behaviour every tool in this server exists to make
-// unnecessary. An error that says only "no pane" invites exactly that guessing;
-// one that names the two ways forward ends the exchange.
-var errNotInTmux = errors.New(
-	"this server is not running inside tmux ($TMUX_PANE is unset), so it has no window to " +
-		"place a pane in — pass an explicit paneId, or use headless:true / create-headless")
+// Callers test it with errors.Is and hand the caller errNoWindowText instead.
+var errNoWindow = errors.New("this server is not running inside tmux ($TMUX_PANE is unset)")
+
+// errNoWindowText is the one sentence a caller sees when it asked for a pane in
+// the user's window and there is no window.
+//
+// It names the way forward on purpose, and that property is older than this
+// contract. The incident this design comes from began with an agent that could
+// not tell "I am not in tmux" from "I passed the wrong argument", and responded
+// by shelling out to raw tmux to find out — the behaviour every tool in this
+// server exists to make unnecessary. An error that says only "no pane" invites
+// exactly that guessing. The predecessor of this sentence named three routes —
+// paneId, headless:true and create-headless — and all three are deleted by this
+// release, so it would have directed an agent to three things that do not exist.
+const errNoWindowText = "no window to place a pane in: this server is not running inside tmux — " +
+	"use isolated: true"
+
+// visibleError maps the internal sentinel onto that sentence. It is applied
+// where a request that needed the user's window fails, and nowhere else: a path
+// that can proceed without a window must test errNoWindow and carry on rather
+// than dressing it up as a message.
+func visibleError(err error) error {
+	if errors.Is(err, errNoWindow) {
+		return errors.New(errNoWindowText)
+	}
+	return err
+}
 
 // The window scope did not go away with selfWindow; it moved onto the port.
 //
@@ -173,8 +194,34 @@ func (s *slots) resolveHelperNoCreateLocked(
 ) (paneRecord, bool, error) {
 	reg, err := s.b.Records(ctx, self)
 	if err != nil {
-		return paneRecord{}, false, fmt.Errorf("read the pane registry: %w", err)
+		return paneRecord{}, false, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
 	}
+
+	// The server's own pane is CONSIDERED here, and teardown is the only lookup
+	// that considers it. Every other path excludes it — reuse must never hand it
+	// back, acquisition must never claim it, the "all" sweep must never touch it,
+	// list-slots must not report it — and here exclusion is wrong for a reason
+	// that does not apply to any of those.
+	//
+	// A subagent started into an outer agent's slot-1 pane inherits a valid
+	// agent-owned record on the pane it is running in. Skipping it makes
+	// close-pane({slot:1}) answer {"action":"none"}, which says "slot 1 is
+	// empty" — and what an agent does next with an empty slot is open one. The
+	// truth is the opposite: slot 1 is the pane this request arrived through, and
+	// closeHelperLocked is where that is said, in the sentence written for it.
+	// Routing the record there rather than dropping it is what keeps that guard
+	// reachable now that close-pane({paneId}) — its only other route — is gone.
+	//
+	// It is returned WITHOUT clearing the stale marker, because unslotting is a
+	// mutation and a refused teardown must not leave one behind. The next
+	// resolution clears it through slotCandidateLocked, which is where the
+	// healing belongs.
+	if !self.empty() {
+		if rec, ok := reg[self]; ok && rec.Slot == slot {
+			return rec, true, nil
+		}
+	}
+
 	rec, ok := s.closeCandidateLocked(ctx, slot, self, reg)
 	return rec, ok, nil
 }
@@ -199,7 +246,7 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int) (paneRef, int
 
 	reg, err := s.b.Records(ctx, self)
 	if err != nil {
-		return paneRef{}, 0, false, "", fmt.Errorf("read the pane registry: %w", err)
+		return paneRef{}, 0, false, "", fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
 	}
 
 	// Reuse.
@@ -224,7 +271,7 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int) (paneRef, int
 	place := s.placementForSlot(ctx, reg, slot, self)
 	pane, err := s.b.OpenBeside(ctx, place)
 	if err != nil {
-		return paneRef{}, 0, false, "", fmt.Errorf("create helper pane for slot %d: %w", slot, err)
+		return paneRef{}, 0, false, "", fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
 	_ = s.b.SetSlot(ctx, pane, slot)
 	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
@@ -253,12 +300,12 @@ func (s *slots) helperResult(
 	pane, self paneRef, slot int, created bool, owner string,
 ) (paneRef, int, bool, string, error) {
 	if pane == self {
-		// %s on a paneRef prints "<pane>", not an id, and that is the point: this
-		// sentence reaches the model. The slot number is the handle the caller
-		// has; the sentence itself is rewritten by the contract commit.
+		// The slot number is the whole handle: the pane is not named here, because
+		// this sentence reaches the model and a pane id in it is a pane id in the
+		// model's context. (paneRef's String prints "<pane>" as a second line of
+		// defence, so even a careless %s here could not leak one.)
 		return paneRef{}, 0, false, "", fmt.Errorf(
-			"internal error: slot %d resolved to this server's own pane %s; refusing to return it",
-			slot, pane)
+			"internal error: slot %d resolved to this server's own pane; refusing to return it", slot)
 	}
 	return pane, slot, created, owner, nil
 }
@@ -614,7 +661,7 @@ func sameUIDAsAgent(state *PaneState) bool {
 //
 // Only the anchor can be missing, and every fallback chain terminates at self,
 // which cannot be missing: resolveHelperLocked has already failed with
-// errNotInTmux if there were no self pane. So a slot-2 request made while slot 1
+// errNoWindow if there were no self pane. So a slot-2 request made while slot 1
 // does not exist produces exactly one pane, placed where slot 1 would have gone
 // and marked slot 2.
 //
@@ -717,14 +764,12 @@ const (
 	actionError    = "error"
 )
 
-// errCloseSelfPane is the refusal close-pane returns when it is pointed at the
-// pane this server is running in.
-//
-// It is a sentinel rather than a bare message because the two call shapes need
-// the same refusal in different packaging: a caller that named the pane
-// explicitly gets it as the whole answer, so it cannot be mistaken for success,
-// while a batch teardown records it as one entry and carries on with the rest.
-var errCloseSelfPane = errors.New("refusing to close this server's own pane")
+// The self refusal used to be a sentinel error, errCloseSelfPane, because two
+// call shapes needed the same refusal in different packaging: the explicit
+// close-pane({paneId}) form raised it as the whole answer, while a batch
+// teardown recorded it as one entry and carried on. There is one call shape now
+// — every close is by slot — so the refusal is one entry with action:"error",
+// and a sentinel nothing tests for is a sentinel that rots.
 
 // closeHelperLocked releases one helper pane according to who owns it. The
 // caller must hold slotMu and must pass the self pane it read inside that hold.
@@ -759,28 +804,25 @@ var errCloseSelfPane = errors.New("refusing to close this server's own pane")
 // record checking can catch this; only the identity comparison can.
 //
 // self arrives as a parameter for the same reason helperResult takes one: it is
-// read once per call, from selfWindow, under the lock — and a future teardown
-// path cannot compile without deciding what to pass, which is the compiler
-// asking whether it has thought about this. An empty self means the server is
-// not running in tmux at all, so there is no own pane to protect and the guard
-// is correctly vacuous; closePanes is where that case is established.
+// read once per call, from the port, under the lock — and a future teardown path
+// cannot compile without deciding what to pass, which is the compiler asking
+// whether it has thought about this. An empty self means the server is not
+// running in tmux at all, so there is no own pane to protect and the guard is
+// correctly vacuous; closePanes is where that case is established.
 //
-// kill-pane remains the deliberate way to destroy any pane, including this one.
-// It keeps its blunt signature — paneId required, no slot, no default — precisely
-// so that destroying something is never the accidental outcome of a tidy-up.
+// Both refusals below name the SLOT and nothing else. They reach the caller
+// verbatim through closedPane.Detail, so an id in either would be an id in the
+// model's context — and the previous text also pointed the agent at kill-pane,
+// a tool this release deletes. An error that names a tool which does not exist
+// is the same failure as an error that says only "no": it sends the agent
+// looking for another route, and the route it finds is raw tmux.
 func (s *slots) closeHelperLocked(ctx context.Context, rec paneRecord, self paneRef) (string, error) {
 	if !self.empty() && rec.Ref == self {
-		// The %s verbs below print "<pane>": closedPane.Detail carries this
-		// verbatim to the caller, so an id here would be an id in the model's
-		// context. Both sentences are replaced wholesale by the contract commit,
-		// which also removes the pointer to kill-pane.
 		return actionError, fmt.Errorf(
-			"%w: %s is the pane this server is running in, and closing it would kill the session "+
-				"this very request arrived through — the conversation and everything in it. A pane "+
-				"created by an outer agent carries a perfectly valid agent-owned record, so the "+
-				"record is not what makes a pane safe to close. Use kill-pane if destroying it is "+
-				"genuinely what you want",
-			errCloseSelfPane, rec.Ref)
+			"slot %d is the pane this server is running in, and closing it would kill the session "+
+				"this request arrived through. A pane created by an outer agent carries a perfectly "+
+				"valid agent-owned record, so the record is not what makes a pane safe to close.",
+			rec.Slot)
 	}
 	switch rec.Owner {
 	case ownerAgent:
@@ -796,8 +838,7 @@ func (s *slots) closeHelperLocked(ctx context.Context, rec paneRecord, self pane
 	default:
 		// Unreachable: every caller checks for a record first, and a record with
 		// an unrecognised owner never leaves the registry readers.
-		return actionNone, fmt.Errorf("pane %s has owner %q, which this binary does not manage",
-			rec.Ref, rec.Owner)
+		return actionNone, fmt.Errorf("slot %d is held by a pane this binary does not manage", rec.Slot)
 	}
 }
 
@@ -838,11 +879,18 @@ func (s *slots) releaseAcquiredLocked(ctx context.Context, rec paneRecord) error
 	return nil
 }
 
-// closeSelector names what close-pane was asked to close. Exactly one form
-// applies, in the order the tool documents: an explicit pane wins, then "all",
-// then a slot number (1 when the caller named nothing at all).
+// closeSelector names what close-pane was asked to close: every slot, or one of
+// them (1 when the caller named nothing at all).
+//
+// The third form — an explicit pane the caller named — is gone with paneId, and
+// what went with it is the refusal that made it safe: a pane carrying no
+// registry record was REFUSED rather than killed, because killing it would have
+// made close-pane a second kill-pane with a friendlier name and a wider blast
+// radius. An agent reaching for "close the pane I am finished with" would
+// eventually have pointed it at one of the user's. That whole class of mistake
+// is now unreachable rather than guarded: a caller cannot name a pane, so it
+// cannot name the wrong one.
 type closeSelector struct {
-	Pane paneRef
 	All  bool
 	Slot int
 }
@@ -880,27 +928,25 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 	// One read of "which pane am I", used for the guard in closeHelperLocked and
 	// as the scope every slot form is resolved around.
 	//
-	// Not being in tmux is fatal to the two window-scoped forms — there is no
-	// window to enumerate and no slot to resolve — but an explicit pane names
-	// itself absolutely and must keep working, because that is how a headless
-	// pane is closed by a server that was never in tmux to begin with. There is
-	// no own pane to protect in that case, so the guard has nothing to do.
-	//
-	// Any OTHER failure refuses every form, including the explicit one. It means
-	// we could not establish which pane is ours, and the self guard is the only
-	// thing standing between close-pane and the agent's own session: a guard that
+	// Every failure refuses, and both halves of that have a reason. Without a
+	// window there is nothing to enumerate and no slot to resolve, so neither
+	// form could be satisfied by anything; and any other failure means we could
+	// not establish which pane is ours, where the self guard is the only thing
+	// standing between close-pane and the agent's own session — a guard that
 	// cannot be evaluated must not be skipped.
+	//
+	// The no-window half becomes a SKIP rather than a refusal once invisible
+	// slots exist: those live on a socket with no window at all, so a server that
+	// was never in tmux still has panes of its own to close. Until then, skipping
+	// would report success for a request nothing could have acted on. The
+	// tolerated case this replaces was the explicit paneId form, which is how a
+	// headless pane used to be closed from outside tmux, and it is gone with it.
 	self, err := s.b.Self(ctx)
 	if err != nil {
-		if sel.Pane.empty() || !errors.Is(err, errNotInTmux) {
-			return nil, err
-		}
-		self = paneRef{}
+		return nil, visibleError(err)
 	}
 
 	switch {
-	case !sel.Pane.empty():
-		return s.closeExplicitLocked(ctx, sel.Pane, self)
 	case sel.All:
 		recs, err := s.slottedHelpersInSelfWindowLocked(ctx, self)
 		if err != nil {
@@ -912,8 +958,7 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 			// at the first problem leaves the caller worse off than one that
 			// continues and reports: the panes after the failure would stay open
 			// with no indication that they had not been considered.
-			entry, _ := s.closeOneLocked(ctx, rec, self)
-			closed = append(closed, entry)
+			closed = append(closed, s.closeOneLocked(ctx, rec, self))
 		}
 		return closed, nil
 	default:
@@ -926,54 +971,27 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 			// 2 was never opened is a request that has already been satisfied.
 			return []closedPane{{Slot: sel.Slot, Action: actionNone}}, nil
 		}
-		entry, _ := s.closeOneLocked(ctx, rec, self)
-		return []closedPane{entry}, nil
+		return []closedPane{s.closeOneLocked(ctx, rec, self)}, nil
 	}
 }
 
-// closeExplicitLocked closes the one pane a caller named. The caller must hold
+// closeOneLocked turns one record into one response entry. The caller must hold
 // slotMu.
 //
-// The refusal of a pane with no registry record is what keeps close-pane from
-// becoming a second kill-pane with a friendlier name and a wider blast radius —
-// see registerClosePane. The self refusal is raised to a tool error here for the
-// same reason: a caller that named a pane and got back an entry saying
-// action:"error" could reasonably read the array as "teardown ran", whereas an
-// error is unmistakable. In a batch the same refusal stays an entry, because one
-// pane must not stop the sweep.
-func (s *slots) closeExplicitLocked(ctx context.Context, pane, self paneRef) ([]closedPane, error) {
-	rec, found, err := s.b.RecordFor(ctx, pane)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read pane record: %w", err)
-	}
-	if !found {
-		// "<pane>", again by construction — see closeHelperLocked. This whole
-		// branch goes when the explicit-pane form does.
-		return nil, fmt.Errorf(
-			"pane %s is not one of this server's helper panes (it carries no "+
-				"@mcp_pane/@mcp_owner record) — refusing to close it; use kill-pane if you "+
-				"are certain", pane)
-	}
-	entry, err := s.closeOneLocked(ctx, rec, self)
-	if errors.Is(err, errCloseSelfPane) {
-		return nil, err
-	}
-	return []closedPane{entry}, nil
-}
-
-// closeOneLocked turns one record into one response entry, and hands back the
-// error as well. Both halves are needed: the entry is what a batch teardown
-// reports and carries on from, while the error is how the explicit branch tells
-// the self refusal apart from an ordinary tmux failure. The caller must hold
-// slotMu.
-func (s *slots) closeOneLocked(ctx context.Context, rec paneRecord, self paneRef) (closedPane, error) {
+// It reports no error to its caller, and that is the whole teardown contract in
+// one line: a refusal or a failure is an ENTRY, with action:"error" and the
+// reason in detail, so a sweep of five slots reports five answers rather than
+// stopping at the first. The explicit-paneId form used to need the error as
+// well — a caller that named one pane and got back an array could read even an
+// error entry as "teardown ran" — and it went with paneId.
+func (s *slots) closeOneLocked(ctx context.Context, rec paneRecord, self paneRef) closedPane {
 	action, err := s.closeHelperLocked(ctx, rec, self)
-	entry := closedPane{PaneID: rec.Ref.target(), Slot: rec.Slot, Action: action}
+	entry := closedPane{Slot: rec.Slot, Action: action}
 	if err != nil {
 		entry.Action = actionError
 		entry.Detail = err.Error()
 	}
-	return entry, err
+	return entry
 }
 
 // slottedHelpersInSelfWindowLocked returns every slotted helper in the window
@@ -1024,6 +1042,101 @@ func (s *slots) slottedHelpersInSelfWindowLocked(
 		return recs[i].Seq < recs[j].Seq
 	})
 	return recs, nil
+}
+
+// ---- The registry, as the caller sees it ----
+
+// Origins, as reported by list-slots. They are WIRE words rather than the
+// internal owner values, so the vocabulary teardown keys off — ownerAgent is
+// killed, ownerAcquired is released — does not leak into a listing, where the
+// only thing a caller needs to know is where the pane came from.
+const (
+	originCreated = "created"
+	originAdopted = "adopted"
+)
+
+// listSlots answers list-slots, and takes slotMu because reading the registry
+// here is mildly MUTATING. See listSlotsLocked.
+func (s *slots) listSlots(ctx context.Context) ([]slotListing, error) {
+	s.slotMu.Lock()
+	defer s.slotMu.Unlock()
+
+	self, err := s.b.Self(ctx)
+	if err != nil {
+		return nil, visibleError(err)
+	}
+	return s.listSlotsLocked(ctx, self)
+}
+
+// listSlotsLocked returns one canonical entry per occupied slot, ascending. The
+// caller must hold slotMu and pass the self it read inside that hold.
+//
+// Printing the registry as it is read would let this tool disagree with the
+// resolver, which is worse than the tool not existing: two entries for one slot
+// when two servers raced for it, and an entry for a slot whose only holder is
+// this server's own pane — a record the next resolution would clear. An agent
+// that then addressed that slot would be answered about a different pane than
+// the one it had just been shown.
+//
+// So it runs the same two repairs resolution runs, through the same functions:
+// self-exclusion clears a stale marker off our own pane, and duplicate healing
+// keeps the oldest holder and retires the rest (releasing an adopted loser
+// rather than stranding it). That makes a read mildly mutating, which is why
+// list-slots carries no readOnlyHint.
+//
+// A slot holding only a dead pane is LISTED, with isAlive:false. The corpse is
+// what the user is looking at and what close-pane exists to reap; answering
+// "slot 2 is empty" would conflate a slot that was never opened with one whose
+// process died, and those are the two facts a caller most needs to tell apart.
+func (s *slots) listSlotsLocked(ctx context.Context, self paneRef) ([]slotListing, error) {
+	reg, err := s.b.Records(ctx, self)
+	if err != nil {
+		return nil, fmt.Errorf("could not read the pane registry: %w", err)
+	}
+
+	// Every slot number the registry mentions, including any carried by our own
+	// pane: those reach closeCandidateLocked precisely so the stale marker is
+	// cleared rather than skipped and left to steer a later call.
+	seen := map[int]bool{}
+	numbers := make([]int, 0, len(reg))
+	for _, rec := range reg {
+		if rec.Slot < slotDefault || seen[rec.Slot] {
+			continue
+		}
+		seen[rec.Slot] = true
+		numbers = append(numbers, rec.Slot)
+	}
+	sort.Ints(numbers)
+
+	listings := make([]slotListing, 0, len(numbers))
+	for _, slot := range numbers {
+		rec, ok := s.closeCandidateLocked(ctx, slot, self, reg)
+		if !ok {
+			continue
+		}
+		listings = append(listings, s.listingFor(ctx, rec))
+	}
+	return listings, nil
+}
+
+// listingFor describes one slot for the caller.
+//
+// The record's own Dead flag is the fallback rather than the answer: it is a
+// tmux fact about the pane, while isAlive is a question about the PROCESS, and
+// the two differ under remain-on-exit — a pane that is very much present while
+// what the caller started in it has exited. A failed process read leaves the
+// record's answer standing, because "we could not look" must not be reported as
+// "it is gone".
+func (s *slots) listingFor(ctx context.Context, rec paneRecord) slotListing {
+	entry := slotListing{Slot: rec.Slot, Origin: originCreated, IsAlive: !rec.Dead}
+	if rec.Owner == ownerAcquired {
+		entry.Origin = originAdopted
+	}
+	if state, err := s.b.Foreground(ctx, rec.Ref); err == nil && state != nil {
+		entry.ForegroundCmd = state.ForegroundCmd
+		entry.IsAlive = state.IsAlive
+	}
+	return entry
 }
 
 // waitForShellReady blocks until a just-created pane's shell is sitting at its

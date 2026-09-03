@@ -349,17 +349,11 @@ func TestGenerateScreenshotHTMLSpecialChars(t *testing.T) {
 
 // REGRESSION: screenshot-pane opens visible browser instead of returning image — Fixed in /dev:fix session dev-fix-20260406-130232-07e187db
 func TestScreenshotPaneDefaultReturnsImage(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, _ := agentPaneFixture(t)
 
-	// Call screenshot-pane with default output mode (no "output" param).
-	raw := c.callToolRaw(t, "screenshot-pane", map[string]any{
-		"paneId": paneID,
-	})
+	// Call screenshot-pane with default output mode (no "output" param) on the
+	// default slot.
+	raw := c.callToolRaw(t, "screenshot-pane", map[string]any{})
 
 	// The result should contain image content, not just text with a file path.
 	var result struct {
@@ -384,6 +378,11 @@ func TestScreenshotPaneDefaultReturnsImage(t *testing.T) {
 			if item.Data == "" {
 				t.Error("image data is empty")
 			}
+		}
+		// The caption is one of the four paths an id escaped through that no
+		// response type covers. It names the slot now, and nothing else.
+		if idInText.MatchString(item.Text) {
+			t.Errorf("the image caption carries a pane id: %q", item.Text)
 		}
 	}
 	if !hasImage {

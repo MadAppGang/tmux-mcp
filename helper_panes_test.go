@@ -54,6 +54,24 @@ func slotFixture(t *testing.T) (*slots, paneRef) {
 // that a pane was NOT split: tmux takes the room for a new pane out of its
 // anchor, so an anchor's size before and after is the only direct evidence of
 // which pane was chosen.
+// recordFor reads one pane's registry record out of the window registry.
+//
+// It exists because Backend has no single-pane read any more: the one it had
+// served the explicit-paneId path, and when that path went the method had no
+// caller left in the product. A port method kept alive by tests is a port method
+// that invites a policy caller, so the tests do the lookup themselves — through
+// Records, which applies the same witness rule, so a record this helper returns
+// is a record resolution would also have believed.
+func recordFor(t *testing.T, sl *slots, self, pane paneRef) (paneRecord, bool) {
+	t.Helper()
+	reg, err := sl.b.Records(context.Background(), self)
+	if err != nil {
+		t.Fatalf("read the pane registry: %v", err)
+	}
+	rec, ok := reg[pane]
+	return rec, ok
+}
+
 func paneSize(t *testing.T, pane paneRef) (width, height int) {
 	t.Helper()
 	return paneCells(t, pane, "#{pane_width}\t#{pane_height}")
@@ -292,7 +310,7 @@ func TestSlotTwoNeverSplitsAnAdoptedPane(t *testing.T) {
 // back for slot 3 but does not carry @mcp_slot=3 would be re-created on the very
 // next call, and the caller's process would vanish with no error anywhere.
 func TestNumberedSlotsAreIndependent(t *testing.T) {
-	sl, _ := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
 	seen := map[paneRef]int{}
@@ -312,9 +330,9 @@ func TestNumberedSlotsAreIndependent(t *testing.T) {
 		}
 		seen[pane] = want
 
-		if rec, found, err := sl.b.RecordFor(ctx, pane); err != nil || !found || rec.Slot != want {
-			t.Errorf("pane %s does not carry slot %d back (found=%v rec=%+v err=%v)",
-				pane.target(), want, found, rec, err)
+		if rec, found := recordFor(t, sl, self, pane); !found || rec.Slot != want {
+			t.Errorf("pane %s does not carry slot %d back (found=%v rec=%+v)",
+				pane.target(), want, found, rec)
 		}
 	}
 }
@@ -336,8 +354,8 @@ func TestResolveHelperNeverReturnsSelf(t *testing.T) {
 	if err := sl.b.Claim(ctx, self, ownerAgent, slotDefault); err != nil {
 		t.Fatalf("mark self as a slot-1 pane: %v", err)
 	}
-	if rec, found, err := sl.b.RecordFor(ctx, self); err != nil || !found || rec.Slot != slotDefault {
-		t.Fatalf("fixture is not exercising the case: self carries no slot-1 record (found=%v rec=%+v err=%v)", found, rec, err)
+	if rec, found := recordFor(t, sl, self, self); !found || rec.Slot != slotDefault {
+		t.Fatalf("fixture is not exercising the case: self carries no slot-1 record (found=%v rec=%+v)", found, rec)
 	}
 
 	pane, _, created, _, err := sl.resolveHelper(ctx, slotDefault)
@@ -354,10 +372,7 @@ func TestResolveHelperNeverReturnsSelf(t *testing.T) {
 
 	// The stale marker is cleared rather than merely skipped, so the same pane is
 	// not re-examined on every later call.
-	rec, found, err := sl.b.RecordFor(ctx, self)
-	if err != nil {
-		t.Fatalf("read self's record back: %v", err)
-	}
+	rec, found := recordFor(t, sl, self, self)
 	if found && rec.Slot != 0 {
 		t.Errorf("self still carries slot %d; the stale marker must be cleared", rec.Slot)
 	}
@@ -467,9 +482,9 @@ func TestAcquireIdleUnownedPane(t *testing.T) {
 		t.Error("an adopted pane is new to the slot, so created must be true")
 	}
 
-	rec, found, err := sl.b.RecordFor(ctx, usersPane)
-	if err != nil || !found {
-		t.Fatalf("adopted pane carries no registry record (found=%v err=%v)", found, err)
+	rec, found := recordFor(t, sl, self, usersPane)
+	if !found {
+		t.Fatal("adopted pane carries no registry record")
 	}
 	if rec.Owner != ownerAcquired {
 		t.Errorf("adopted pane is marked %q, want %q — the owner kind is what stops close-pane "+
@@ -530,10 +545,10 @@ func TestFailedAdoptionLeavesNoPartialMark(t *testing.T) {
 		t.Fatalf("adoption of the idle pane %s failed outright; the failure path below would then "+
 			"be the only thing this test exercises", usersPane.target())
 	}
-	rec, found, err := sl.b.RecordFor(ctx, usersPane)
-	if err != nil || !found || rec.Owner != ownerAcquired || rec.Slot != slotDefault {
-		t.Fatalf("a successful adoption left record %+v (found=%v err=%v), want owner %q slot %d",
-			rec, found, err, ownerAcquired, slotDefault)
+	rec, found := recordFor(t, sl, self, usersPane)
+	if !found || rec.Owner != ownerAcquired || rec.Slot != slotDefault {
+		t.Fatalf("a successful adoption left record %+v (found=%v), want owner %q slot %d",
+			rec, found, ownerAcquired, slotDefault)
 	}
 
 	// Back to an unclaimed pane, then to the prefix a mark interrupted after its
@@ -605,7 +620,7 @@ func TestAcquireRejectsPaneRunningCat(t *testing.T) {
 	if pane == busy {
 		t.Fatalf("resolveHelper adopted the busy pane %s", pane.target())
 	}
-	if rec, found, _ := sl.b.RecordFor(ctx, busy); found {
+	if rec, found := recordFor(t, sl, self, busy); found {
 		t.Errorf("the busy pane was marked anyway: %+v", rec)
 	}
 }
@@ -746,26 +761,177 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 // The rule matters more than a tidiness rule would, because the id policy must
 // never see is a tmux id: a file that can run tmux can read one, and every leak
 // this design guards against starts there.
+// audit is what one walk of the package found. Every field is a question the
+// test asks of the source rather than of a running server, because all four
+// rules below are about code that does not exist yet: the handler somebody adds
+// next year, not the ones here today.
+type audit struct {
+	selfCallers    map[string]string // function name → the reason it is permitted to ask, or ""
+	execImporters  map[string]bool   // file → imports os/exec
+	targetCallers  []string          // "file.function calls target()" — outside the adapter
+	addToolCallers map[string]string // "file.function" → outside addAgenticTool
+
+	sawSelfDecl   bool // Backend.Self is declared somewhere
+	sawTargetCall bool // the adapter itself turns a handle back into an id
+	sawAddTool    bool // addAgenticTool itself registers a tool
+}
+
+func newAudit() *audit {
+	return &audit{
+		selfCallers:    map[string]string{},
+		execImporters:  map[string]bool{},
+		addToolCallers: map[string]string{},
+	}
+}
+
+// inspect walks one parsed file and records every violation-shaped fact in it.
+//
+// It takes the file NAME rather than reading it from the fset so the same
+// function can be run over a source string that pretends to be an ordinary
+// policy file — which is how the controls below prove the analyzer detects
+// anything at all.
+func (a *audit) inspect(name string, file *ast.File) {
+	const adapter = "backend_tmux.go"
+
+	for _, imp := range file.Imports {
+		if imp.Path.Value == `"os/exec"` {
+			a.execImporters[name] = true
+		}
+	}
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fn.Name.Name == "Self" {
+			a.sawSelfDecl = true
+			continue // the accessor itself is where os.Getenv belongs
+		}
+		where := name + "." + fn.Name.Name
+		ast.Inspect(fn, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			// newPaneRef is the constructor half of the same rule: it turns an id
+			// INTO a handle, so a policy file that calls it has an id in hand.
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "newPaneRef" {
+				if name == adapter {
+					a.sawTargetCall = true
+				} else {
+					a.targetCallers = append(a.targetCallers, where+" calls newPaneRef")
+				}
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch sel.Sel.Name {
+			case "Self":
+				a.selfCallers[fn.Name.Name] = name
+			case "target":
+				if name == adapter {
+					a.sawTargetCall = true
+				} else {
+					a.targetCallers = append(a.targetCallers, where+" calls target()")
+				}
+			case "AddTool":
+				if fn.Name.Name == "addAgenticTool" {
+					a.sawAddTool = true
+				} else {
+					a.addToolCallers[where] = "AddTool"
+				}
+			case "Getenv":
+				// os.Getenv("TMUX_PANE") is the same knowledge by another route,
+				// and reading it directly would bypass both this test and the
+				// single accessor it protects.
+				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "os" && len(call.Args) == 1 {
+					if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Value == `"TMUX_PANE"` {
+						a.selfCallers[fn.Name.Name] = name
+					}
+				}
+			}
+			return true
+		})
+	}
+}
+
+// TestOnlyPolicyCodeKnowsOurOwnPane enforces the four rules that keep a pane id
+// out of policy code and out of the model's context, by parsing the package
+// rather than by trusting review.
+//
+// # Rule 1: who may ask which pane this server runs in
+//
+// Knowing that is permitted only where the pane is used as a split ANCHOR, or as
+// something to EXCLUDE. It is never permitted where keystrokes are delivered.
+// The self pane is an input to placement — the pane we split — and never an
+// output of resolution — the pane we type into — and a pane produced by
+// splitting is, by construction, not the pane that was split.
+//
+// Only a permitted SET is asserted, and nothing is required to be in it: every
+// function named there is a place the design already allows to ask, and which of
+// them happens to ask this month is an implementation detail. What may never
+// appear is a handler that types. A future send-keys that reaches for
+// Backend.Self, or for os.Getenv("TMUX_PANE") directly to dodge this test, fails
+// the build's test step — which is the only way a rule like this survives a year
+// of edits, because the failure it prevents is invisible from outside the
+// process: the agent's own transcript fills with its own keystrokes, and there
+// is nothing left to read the diagnosis from.
+//
+// # Rule 2: who may run a command at all
+//
+// Only backend_tmux.go may talk to the multiplexer, and os/exec is the only way
+// to talk to it, so an import of os/exec anywhere else is either a second tmux
+// call site or the start of one. screenshot.go is the one exception and it is
+// not a tmux exception: it runs headless Chrome to render a PNG, and
+// `open`/`xdg-open` to show one.
+//
+// # Rule 3: who may turn a handle back into an id
+//
+// paneRef.String() prints "<pane>", so an id cannot leak through a format verb —
+// but that redaction is only as good as the rule that the real id is reachable
+// from ONE place. target() and newPaneRef are that place, and this clause is
+// what keeps it one: the ten call sites outside the adapter that existed before
+// this contract all fed a PaneID field on a response type, and every one of them
+// vanished when those fields did. A new one appearing is a new leak, and it
+// would look perfectly ordinary in review.
+//
+// # Rule 4: every tool is registered through the rejection wrapper
+//
+// addAgenticTool wraps each handler in rejectIdArgs, and a tool registered with
+// a direct s.AddTool would silently lose the check. close-pane is why that
+// matters: it never resolves a slot, so an ignored paneId there does not type
+// into the wrong pane — it defaults to slot 1 and KILLS it.
+//
+// # The controls
+//
+// Each rule is proven against a VIOLATING FIXTURE, parsed from a source string
+// in this test. A presence check ("the permitted functions exist") proves only
+// that declarations exist; running the analyzer over code that breaks all four
+// rules proves it can see a violation at all. Without that, a walker reading the
+// wrong AST node passes silently, which is the exact failure this test exists to
+// prevent elsewhere.
 func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 	permitted := map[string]string{
-		"resolveHelperLocked":   "§5.3 step 1, where resolution starts from the pane it must not return",
+		"resolveHelperLocked":   "resolution starts from the pane it must not return",
 		"resolveHelperNoCreate": "the same, for the lookup close-pane performs",
 		"closePanes":            "teardown, which must not close the pane the request arrived through",
+		"listSlots":             "the registry read is scoped to the window this server's pane is in",
 	}
 
 	permittedExecImporters := map[string]string{
 		"backend_tmux.go": "the only file that runs tmux; every multiplexer call in the package is here",
 		"screenshot.go":   "headless Chrome and open/xdg-open, which are rendering, not multiplexer access",
 	}
-	execImporters := map[string]bool{}
 
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatalf("glob package files: %v", err)
 	}
 	fset := token.NewFileSet()
-	found := map[string]bool{}
-	sawDeclaration := false
+	got := newAudit()
 
 	for _, path := range files {
 		if strings.HasSuffix(path, "_test.go") {
@@ -775,73 +941,96 @@ func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
-		for _, imp := range file.Imports {
-			if imp.Path.Value == `"os/exec"` {
-				execImporters[path] = true
-			}
-		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok {
-				continue
-			}
-			if fn.Name.Name == "Self" {
-				sawDeclaration = true
-				continue // the accessor itself is where os.Getenv belongs
-			}
-			ast.Inspect(fn, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				if sel.Sel.Name == "Self" {
-					found[fn.Name.Name] = true
-					return true
-				}
-				// os.Getenv("TMUX_PANE") is the same knowledge by another route,
-				// and reading it directly would bypass both this test and the
-				// single accessor it protects.
-				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "os" && sel.Sel.Name == "Getenv" &&
-					len(call.Args) == 1 {
-					if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Value == `"TMUX_PANE"` {
-						found[fn.Name.Name] = true
-					}
-				}
-				return true
-			})
-		}
+		got.inspect(path, file)
 	}
 
-	if !sawDeclaration {
+	// ---- Rule 1 ----
+	if !got.sawSelfDecl {
 		t.Fatal("Self is not declared in this package — the test is looking for the wrong symbol")
 	}
-	for name := range found {
+	for name := range got.selfCallers {
 		if _, ok := permitted[name]; !ok {
 			t.Errorf("%s asks which pane this server runs in, and is not permitted to: "+
 				"Backend.Self may be used only as a split anchor or as something to exclude, never "+
 				"as a pane to deliver keystrokes to (permitted: %v)", name, permittedNames(permitted))
 		}
 	}
-	if len(found) == 0 {
+	if len(got.selfCallers) == 0 {
 		t.Errorf("nothing in this package asks which pane this server runs in, so nothing can be "+
 			"excluding it either — resolution has stopped knowing what not to hand back, and this "+
 			"test is guarding an empty set (permitted callers: %v)", permittedNames(permitted))
 	}
 
-	for path := range execImporters {
+	// ---- Rule 2 ----
+	for path := range got.execImporters {
 		if _, ok := permittedExecImporters[path]; !ok {
 			t.Errorf("%s imports os/exec, and only %v may: a file that can run a command can run "+
 				"tmux, and a second tmux call site is how a raw pane id gets back into policy "+
 				"code", path, permittedNames(permittedExecImporters))
 		}
 	}
-	if !execImporters["backend_tmux.go"] {
+	if !got.execImporters["backend_tmux.go"] {
 		t.Error("backend_tmux.go does not import os/exec, so it is not the file running tmux any " +
 			"more — whichever file now is, this test is no longer looking at it")
+	}
+
+	// ---- Rule 3 ----
+	for _, where := range got.targetCallers {
+		t.Errorf("%s, outside backend_tmux.go: the real pane id must be reachable from one file "+
+			"only, or paneRef's redacting String() is a convention again and the next response "+
+			"field reintroduces the leak this release removed", where)
+	}
+	if !got.sawTargetCall {
+		t.Error("backend_tmux.go never turns a handle back into an id, so it is no longer the " +
+			"adapter — this clause is watching the wrong file and would pass over a leak anywhere else")
+	}
+
+	// ---- Rule 4 ----
+	for where := range got.addToolCallers {
+		t.Errorf("%s registers a tool directly with s.AddTool: every tool must go through "+
+			"addAgenticTool, which is where a request carrying paneId is refused. A tool registered "+
+			"here silently accepts one — and on close-pane an ignored paneId defaults to slot 1 and "+
+			"kills it", where)
+	}
+	if !got.sawAddTool {
+		t.Error("addAgenticTool does not call s.AddTool, so it is not the registration path any " +
+			"more and this clause is guarding nothing")
+	}
+
+	// ---- The controls: a fixture that breaks all four rules must be caught ----
+	const violation = `package main
+
+import "os/exec"
+
+func typesIntoAPane(p paneRef, s *server) {
+	_ = os.Getenv("TMUX_PANE")
+	_ = exec.Command("tmux", "send-keys", "-t", p.target())
+	s.AddTool(tool, handler)
+	_ = newPaneRef("%3")
+}
+`
+	fixture, err := parser.ParseFile(fset, "fixture.go", violation, 0)
+	if err != nil {
+		t.Fatalf("parse the violating fixture: %v", err)
+	}
+	control := newAudit()
+	control.inspect("fixture.go", fixture)
+
+	if _, ok := control.selfCallers["typesIntoAPane"]; !ok {
+		t.Error("the analyzer did not see os.Getenv(\"TMUX_PANE\") in the fixture, so rule 1 is " +
+			"being enforced by a walk that finds nothing")
+	}
+	if !control.execImporters["fixture.go"] {
+		t.Error("the analyzer did not see the os/exec import in the fixture, so rule 2 is " +
+			"being enforced by a walk that finds nothing")
+	}
+	if len(control.targetCallers) != 2 {
+		t.Errorf("the analyzer flagged %d of the fixture's 2 id conversions (%v); rule 3 is being "+
+			"enforced by a walk that cannot see them", len(control.targetCallers), control.targetCallers)
+	}
+	if _, ok := control.addToolCallers["fixture.go.typesIntoAPane"]; !ok {
+		t.Error("the analyzer did not see the direct s.AddTool call in the fixture, so rule 4 is " +
+			"being enforced by a walk that finds nothing")
 	}
 }
 

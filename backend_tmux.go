@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,76 +16,60 @@ import (
 	"github.com/google/uuid"
 )
 
-// Session represents a tmux session.
-type Session struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Windows  int    `json:"windows"`
-	Attached bool   `json:"attached"`
-}
+// The four types below carry NO json tags, and their absence is the point.
+//
+// Every one of them used to be a tool response — list-panes answered with Pane,
+// create-session with CreatedSession, split-pane with CreatedPane — which is why
+// three of them carried a `json:"paneId"` field. Those tools are gone, and
+// nothing in this package marshals these types any more: they are the adapter's
+// own vocabulary for what tmux just told it, and they reach policy only as
+// paneRef and paneInfo.
+//
+// Leaving the tags would leave a response shape lying around with a pane id
+// already named in it, one `jsonResult(...)` away from being on the wire again.
+// A type that cannot be serialised into a tool result without someone writing
+// the tags back is a type that cannot leak by accident.
 
-// Window represents a tmux window.
-type Window struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Active bool   `json:"active"`
-	Panes  int    `json:"panes"`
-}
-
-// Pane represents a tmux pane with extended info.
+// Pane is a tmux pane with the extended info list-panes reports.
 type Pane struct {
-	ID             string `json:"id"`
-	Title          string `json:"title"`
-	Active         bool   `json:"active"`
-	Width          int    `json:"width"`
-	Height         int    `json:"height"`
-	CurrentCommand string `json:"currentCommand"`
-	CurrentPath    string `json:"currentPath"`
+	ID             string
+	Title          string
+	Active         bool
+	Width          int
+	Height         int
+	CurrentCommand string
+	CurrentPath    string
 }
 
-// CommandResult holds the output and exit code of a completed command.
-//
-// Slot and Created are set only when the caller let the server choose the pane;
-// both are omitempty, so a call that named a paneId gets exactly the object it
-// always got.
-type CommandResult struct {
-	PaneID   string `json:"paneId"`
-	Output   string `json:"output"`
-	ExitCode int    `json:"exitCode"`
-	TimedOut bool   `json:"timedOut,omitempty"`
-	Slot     int    `json:"slot,omitempty"`
-	Created  bool   `json:"created,omitempty"`
-}
-
-// CreatedSession holds the IDs returned when a new session is created.
+// CreatedSession holds the IDs tmux returns when a new session is created.
 type CreatedSession struct {
-	SessionID   string `json:"sessionId"`
-	SessionName string `json:"sessionName"`
-	WindowID    string `json:"windowId"`
-	PaneID      string `json:"paneId"`
+	SessionID   string
+	SessionName string
+	WindowID    string
+	PaneID      string
 }
 
-// CreatedWindow holds the IDs returned when a new window is created.
+// CreatedWindow holds the IDs tmux returns when a new window is created.
 type CreatedWindow struct {
-	WindowID   string `json:"windowId"`
-	WindowName string `json:"windowName"`
-	PaneID     string `json:"paneId"`
+	WindowID   string
+	WindowName string
+	PaneID     string
 }
 
-// CreatedPane holds the IDs returned when a new pane is created.
+// CreatedPane holds the IDs tmux returns when a new pane is created.
 //
-// Reused and Created say almost the same thing from opposite ends, and both are
-// kept on purpose. Reused predates slots and some consumer somewhere keys on it,
-// so the slot path sets Reused = !Created rather than leaving it absent; Created
-// is the field the rest of the slot-aware tools use, and it means "new to this
-// slot", which on this tool is also "new pane".
+// Reused, Slot and Created went with the tags: they existed to shape split-pane's
+// response, and the tool that answered with them is gone. What the adapter needs
+// from a split is the pane it made.
 type CreatedPane struct {
-	PaneID   string `json:"paneId"`
-	WindowID string `json:"windowId"`
-	Reused   bool   `json:"reused,omitempty"`
-	Slot     int    `json:"slot,omitempty"`
-	Created  bool   `json:"created,omitempty"`
+	PaneID   string
+	WindowID string
 }
+
+// errPaneGone reports that a pane a caller named no longer exists. It is a
+// sentinel so that the handler can name the SLOT — the only handle the caller
+// has — instead of the adapter naming the pane.
+var errPaneGone = errors.New("the pane is gone")
 
 // headlessSocket is the tmux socket name used for isolated headless sessions.
 const headlessSocket = "mcp-headless"
@@ -136,12 +122,11 @@ const headlessPrefix = "headless:"
 // the user's shells and call it "the helper pane" — the witness failure of the
 // original bug, now on a path that types into the pane rather than merely
 // listing it. That is why the slot is never read on its own: every read of
-// paneOptSlot or paneOptOwner goes through paneRegistryInWindow (a window) or
-// paneRecordFor (a single pane), and both fetch paneOptWitness in the *same*
-// tmux call and reject the record unless it equals the pane's own ID. Two
-// readers, both here, both next to this comment — so "did this new read keep
-// the witness?" is a question with only two places to look rather than one per
-// caller.
+// paneOptSlot or paneOptOwner goes through paneRegistryAround, which fetches
+// paneOptWitness in the *same* tmux call and rejects the record unless it
+// equals the pane's own ID. There is ONE such reader now — the single-pane
+// lookup went with the explicit-paneId path — so "did this new read keep the
+// witness?" is a question with one place to look.
 //
 // There is exactly one further reader, paneOwnerMark, and it deliberately does
 // not apply the witness. It asks the opposite question — "is this pane wholly
@@ -287,95 +272,33 @@ func (t *tmuxClient) runWithSocket(ctx context.Context, socket string, args ...s
 		// regardless of how many global flags the socket prefixed.
 		subCmd := args[0]
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("tmux %s: %w: %s", subCmd, err, strings.TrimSpace(string(exitErr.Stderr)))
+			return "", fmt.Errorf("tmux %s: %w: %s", subCmd, err, scrubIDs(strings.TrimSpace(string(exitErr.Stderr))))
 		}
 		return "", fmt.Errorf("tmux %s: %w", subCmd, err)
 	}
 	return strings.TrimRight(string(out), "\n"), nil
 }
 
-// ListSessions returns all active tmux sessions on the default server.
-func (t *tmuxClient) ListSessions(ctx context.Context) ([]Session, error) {
-	return t.listSessionsOnSocket(ctx, "")
-}
+// idInText matches a multiplexer id embedded anywhere in a sentence: %3 for a
+// pane, @2 for a window, $1 for a session. The leading group keeps it from
+// firing inside an identifier or a path (mcp_pane%3 is not an id we wrote), and
+// it is deliberately UNANCHORED, because every leak this scrub exists for is an
+// id in the middle of a sentence rather than a whole value.
+var idInText = regexp.MustCompile(`(^|[^A-Za-z0-9_])[%@$][0-9]+`)
 
-// ListHeadlessSessions returns all active sessions on the headless server.
-// IDs in the returned sessions are prefixed with "headless:".
-func (t *tmuxClient) ListHeadlessSessions(ctx context.Context) ([]Session, error) {
-	sessions, err := t.listSessionsOnSocket(ctx, headlessSocket)
-	if err != nil {
-		return sessions, err
-	}
-	for i := range sessions {
-		sessions[i].ID = headlessPrefix + sessions[i].ID
-	}
-	return sessions, nil
-}
-
-// listSessionsOnSocket lists sessions on the given tmux socket (empty = default).
-func (t *tmuxClient) listSessionsOnSocket(ctx context.Context, socket string) ([]Session, error) {
-	out, err := t.runWithSocket(ctx, socket, "list-sessions",
-		"-F", "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}")
-	if err != nil {
-		if strings.Contains(err.Error(), "no server running") ||
-			strings.Contains(err.Error(), "no sessions") {
-			return []Session{}, nil
-		}
-		return nil, err
-	}
-	if out == "" {
-		return []Session{}, nil
-	}
-
-	var sessions []Session
-	for _, line := range strings.Split(out, "\n") {
-		parts := strings.Split(line, "\t")
-		if len(parts) != 4 {
-			continue
-		}
-		windows, _ := strconv.Atoi(parts[2])
-		sessions = append(sessions, Session{
-			ID:       parts[0],
-			Name:     parts[1],
-			Windows:  windows,
-			Attached: parts[3] != "0",
-		})
-	}
-	return sessions, nil
-}
-
-// ListWindows returns windows in the given session.
-func (t *tmuxClient) ListWindows(ctx context.Context, sessionID string) ([]Window, error) {
-	socket, bareID := parseTarget(sessionID)
-	out, err := t.runWithSocket(ctx, socket, "list-windows",
-		"-t", bareID,
-		"-F", "#{window_id}\t#{window_name}\t#{window_active}\t#{window_panes}")
-	if err != nil {
-		return nil, err
-	}
-	if out == "" {
-		return []Window{}, nil
-	}
-
-	prefix := ""
-	if socket != "" {
-		prefix = headlessPrefix
-	}
-	var windows []Window
-	for _, line := range strings.Split(out, "\n") {
-		parts := strings.Split(line, "\t")
-		if len(parts) != 4 {
-			continue
-		}
-		panes, _ := strconv.Atoi(parts[3])
-		windows = append(windows, Window{
-			ID:     prefix + parts[0],
-			Name:   parts[1],
-			Active: parts[2] == "1",
-			Panes:  panes,
-		})
-	}
-	return windows, nil
+// scrubIDs removes multiplexer ids from text that is about to become an error a
+// caller can see. It is applied in runWithSocket, the single place tmux's own
+// stderr enters this process, so every wrapped tmux error in the package flows
+// through it.
+//
+// It is not cosmetic. tmux says "can't find pane %3", and that sentence reaches
+// the model through closedPane.Detail and every NewToolResultErrorFromErr in
+// the package — a path no response type covers and no schema check can see. The
+// VALUE is replaced rather than the message dropped, because the rest of the
+// sentence is the only diagnostic the caller gets: "can't find pane <pane>"
+// still says what went wrong.
+func scrubIDs(s string) string {
+	return idInText.ReplaceAllString(s, "${1}<pane>")
 }
 
 // ListPanes returns panes in the given window with extended info.
@@ -768,7 +691,7 @@ func (t *tmuxClient) SendKeys(ctx context.Context, paneID, keys string, literal,
 // It wraps the command so output is tee'd to a temp file and the exit code is
 // written to a separate file, then uses "tmux wait-for" to block until the
 // command finishes. The context deadline controls the overall timeout.
-func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string) (*CommandResult, error) {
+func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string) (*execOutcome, error) {
 	socket, _ := parseTarget(paneID)
 
 	id := uuid.New().String()
@@ -799,8 +722,7 @@ func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string)
 			if data, err := os.ReadFile(outFile); err == nil {
 				partialOutput = strings.TrimRight(string(data), "\n")
 			}
-			return &CommandResult{
-				PaneID:   paneID,
+			return &execOutcome{
 				Output:   partialOutput,
 				ExitCode: -1,
 				TimedOut: true,
@@ -832,8 +754,7 @@ func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string)
 
 	exitCode, _ := strconv.Atoi(strings.TrimSpace(string(exitBytes)))
 
-	return &CommandResult{
-		PaneID:   paneID,
+	return &execOutcome{
 		Output:   strings.TrimRight(string(outputBytes), "\n"),
 		ExitCode: exitCode,
 	}, nil
@@ -865,67 +786,11 @@ func (t *tmuxClient) wrapCommand(command, outFile, exitFile, waitChannel string)
 	}
 }
 
-// KillSession kills a tmux session and all its windows.
-// It accepts session IDs ($N), prefixed IDs (headless:$N), or session names.
-func (t *tmuxClient) KillSession(ctx context.Context, sessionID string) error {
-	socket, bareID := parseTarget(sessionID)
-	_, err := t.runWithSocket(ctx, socket, "kill-session", "-t", bareID)
-	if err != nil {
-		// If the direct target failed, try resolving by session name.
-		resolved, resolveErr := t.resolveSessionTarget(ctx, socket, bareID)
-		if resolveErr == nil {
-			_, err = t.runWithSocket(ctx, socket, "kill-session", "-t", resolved)
-		}
-	}
-	return err
-}
-
-// resolveSessionTarget attempts to resolve a session target that may be a name
-// rather than a tmux session ID. It searches the session list on the given socket.
-func (t *tmuxClient) resolveSessionTarget(ctx context.Context, socket, target string) (string, error) {
-	out, err := t.runWithSocket(ctx, socket, "list-sessions",
-		"-F", "#{session_id}\t#{session_name}")
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(out, "\n") {
-		parts := strings.Split(line, "\t")
-		if len(parts) != 2 {
-			continue
-		}
-		sid, sname := parts[0], parts[1]
-		if sname == target || sid == target {
-			return sid, nil
-		}
-	}
-	return "", fmt.Errorf("session not found: %s", target)
-}
-
 // KillPane kills a tmux pane.
 func (t *tmuxClient) KillPane(ctx context.Context, paneID string) error {
 	socket, bareID := parseTarget(paneID)
 	_, err := t.runWithSocket(ctx, socket, "kill-pane", "-t", bareID)
 	return err
-}
-
-// KillHeadlessServer shuts down the headless tmux server and all its sessions.
-// Returns the number of sessions that were running before shutdown.
-// It kills sessions individually rather than using kill-server to avoid any
-// kill-server wrappers or guards in the environment.
-func (t *tmuxClient) KillHeadlessServer(ctx context.Context) (int, error) {
-	// List sessions on the headless socket (without the "headless:" prefix so we
-	// can pass the bare IDs directly to kill-session on the headless socket).
-	sessions, err := t.listSessionsOnSocket(ctx, headlessSocket)
-	if err != nil {
-		// No server running is not an error.
-		return 0, nil
-	}
-	n := len(sessions)
-	for _, s := range sessions {
-		// Kill each session on the headless socket using its bare ID.
-		_, _ = t.runWithSocket(ctx, headlessSocket, "kill-session", "-t", s.ID)
-	}
-	return n, nil
 }
 
 // Bell reports the multiplexer's CURRENT bell indication for the pane's window.
@@ -1021,22 +886,6 @@ func (t *tmuxClient) GetPaneDimensions(ctx context.Context, paneID string) (cols
 		return 0, 0, fmt.Errorf("parse pane height %q: %w", parts[1], err)
 	}
 	return cols, rows, nil
-}
-
-// getWindowIDForPane returns the window ID that contains the given pane.
-// The returned ID is prefixed with "headless:" when the pane lives on the
-// headless socket.
-func (t *tmuxClient) getWindowIDForPane(ctx context.Context, paneID string) (string, error) {
-	socket, bareID := parseTarget(paneID)
-	out, err := t.runWithSocket(ctx, socket, "display-message", "-t", bareID, "-p", "#{window_id}")
-	if err != nil {
-		return "", err
-	}
-	id := strings.TrimSpace(out)
-	if socket != "" {
-		id = headlessPrefix + id
-	}
-	return id, nil
 }
 
 // paneRecord is one pane's registry entry, as read back from its tmux options.
@@ -1144,30 +993,6 @@ func (t *tmuxClient) paneRegistryAround(ctx context.Context, target string) (map
 	return reg, nil
 }
 
-// paneRecordFor returns the registry record for a single pane. found is false
-// when the pane carries no valid record — which is the normal answer for one of
-// the user's own panes, and the reason close-pane refuses to touch it.
-//
-// display-message -p evaluates the format in the target pane's context, so
-// #{@mcp_pane} resolves exactly as it does inside list-panes and the witness
-// comparison is the same comparison.
-func (t *tmuxClient) paneRecordFor(ctx context.Context, paneID string) (paneRecord, bool, error) {
-	socket, bareID := parseTarget(paneID)
-	out, err := t.runWithSocket(ctx, socket, "display-message", "-t", bareID, "-p", registryFormat())
-	if err != nil {
-		return paneRecord{}, false, err
-	}
-	prefix := ""
-	if socket != "" {
-		prefix = headlessPrefix
-	}
-	rec, ok := parseRegistryLine(out, prefix)
-	if !ok {
-		return paneRecord{}, false, nil
-	}
-	return rec, true, nil
-}
-
 // paneOwnerMark returns the raw @mcp_owner value a pane renders, whatever it is.
 //
 // This is deliberately NOT a registry read, and it is the one place in the file
@@ -1230,63 +1055,6 @@ func (t *tmuxClient) ownedPanesInWindow(ctx context.Context, windowID string) (m
 	return owned, nil
 }
 
-// findIdlePaneInWindow finds a pane in the same window as sourcePaneID that we
-// created and that is now sitting idle, so it can be reused instead of piling
-// up another split. It returns the pane ID, or empty string if there is none.
-//
-// Two conditions, and both are load-bearing.
-//
-// It must be *ours*. tmux records no creator, so we mark the panes we make
-// (markPaneOwned) and treat every unmarked pane as the user's. Reusing an
-// unmarked pane means typing into whatever shell the user left at a prompt —
-// which may be sitting at an `ssh prod`, a `sudo -i`, or a psql session, where
-// "reuse" would execute the agent's command in their privileged context, and a
-// later teardown would kill the pane out from under them. Idle is not the same
-// as free.
-//
-// It must be *idle*, which we take to mean alive with the shell itself as the
-// foreground process — no child command has taken over the terminal. That is
-// paneIsIdleShell rather than WaitingForInput, because WaitingForInput is not
-// consistent across platforms: an idle interactive shell reports
-// waitingForInput=false on Linux (readline blocks in poll/select, not
-// n_tty_read) but true on macOS. The "shell is the foreground process" signal
-// agrees on both, and is strictly more correct anyway — a pane running
-// `bash script.sh` has a child in the foreground and is not idle.
-func (t *tmuxClient) findIdlePaneInWindow(ctx context.Context, sourcePaneID string) (string, error) {
-	windowID, err := t.getWindowIDForPane(ctx, sourcePaneID)
-	if err != nil {
-		return "", fmt.Errorf("get window for pane %s: %w", sourcePaneID, err)
-	}
-
-	owned, err := t.ownedPanesInWindow(ctx, windowID)
-	if err != nil {
-		return "", fmt.Errorf("list owned panes in window %s: %w", windowID, err)
-	}
-	if len(owned) == 0 {
-		return "", nil
-	}
-
-	panes, err := t.ListPanes(ctx, windowID)
-	if err != nil {
-		return "", fmt.Errorf("list panes in window %s: %w", windowID, err)
-	}
-
-	for _, p := range panes {
-		if p.ID == sourcePaneID || !owned[p.ID] {
-			continue
-		}
-		state, err := t.GetPaneState(ctx, p.ID)
-		if err != nil {
-			continue
-		}
-		if paneIsIdleShell(state) {
-			return p.ID, nil
-		}
-	}
-
-	return "", nil
-}
-
 // GetPaneState returns the native OS-level state of the process in a tmux pane.
 // It queries tmux for the pane's PID, dead flag, and dead status in a single
 // call, then uses OS-specific inspection to determine whether the foreground
@@ -1312,9 +1080,12 @@ func (t *tmuxClient) GetPaneState(ctx context.Context, paneID string) (*PaneStat
 	deadFlag := strings.TrimSpace(parts[1])
 	deadStatusStr := strings.TrimSpace(parts[2])
 
-	// If the pane PID is empty the pane does not exist.
+	// If the pane PID is empty the pane does not exist. This is a SENTINEL and
+	// not a sentence, because the adapter cannot write the sentence: the caller
+	// is the only party that knows the slot number the user should be told
+	// about, and "pane %3 does not exist" is an id in the model's context.
 	if pidStr == "" {
-		return nil, fmt.Errorf("pane %s does not exist or has no PID", paneID)
+		return nil, errPaneGone
 	}
 
 	pid, err := strconv.Atoi(pidStr)
@@ -1430,7 +1201,7 @@ type Backend interface {
 	// ---- Identity ----
 
 	// Self is the pane this server runs in, and is the ONLY reader of TMUX_PANE
-	// in the package (Invariant S). It returns errNotInTmux when there is none.
+	// in the package (Invariant S). It returns errNoWindow when there is none.
 	Self(ctx context.Context) (paneRef, error)
 
 	// ---- Structure ----
@@ -1448,14 +1219,6 @@ type Backend interface {
 
 	// Records is the witnessed registry of the window around the given pane.
 	Records(ctx context.Context, of paneRef) (map[paneRef]paneRecord, error)
-
-	// RecordFor is the single-pane witnessed lookup, and it exists only while the
-	// explicit-paneId path does: both remaining callers — close-pane's explicit
-	// branch and clearForDisplay's re-read — are on that path, and the commit
-	// that deletes it deletes this with it. It is named here rather than left
-	// implicit so that "why does the port have a single-pane read?" has an answer
-	// with an expiry date on it.
-	RecordFor(ctx context.Context, p paneRef) (paneRecord, bool, error)
 
 	// OwnerMark asks the OPPOSITE question from Records and is deliberately not
 	// witnessed: not "is this pane ours?" but "is it wholly unclaimed?", where
@@ -1524,7 +1287,7 @@ var _ Backend = (*tmuxBackend)(nil)
 // It is also not a guess: every agent runtime that starts this server starts it
 // inside the pane the user is looking at, so an empty answer means something
 // specific and reportable — "this process is not in tmux" — rather than "lookup
-// failed", which is why the caller can turn it into errNotInTmux instead of a
+// failed", which is why the caller can turn it into errNoWindow instead of a
 // fallback.
 //
 // Reading it here rather than at each call site is deliberate: the set of
@@ -1535,7 +1298,7 @@ var _ Backend = (*tmuxBackend)(nil)
 func (b *tmuxBackend) Self(_ context.Context) (paneRef, error) {
 	id := os.Getenv("TMUX_PANE")
 	if id == "" {
-		return paneRef{}, errNotInTmux
+		return paneRef{}, errNoWindow
 	}
 	return newPaneRef(id), nil
 }
@@ -1576,10 +1339,6 @@ func (b *tmuxBackend) Records(ctx context.Context, of paneRef) (map[paneRef]pane
 	return b.c.paneRegistryAround(ctx, of.target())
 }
 
-func (b *tmuxBackend) RecordFor(ctx context.Context, p paneRef) (paneRecord, bool, error) {
-	return b.c.paneRecordFor(ctx, p.target())
-}
-
 func (b *tmuxBackend) OwnerMark(ctx context.Context, p paneRef) (string, error) {
 	return b.c.paneOwnerMark(ctx, p.target())
 }
@@ -1613,11 +1372,10 @@ func (b *tmuxBackend) Screen(ctx context.Context, p paneRef) (screen, error) {
 }
 
 func (b *tmuxBackend) Exec(ctx context.Context, p paneRef, command string) (*execOutcome, error) {
-	res, err := b.c.ExecuteCommand(ctx, p.target(), command)
-	if err != nil {
-		return nil, err
-	}
-	return &execOutcome{Output: res.Output, ExitCode: res.ExitCode, TimedOut: res.TimedOut}, nil
+	// No translation left to do: ExecuteCommand answers in execOutcome directly
+	// now that CommandResult is gone. That type carried a paneId json tag — the
+	// last one in the package — and the wire it served no longer exists.
+	return b.c.ExecuteCommand(ctx, p.target(), command)
 }
 
 func (b *tmuxBackend) Foreground(ctx context.Context, p paneRef) (*PaneState, error) {

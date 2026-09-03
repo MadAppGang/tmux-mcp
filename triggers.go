@@ -46,10 +46,11 @@ func resolveMode(name string) NotificationMode {
 
 // MonitorState carries the evolving state passed to trigger Check functions.
 type MonitorState struct {
-	// Pane being monitored, as an opaque handle. Nothing here formats it: the
-	// progress notification and the channel event name the SLOT, which is the
-	// only pane name this contract has.
-	Pane paneRef
+	// Target is the RESOLVED slot being monitored: the handle to read, and the
+	// slot number every event names. Nothing formats the handle — the progress
+	// notification and the channel event name the slot, which is the only pane
+	// name this contract has.
+	Target paneTarget
 	// Baseline content captured at the start of monitoring.
 	Baseline string
 	// Current full pane content.
@@ -231,11 +232,11 @@ func buildTrigger(name string, b Backend) *Trigger {
 				// A failed read is not a quiet pane, but it is not a reason to
 				// abort a watch either: the trigger reports "no bell" and the
 				// next poll asks again, which is what this has always done.
-				rang, err := b.Bell(ctx, s.Pane)
+				rang, err := b.Bell(ctx, s.Target.Ref)
 				if err != nil || !rang {
 					return false, ""
 				}
-				return true, "tmux window bell received"
+				return true, "terminal bell received"
 			},
 		}
 
@@ -263,20 +264,19 @@ func buildTrigger(name string, b Backend) *Trigger {
 
 // WatchResult is the structured result returned by watch-pane and start-and-watch.
 //
-// Slot and Created are appended rather than embedded via paneResolution because
-// this struct already has a PaneID field with the right name and every existing
-// consumer reads it; embedding would have meant deleting that field and hoping
-// the promotion produced the same key. Both new fields are omitempty, so a call
-// that named a paneId is answered exactly as before.
+// One struct serves both tools, and Created being a POINTER is what lets it:
+// start-and-watch is a creating tool and always reports created, watch-pane is a
+// reading tool and never does. A plain bool would force either a second struct
+// or a field that is structurally always false on a read — which would teach the
+// model that a read might create.
 type WatchResult struct {
-	PaneID    string     `json:"paneId"`
+	Slot      int        `json:"slot"`
+	Created   *bool      `json:"created,omitempty"`   // creating tools only; nil means "not applicable"
 	Event     string     `json:"event"`               // trigger name or "timeout"
 	Detail    string     `json:"detail"`              // human-readable explanation
 	Elapsed   float64    `json:"elapsed"`             // seconds
 	Output    string     `json:"output"`              // all new content accumulated
 	PaneState *PaneState `json:"paneState,omitempty"` // final process state
-	Slot      int        `json:"slot,omitempty"`      // helper slot, when the server chose the pane
-	Created   bool       `json:"created,omitempty"`   // the pane is new to that slot
 }
 
 // dropEcho removes the shell's echo of a command we just typed from the front of
@@ -350,13 +350,14 @@ func monitorPane(
 	ctx context.Context,
 	s *server.MCPServer,
 	b Backend,
-	pane paneRef,
+	tgt paneTarget,
 	mode NotificationMode,
 	triggers []Trigger,
 	timeoutSecs int,
 	emitter *ChannelEmitter,
 ) (*WatchResult, error) {
-	return monitorPaneFrom(ctx, s, b, pane, nil, "", mode, triggers, timeoutSecs, emitter)
+	// created is nil: this is watch-pane's entry point, and watch-pane reads.
+	return monitorPaneFrom(ctx, s, b, tgt, nil, nil, "", mode, triggers, timeoutSecs, emitter)
 }
 
 // monitorPaneFrom polls at mode.PollInterval, checks all triggers each tick,
@@ -373,11 +374,22 @@ func monitorPane(
 //
 // echoCmd, when non-empty, is that command; its echoed line is stripped from the
 // trigger input. See dropEcho.
+//
+// It takes the RESOLVED target and the created pointer, not a bare handle, and
+// that is a bug this contract would otherwise ship. Emit fires from INSIDE this
+// function, at four return paths, and the handlers used to fill the slot in
+// after it returned. That was invisible while WatchResult carried a pane id the
+// monitor populated itself; with the id gone, every channel notification would
+// have announced "slot 0" — the one field the event exists to carry. So the four
+// WatchResult constructions below set Slot and Created at construction, the
+// handlers set nothing afterwards, and there is no window in which the struct is
+// incomplete. See TestChannelEventNamesTheSlot.
 func monitorPaneFrom(
 	ctx context.Context,
 	s *server.MCPServer,
 	b Backend,
-	pane paneRef,
+	tgt paneTarget,
+	created *bool,
 	baseline *string,
 	echoCmd string,
 	mode NotificationMode,
@@ -385,6 +397,7 @@ func monitorPaneFrom(
 	timeoutSecs int,
 	emitter *ChannelEmitter,
 ) (*WatchResult, error) {
+	pane := tgt.Ref
 	start := time.Now()
 	timeout := time.Duration(timeoutSecs) * time.Second
 
@@ -405,7 +418,7 @@ func monitorPaneFrom(
 	}
 
 	ms := &MonitorState{
-		Pane:             pane,
+		Target:           tgt,
 		Baseline:         base,
 		InitialCmd:       initialCmd,
 		LastProgressTime: start,
@@ -437,7 +450,8 @@ func monitorPaneFrom(
 					fired, detail := trig.Check(ctx, ms)
 					if fired {
 						result := &WatchResult{
-							PaneID:    pane.target(),
+							Slot:      tgt.Slot,
+							Created:   created,
 							Event:     trig.Name,
 							Detail:    detail,
 							Elapsed:   elapsed.Seconds(),
@@ -450,7 +464,8 @@ func monitorPaneFrom(
 				}
 				if elapsed >= time.Duration(timeoutSecs)*time.Second {
 					result := &WatchResult{
-						PaneID:    pane.target(),
+						Slot:      tgt.Slot,
+						Created:   created,
 						Event:     "timeout",
 						Detail:    fmt.Sprintf("Timed out after %ds", timeoutSecs),
 						Elapsed:   elapsed.Seconds(),
@@ -525,7 +540,8 @@ func monitorPaneFrom(
 				fired, detail := trig.Check(ctx, ms)
 				if fired {
 					result := &WatchResult{
-						PaneID:    pane.target(),
+						Slot:      tgt.Slot,
+						Created:   created,
 						Event:     trig.Name,
 						Detail:    detail,
 						Elapsed:   elapsed.Seconds(),
@@ -548,14 +564,14 @@ func monitorPaneFrom(
 			}
 
 			if shouldNotify {
-				// pane.target() is one of the two places this file still names a
-				// pane to the caller — the other is WatchResult.PaneID. Both are
-				// the wire's remaining ids, and both become the slot in the
-				// contract commit.
+				// The message names the SLOT. It used to name the pane id, which
+				// is one of the four paths an id escaped through that no response
+				// type covers — a progress notification is not a response, and
+				// nothing that scanned response structs could ever have seen it.
 				_ = s.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
 					"progress": int(elapsed.Seconds()),
 					"total":    timeoutSecs,
-					"message":  fmt.Sprintf("[%s +%ds] %d new lines", pane.target(), int(elapsed.Seconds()), ms.NewLineCount),
+					"message":  fmt.Sprintf("[slot %d +%ds] %d new lines", tgt.Slot, int(elapsed.Seconds()), ms.NewLineCount),
 				})
 				ms.LastProgressTime = time.Now()
 				ms.NewLineCount = 0
@@ -564,7 +580,8 @@ func monitorPaneFrom(
 			// Check overall timeout.
 			if elapsed >= timeout {
 				result := &WatchResult{
-					PaneID:    pane.target(),
+					Slot:      tgt.Slot,
+					Created:   created,
 					Event:     "timeout",
 					Detail:    fmt.Sprintf("Timed out after %ds", timeoutSecs),
 					Elapsed:   elapsed.Seconds(),
