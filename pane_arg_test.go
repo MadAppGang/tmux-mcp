@@ -92,61 +92,62 @@ func TestParseSlotArg(t *testing.T) {
 	}
 }
 
-// TestPaneResolutionFlattens pins the embedding behaviour the response types
-// depend on.
+// TestSlotEmbeddingFlattens pins a Go rule the responses depend on: the
+// exported fields of an embedded UNEXPORTED struct type are promoted into the
+// enclosing JSON object rather than nested under a sub-object.
 //
-// Go's encoding/json promotes the exported fields of an embedded struct even
-// when the struct's own type is unexported — which is what lets pane-state and
-// run-in-repl gain slot/created without nesting them under a sub-object, and
-// without either response growing a second paneId key. It is a rule about the
-// library rather than about this code, so it is checked rather than assumed: a
-// future Go that changed it, or an edit that reintroduced a PaneID field
-// alongside the embedded struct, would produce an object no client parses the
-// way we think it does.
-func TestPaneResolutionFlattens(t *testing.T) {
+// That promotion is what lets pane-state answer {"panePid":…,"slot":1} and
+// run-in-repl answer {"slot":1,"created":false,"output":…} without either
+// response growing a nested object no client expects. It is a rule about the
+// library rather than about this code, so it is checked rather than assumed.
+//
+// It also pins the two always-present fields. created is a POINTER so that
+// "absent" and "false" are different answers — a reading tool omits the key
+// entirely — while exited and timedOut have no omitempty at all, because an
+// absent key makes `result.exited === false` unsatisfiable for the caller and
+// gives a model reading the response no way to learn the field exists.
+func TestSlotEmbeddingFlattens(t *testing.T) {
 	t.Run("pane-state", func(t *testing.T) {
 		out := marshalMap(t, paneStateResult{
-			PaneState:      &PaneState{PanePID: 42, IsAlive: true},
-			paneResolution: paneResolution{PaneID: "%7", Slot: 2, Created: true},
+			PaneState: &PaneState{PanePID: 42, IsAlive: true},
+			slotRef:   slotRef{Slot: 2},
 		})
 		assertFlat(t, out, map[string]any{
-			"paneId": "%7", "slot": float64(2), "created": true,
-			"panePid": float64(42), "isAlive": true,
+			"slot": float64(2), "panePid": float64(42), "isAlive": true,
 		})
+		if _, ok := out["created"]; ok {
+			t.Error("pane-state reads; created must be absent, not false")
+		}
 	})
 
 	t.Run("run-in-repl", func(t *testing.T) {
 		out := marshalMap(t, replResult{
-			paneResolution: paneResolution{PaneID: "%7", Slot: 2, Created: true},
+			slotResolution: slotResolution{Slot: 2, Created: creating(true)},
 			Output:         "hello",
 		})
 		assertFlat(t, out, map[string]any{
-			"paneId": "%7", "slot": float64(2), "created": true, "output": "hello",
+			"slot": float64(2), "created": true, "output": "hello", "exited": false,
 		})
-		if _, ok := out["exited"]; ok {
-			t.Error("exited must be omitted when false — that is what keeps the ordinary answer unchanged")
-		}
 	})
 
-	t.Run("explicit paneId omits the resolution fields", func(t *testing.T) {
-		for name, v := range map[string]any{
-			"send-keys":   paneTarget{PaneID: "%3"}.resolution(),
-			"run-in-repl": replResult{paneResolution: paneTarget{PaneID: "%3"}.resolution()},
-			"pane-state": paneStateResult{
-				PaneState:      &PaneState{PanePID: 1},
-				paneResolution: paneTarget{PaneID: "%3"}.resolution(),
-			},
-		} {
-			out := marshalMap(t, v)
-			for _, key := range []string{"slot", "created"} {
-				if _, ok := out[key]; ok {
-					t.Errorf("%s: %q present for an explicitly named pane; it must be omitted so the "+
-						"response is unchanged for existing callers", name, key)
-				}
-			}
-			if out["paneId"] != "%3" {
-				t.Errorf("%s: paneId is %v, want %q", name, out["paneId"], "%3")
-			}
+	t.Run("execute-command", func(t *testing.T) {
+		out := marshalMap(t, execResult{
+			slotResolution: slotResolution{Slot: 1, Created: creating(false)},
+			Output:         "hi",
+		})
+		assertFlat(t, out, map[string]any{
+			"slot": float64(1), "created": false, "output": "hi",
+			"exitCode": float64(0), "timedOut": false,
+		})
+	})
+
+	t.Run("a reading tool omits created entirely", func(t *testing.T) {
+		out := marshalMap(t, WatchResult{Slot: 3, Event: "timeout"})
+		if _, ok := out["created"]; ok {
+			t.Errorf("created present on a reading WatchResult: %v", out)
+		}
+		if out["slot"] != float64(3) {
+			t.Errorf("slot is %v, want 3", out["slot"])
 		}
 	})
 }
@@ -157,11 +158,12 @@ func marshalMap(t *testing.T, v any) map[string]any {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	// Count the keys by hand as well: json.Unmarshal into a map silently keeps
-	// only the last of two identical keys, which would hide the exact bug the
-	// embedded paneResolution could cause.
-	if n := strings.Count(string(data), `"paneId"`); n != 1 {
-		t.Fatalf("expected exactly one paneId key, found %d in %s", n, data)
+	// Read the raw bytes as well as the decoded map: json.Unmarshal into a map
+	// silently keeps only the last of two identical keys, so a duplicated key —
+	// the exact bug an embedded struct can cause — would be invisible in the map.
+	// And no response type may carry a pane id at all.
+	if strings.Contains(string(data), `"paneId"`) {
+		t.Fatalf("a response type carries a paneId: %s", data)
 	}
 	var out map[string]any
 	if err := json.Unmarshal(data, &out); err != nil {

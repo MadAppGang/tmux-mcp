@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -171,34 +170,73 @@ func TestDropEcho(t *testing.T) {
 	}
 }
 
-// TestCreateWindowMarksItsPane closes the last gap in the ownership invariant:
-// every pane the server creates must be marked, or it can never be reused.
-// SplitPane and createSessionOnSocket did this; CreateWindow did not.
-func TestCreateWindowMarksItsPane(t *testing.T) {
+// TestEveryPaneWeMakeIsAttributable is the ownership invariant at both of the
+// two places this server can now produce a pane, which is the whole of it: a
+// visible split, and an isolated session.
+//
+// It replaces a test that pinned create-window, a path that no longer exists —
+// the tool went with the primitives surface and the client method went with it.
+// The invariant did not go anywhere, and neither did the reason: a pane we made
+// that carries no attribution can never be reused, never be listed, and never be
+// closed by the tool whose job that is.
+//
+// The two halves are attributed by DIFFERENT mechanisms, which is why both are
+// asserted here rather than either standing for the other. A split is attributed
+// by pane options written after the fact, so the assertion is that the marks are
+// there. An isolated pane is attributed by the NAME of the session it is created
+// in, atomically with its creation, and carries no marks at all until Claim
+// writes them — so asserting marks on it would be asserting the wrong thing.
+func TestEveryPaneWeMakeIsAttributable(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
 	client := newTmuxClient("bash")
+	backend := newTmuxBackend(client)
 	ctx := context.Background()
 
 	name := uniqueSession(t)
-	sess, err := client.CreateSession(ctx, name)
-	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
+	tmuxExec(t, "new-session", "-d", "-x", "200", "-y", "50", "-s", name)
 	defer exec.Command("tmux", "kill-session", "-t", name).Run() //nolint:errcheck
+	anchor := tmuxExec(t, "display-message", "-p", "-t", name, "#{pane_id}")
 
-	win, err := client.CreateWindow(ctx, sess.SessionID, "work")
+	split, err := client.SplitPane(ctx, anchor, "vertical", 50)
 	if err != nil {
-		t.Fatalf("create window: %v", err)
+		t.Fatalf("split pane: %v", err)
 	}
-
-	owned, err := client.ownedPanesInWindow(ctx, win.WindowID)
+	owned, err := client.ownedPanesInWindow(ctx, anchor)
 	if err != nil {
 		t.Fatalf("ownedPanesInWindow: %v", err)
 	}
-	if !owned[win.PaneID] {
-		t.Errorf("pane %s came from create-window, so it is ours, but it is not marked owned", win.PaneID)
+	if !owned[split.PaneID] {
+		t.Errorf("a pane this server split is not marked owned, so nothing can ever reuse, list "+
+			"or close it: %v", owned)
+	}
+
+	pane, err := backend.OpenIsolated(ctx)
+	if err != nil {
+		t.Fatalf("open an isolated pane: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close(context.Background(), pane) })
+
+	panes, err := backend.IsolatedPanes(ctx)
+	if err != nil {
+		t.Fatalf("list this namespace's panes: %v", err)
+	}
+	if !slices.Contains(panes, pane) {
+		t.Errorf("an isolated pane this server opened is not in its own namespace, so the sweep "+
+			"that reclaims unclaimed panes would never find it: %v", panes)
+	}
+
+	// And it carries no marks yet, which is the half that is easy to "fix" into
+	// a second mark writer. Attribution here is the session name; Claim is the
+	// one thing that writes an option, and it has not run.
+	records, err := backend.IsolatedRecords(ctx)
+	if err != nil {
+		t.Fatalf("read this namespace's registry: %v", err)
+	}
+	if _, claimed := records[pane]; claimed {
+		t.Error("a freshly opened isolated pane already carries registry marks: something other " +
+			"than Claim is writing them, which is what makes the write order unanalysable")
 	}
 }
 
@@ -370,90 +408,24 @@ func tmuxExec(t *testing.T, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// TestReuseIgnoresPanesWeDoNotOwn is the regression for pane reuse hijacking the
-// user's shell.
-//
-// Reuse used to accept any idle pane in the window. A user's shell sitting at a
-// prompt is idle but emphatically not free: it may be parked at an `ssh prod`, a
-// `sudo -i`, or a psql session, where "reusing" it runs the agent's command in
-// that context — and a later teardown kills the pane out from under them.
-func TestReuseIgnoresPanesWeDoNotOwn(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	defer c.close()
-
-	sess := createSession(t, c, uniqueSession(t))
-	sessionID := sess["sessionId"].(string)
-	defer c.callToolJSON(t, "kill-session", map[string]any{"sessionId": sessionID}, &map[string]any{})
-	sourcePane := sess["paneId"].(string)
-
-	// Stand in for the user's own pane: split with raw tmux, so the server never
-	// sees it and never marks it. It settles at an idle shell prompt — a perfect
-	// reuse candidate by the old rules.
-	usersPane := tmuxExec(t, "split-window", "-d", "-t", sourcePane, "-P", "-F", "#{pane_id}")
-	waitForPaneIdle(t, c, usersPane)
-
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{"paneId": sourcePane}, &split)
-
-	if got := split["paneId"].(string); got == usersPane {
-		t.Fatalf("split-pane reused the user's pane %s; it must only ever reuse panes it created", got)
-	}
-	if reused, _ := split["reused"].(bool); reused {
-		t.Errorf("split-pane reported reused=true, but the only idle pane was the user's")
-	}
-}
-
-// TestReuseStillWorksForOurOwnPanes guards the fix above against overcorrecting:
-// a pane the server made and left idle must still be recycled rather than piling
-// up another split.
-func TestReuseStillWorksForOurOwnPanes(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	defer c.close()
-
-	sess := createSession(t, c, uniqueSession(t))
-	sessionID := sess["sessionId"].(string)
-	defer c.callToolJSON(t, "kill-session", map[string]any{"sessionId": sessionID}, &map[string]any{})
-	sourcePane := sess["paneId"].(string)
-
-	var first map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{"paneId": sourcePane}, &first)
-	ourPane := first["paneId"].(string)
-	waitForPaneIdle(t, c, ourPane)
-
-	var second map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{"paneId": sourcePane}, &second)
-
-	if got := second["paneId"].(string); got != ourPane {
-		t.Errorf("split-pane created pane %s instead of reusing our idle pane %s", got, ourPane)
-	}
-	if reused, _ := second["reused"].(bool); !reused {
-		t.Error("split-pane should have reported reused=true")
-	}
-}
-
-// TestSplitPaneDefaultsToOwnPane covers the self-location default: split-pane
-// with no paneId splits the pane the server itself runs in.
+// TestOpenPaneDefaultsToOwnWindow covers the self-location default: open-pane
+// with no arguments puts a pane beside the one the server itself runs in.
 //
 // The fixture is built with raw tmux rather than through the server because the
 // pane has to exist *before* the server starts — TMUX_PANE is read from the
 // environment at spawn, exactly as it is in production, and a pane the server
 // created for itself would not be the situation this default exists for.
 //
-// Two assertions, and the first is the safety one. The returned pane must not be
-// the server's own: the agent's whole session lives in that pane, and a tool
-// that answered with it would hand every later send-keys a licence to type into
-// the conversation the user is having. It cannot happen here — a split never
-// returns the pane it split — and that is precisely the property being pinned,
-// because it is what makes "defaults to my own pane" safe at all. The second
-// says the new pane landed in the user's window rather than in some session of
-// the server's own making, which is the behaviour that makes the default useful.
-func TestSplitPaneDefaultsToOwnPane(t *testing.T) {
+// Two assertions, and the first is the safety one. The pane behind the slot must
+// not be the server's own: the agent's whole session lives in that pane, and a
+// resolution that answered with it would hand every later send-keys a licence to
+// type into the conversation the user is having. It cannot happen — a split
+// never returns the pane it split, and helperResult refuses self besides — and
+// that is precisely the property being pinned, because it is what makes
+// "defaults to my own window" safe at all. The second says the new pane landed
+// in the user's window rather than in some session of the server's own making,
+// which is the behaviour that makes the default useful.
+func TestOpenPaneDefaultsToOwnWindow(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
@@ -467,26 +439,26 @@ func TestSplitPaneDefaultsToOwnPane(t *testing.T) {
 
 	c := newMCPClientInPane(t, self)
 
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{}, &split)
+	var opened map[string]any
+	c.callToolJSON(t, "open-pane", map[string]any{}, &opened)
+	if opened["created"] != true {
+		t.Fatalf("the first open-pane must report created:true, got %v", opened)
+	}
+	if _, hasPaneID := opened["paneId"]; hasPaneID {
+		t.Fatalf("open-pane answered with a paneId: %v", opened)
+	}
 
-	got, _ := split["paneId"].(string)
-	if got == "" {
-		t.Fatalf("split-pane with no paneId returned no pane: %v", split)
-	}
+	got := slotPaneID(t, self, 1)
 	if got == self {
-		t.Fatalf("split-pane returned the server's own pane %s; the pane it splits must never be the pane it returns", got)
-	}
-	if gotWindow, _ := split["windowId"].(string); gotWindow != wantWindow {
-		t.Errorf("split-pane put the new pane in window %s, want %s — the window the server's own pane lives in", gotWindow, wantWindow)
+		t.Fatalf("slot 1 resolved to the server's own pane %s; the pane it splits must never be the pane it returns", got)
 	}
 	if panes := tmuxExec(t, "list-panes", "-t", wantWindow, "-F", "#{pane_id}"); !strings.Contains(panes, got) {
 		t.Errorf("pane %s is not in window %s (window holds %q)", got, wantWindow, panes)
 	}
 }
 
-// TestSplitPaneOutsideTmuxNamesHeadless pins what happens when there is no self
-// pane to default to.
+// TestOpenPaneOutsideTmuxNamesTheWayForward pins what happens when there is no
+// self pane to default to.
 //
 // isolateTmux clears TMUX_PANE for the whole test process and newMCPClient does
 // not put it back, so this server genuinely has no pane — the same position a
@@ -496,16 +468,19 @@ func TestSplitPaneDefaultsToOwnPane(t *testing.T) {
 // point of the test. The incident this feature comes from began with an agent
 // that could not distinguish "I am not in tmux" from "I passed a bad argument",
 // and started shelling out to raw tmux to work out which. A message that names
-// the way forward — headless — is what ends that guessing, so the wording is
-// part of the contract rather than decoration.
-func TestSplitPaneOutsideTmuxNamesHeadless(t *testing.T) {
+// the way forward is what ends that guessing, so the wording is part of the
+// contract rather than decoration — and the wording had to change, because the
+// three routes the old sentence named (paneId, headless:true, create-headless)
+// are all deleted by this release. An error naming a tool that does not exist is
+// the same failure as an error that says only "no".
+func TestOpenPaneOutsideTmuxNamesTheWayForward(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
 
 	c := newMCPClient(t)
 
-	raw := c.callToolRaw(t, "split-pane", map[string]any{})
+	raw := c.callToolRaw(t, "open-pane", map[string]any{})
 
 	var result struct {
 		IsError bool `json:"isError"`
@@ -514,20 +489,22 @@ func TestSplitPaneOutsideTmuxNamesHeadless(t *testing.T) {
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &result); err != nil {
-		t.Fatalf("unmarshal split-pane result: %v\nraw: %s", err, raw)
+		t.Fatalf("unmarshal open-pane result: %v\nraw: %s", err, raw)
 	}
 	if !result.IsError {
-		t.Fatalf("split-pane with no paneId and no TMUX_PANE must be an error, got: %s", raw)
+		t.Fatalf("open-pane with no TMUX_PANE must be an error, got: %s", raw)
 	}
 	if len(result.Content) == 0 {
 		t.Fatalf("error result carried no message: %s", raw)
 	}
 	text := result.Content[0].Text
-	if !strings.Contains(text, "headless") {
-		t.Errorf("error message must name the headless alternative, got %q", text)
+	if text != errNoWindowText {
+		t.Errorf("error message is %q, want the one sentence this case has:\n%q", text, errNoWindowText)
 	}
-	if !strings.Contains(text, "paneId") {
-		t.Errorf("error message must name the explicit-paneId alternative, got %q", text)
+	for _, gone := range []string{"paneId", "create-headless", "$TMUX_PANE"} {
+		if strings.Contains(text, gone) {
+			t.Errorf("error message names %q, which this release deletes: %q", gone, text)
+		}
 	}
 }
 
@@ -585,16 +562,21 @@ func TestOwnershipSurvivesSessionScopedOptionLeak(t *testing.T) {
 	}
 }
 
-// TestHeadlessServerIgnoresUserConfig is the regression for the headless server
+// TestHeadlessServerIgnoresUserConfig is the regression for the isolated server
 // not actually being isolated.
 //
 // tmux reads a config file when a server starts, so without -f /dev/null the
-// first command on the headless socket loads the user's ~/.tmux.conf. A config
+// first command on the isolated socket loads the user's ~/.tmux.conf. A config
 // running tmux-resurrect/tmux-continuum — or, as here, any run-shell that creates
 // a session — then restores the user's workspace *into* the sandbox. It stops
-// being isolated, and kill-headless-server, which iterates and kills every
-// session it finds, starts killing the user's real work.
-func TestHeadlessServerIgnoresUserConfig(t *testing.T) {
+// being isolated, and a sweep that iterates and closes every pane it finds there
+// starts closing the user's real work.
+//
+// It drives the backend rather than a tool, because the invariant is about the
+// SOCKET and not about any one tool: every isolated slot on the surface reaches
+// this socket through OpenIsolated, so proving it here proves it for all of
+// them.
+func TestIsolatedServerIgnoresUserConfig(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
@@ -607,35 +589,45 @@ func TestHeadlessServerIgnoresUserConfig(t *testing.T) {
 		t.Fatalf("write fixture config: %v", err)
 	}
 
-	// The headless server may already be up from an earlier test, in which case
+	// The isolated server may already be up from an earlier test, in which case
 	// it would not re-read any config. Tear it down so this test observes a real
-	// server start.
+	// server start. This is the ONE place that kills that server, and it is a
+	// test on an isolated TMUX_TMPDIR: the product never does it, because the
+	// socket is shared and the window in which "is it up?" fails is exactly the
+	// window in which a neighbour is starting one.
 	_ = exec.Command("tmux", "-L", headlessSocket, "kill-server").Run()
 
-	// The child inherits our environment, and tmux resolves ~ from $HOME.
+	// tmux resolves ~ from $HOME.
 	t.Setenv("HOME", home)
 
-	c := newMCPClient(t)
-	defer c.close()
+	backend := newTmuxBackend(newTmuxClient("bash"))
+	ctx := context.Background()
+	pane, err := backend.OpenIsolated(ctx)
+	if err != nil {
+		t.Fatalf("open an isolated pane: %v", err)
+	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", headlessSocket, "kill-server").Run() })
 
-	var created map[string]any
-	c.callToolJSON(t, "create-headless", map[string]any{}, &created)
-	defer c.callToolJSON(t, "kill-headless-server", map[string]any{}, &map[string]any{})
+	out, err := exec.Command("tmux", append(socketArgs(headlessSocket),
+		"list-sessions", "-F", "#{session_name}")...).Output()
+	if err != nil {
+		t.Fatalf("list sessions on the isolated socket: %v", err)
+	}
+	names := strings.Split(strings.TrimSpace(string(out)), "\n")
 
-	var sessions []map[string]any
-	c.callToolJSON(t, "list-sessions", map[string]any{"headless": true}, &sessions)
-
-	for _, s := range sessions {
-		if name, _ := s["name"].(string); name == "pwned" {
-			t.Fatal("the user's tmux.conf was loaded into the headless server: it is not isolated")
+	for _, name := range names {
+		if name == "pwned" {
+			t.Fatal("the user's tmux.conf was loaded into the isolated server: it is not isolated")
 		}
 	}
-	if len(sessions) != 1 {
-		names := make([]string, 0, len(sessions))
-		for _, s := range sessions {
-			names = append(names, fmt.Sprint(s["name"]))
-		}
-		t.Fatalf("headless server should hold exactly the 1 session we created, got %d: %v", len(sessions), names)
+	if len(names) != 1 {
+		t.Fatalf("the isolated server should hold exactly the 1 session opening %v created, got %d: %v",
+			pane, len(names), names)
+	}
+	if !strings.HasPrefix(names[0], backend.namespacePrefix()) {
+		t.Errorf("the session is named %q, which does not carry this server's namespace %q — "+
+			"attribution is the session name, so a pane in a session we cannot recognise is a "+
+			"pane no sweep will ever reclaim", names[0], backend.namespacePrefix())
 	}
 }
 
@@ -645,27 +637,16 @@ func TestHeadlessServerIgnoresUserConfig(t *testing.T) {
 // user's cursor out of whatever they were typing in — typically their
 // conversation with the agent.
 func TestSplitDoesNotStealFocus(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	defer c.close()
+	c, self := agentPaneFixture(t)
 
-	sess := createSession(t, c, uniqueSession(t))
-	sessionID := sess["sessionId"].(string)
-	defer c.callToolJSON(t, "kill-session", map[string]any{"sessionId": sessionID}, &map[string]any{})
-	sourcePane := sess["paneId"].(string)
+	newPane := openSlot(t, c, self, 1)
 
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{"paneId": sourcePane}, &split)
-	newPane := split["paneId"].(string)
-
-	active := tmuxExec(t, "display-message", "-p", "-t", sessionID, "#{pane_id}")
+	active := tmuxExec(t, "display-message", "-p", "-t", self, "#{pane_id}")
 	if active == newPane {
-		t.Errorf("split made the new pane %s active, stealing focus from %s", newPane, sourcePane)
+		t.Errorf("open-pane made the new pane %s active, stealing focus from %s", newPane, self)
 	}
-	if active != sourcePane {
-		t.Errorf("active pane is %s, want the source pane %s", active, sourcePane)
+	if active != self {
+		t.Errorf("active pane is %s, want the agent's own pane %s", active, self)
 	}
 }
 
@@ -676,30 +657,35 @@ func TestSplitDoesNotStealFocus(t *testing.T) {
 // At 80 columns a dev server's output wraps mid-line, which silently defeats
 // readiness patterns that expect their match on a single line — a failure that
 // looks like the pattern being wrong rather than the pane being narrow.
+//
+// Every detached session this server creates is now an ISOLATED one — that is
+// the only path left that creates a session at all — so the test drives
+// OpenIsolated. The sizing rule and the failure it prevents are unchanged; only
+// the caller is.
 func TestDetachedSessionIsNotEightyColumns(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	c := newMCPClient(t)
-	defer c.close()
+	backend := newTmuxBackend(newTmuxClient("bash"))
+	ctx := context.Background()
 
-	sess := createSession(t, c, uniqueSession(t))
-	sessionID := sess["sessionId"].(string)
-	defer c.callToolJSON(t, "kill-session", map[string]any{"sessionId": sessionID}, &map[string]any{})
-
-	var panes []map[string]any
-	c.callToolJSON(t, "list-panes", map[string]any{"windowId": sess["windowId"].(string)}, &panes)
-	if len(panes) != 1 {
-		t.Fatalf("expected 1 pane, got %d", len(panes))
+	pane, err := backend.OpenIsolated(ctx)
+	if err != nil {
+		t.Fatalf("open an isolated pane: %v", err)
 	}
+	t.Cleanup(func() { _ = backend.Close(context.Background(), pane) })
 
-	width := int(panes[0]["width"].(float64))
-	if width != detachedWidth {
-		t.Errorf("detached pane is %d columns wide, want %d (80 wraps long output lines)", width, detachedWidth)
+	cols, rows, err := backend.c.GetPaneDimensions(ctx, pane.target())
+	if err != nil {
+		t.Fatalf("read the pane's dimensions: %v", err)
 	}
-	height := int(panes[0]["height"].(float64))
-	if height != detachedHeight {
-		t.Errorf("detached pane is %d rows tall, want %d (24 gives almost no scrollback to read)", height, detachedHeight)
+	if cols != detachedWidth {
+		t.Errorf("detached pane is %d columns wide, want %d (80 wraps long output lines)",
+			cols, detachedWidth)
+	}
+	if rows != detachedHeight {
+		t.Errorf("detached pane is %d rows tall, want %d (24 gives almost no scrollback to read)",
+			rows, detachedHeight)
 	}
 }
 
@@ -718,25 +704,16 @@ func TestDetachedSessionIsNotEightyColumns(t *testing.T) {
 // test of dropEcho at the same time: were the echo still reaching the triggers,
 // a pattern like "42" would need to come from the command's result either way.
 func TestStartAndWatchMatchesAnInstantCommand(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	defer c.close()
-
-	sess := createSession(t, c, uniqueSession(t))
-	sessionID := sess["sessionId"].(string)
-	defer c.callToolJSON(t, "kill-session", map[string]any{"sessionId": sessionID}, &map[string]any{})
-	paneID := sess["paneId"].(string)
+	c, self := agentPaneFixture(t)
+	pane := openSlot(t, c, self, 1)
 
 	// Run it repeatedly: this is a race, and a race that passes once proves
 	// nothing.
 	for i := range 10 {
-		waitForPaneIdle(t, c, paneID)
+		waitForPaneIdle(t, pane)
 
 		var res map[string]any
 		c.callToolJSON(t, "start-and-watch", map[string]any{
-			"paneId":  paneID,
 			"command": "expr 40 + 2", // echoes as "expr 40 + 2"; prints "42"
 			"pattern": "^42$",
 			"timeout": 10,
@@ -764,23 +741,14 @@ func TestStartAndWatchMatchesAnInstantCommand(t *testing.T) {
 // error before running, and a readiness pattern occurring in the command string
 // would report ready before anything started. One bug was concealing the other.
 func TestStartAndWatchDoesNotMatchItsOwnCommandLine(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	defer c.close()
-
-	sess := createSession(t, c, uniqueSession(t))
-	sessionID := sess["sessionId"].(string)
-	defer c.callToolJSON(t, "kill-session", map[string]any{"sessionId": sessionID}, &map[string]any{})
-	paneID := sess["paneId"].(string)
-	waitForPaneIdle(t, c, paneID)
+	c, self := agentPaneFixture(t)
+	pane := openSlot(t, c, self, 1)
+	waitForPaneIdle(t, pane)
 
 	// "listening" appears in the command line but never in the output. If the
 	// echo reaches the triggers, the pattern fires immediately and wrongly.
 	var res map[string]any
 	c.callToolJSON(t, "start-and-watch", map[string]any{
-		"paneId":   paneID,
 		"command":  "printf 'server up\\n' # listening on :3000",
 		"pattern":  "listening on",
 		"triggers": "idle:2",

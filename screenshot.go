@@ -112,26 +112,29 @@ func renderHTMLToPNG(ctx context.Context, htmlContent string, cols, rows int) ([
 }
 
 // handleScreenshotPane is the handler for the screenshot-pane tool.
-func handleScreenshotPane(ctx context.Context, client *tmuxClient, paneID, theme, output string) (*mcp.CallToolResult, error) {
-	// 1. Get pane dimensions (fall back to 80x24 on error).
-	cols, rows, err := client.GetPaneDimensions(ctx, paneID)
-	if err != nil {
-		cols, rows = 80, 24
-	}
-
-	// 2. Capture ANSI content.
-	ansiContent, err := client.CapturePaneRaw(ctx, paneID)
+//
+// It takes the port, a handle AND the slot, and the slot is not redundant: the
+// image caption names the pane to the model, and the slot is the only name this
+// contract has. That caption used to read "Terminal screenshot of pane %3" —
+// one of the four paths an id escaped through that no response type covers,
+// because an image caption is not a response field.
+func handleScreenshotPane(ctx context.Context, b Backend, pane paneRef, slot int, theme, output string) (*mcp.CallToolResult, error) {
+	// 1. Snapshot the pane: its content and its geometry. Both tmux commands,
+	// and the 80x24 fallback that covers a failed measurement, live behind
+	// Screen — this file renders, it does not talk to the multiplexer.
+	snap, err := b.Screen(ctx, pane)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("failed to capture pane", err), nil
 	}
+	cols, rows := snap.Cols, snap.Rows
 
-	// 3. Detect terminal style (best-effort, never errors).
+	// 2. Detect terminal style (best-effort, never errors).
 	style := detectTerminalStyle()
 
-	// 4. Generate HTML.
-	html := generateScreenshotHTML(ansiContent, cols, rows, style, theme)
+	// 3. Generate HTML.
+	html := generateScreenshotHTML(snap.ANSI, cols, rows, style, theme)
 
-	// 5. Output based on mode.
+	// 4. Output based on mode.
 	switch output {
 	case "html":
 		return mcp.NewToolResultText(html), nil
@@ -149,7 +152,7 @@ func handleScreenshotPane(ctx context.Context, client *tmuxClient, paneID, theme
 		pngData, renderErr := renderHTMLToPNG(ctx, html, cols, rows)
 		if renderErr == nil {
 			return mcp.NewToolResultImage(
-				"Terminal screenshot of pane "+paneID,
+				fmt.Sprintf("Terminal screenshot of slot %d", slot),
 				base64.StdEncoding.EncodeToString(pngData),
 				"image/png",
 			), nil

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,7 +47,10 @@ func (r callToolResult) text(t *testing.T, tool string) string {
 // the way one started from inside the user's terminal does, and returns the
 // client plus that pane's id. Every slot the server resolves lands in this
 // pane's window.
-func agentPaneFixture(t *testing.T) (*mcpClient, string) {
+//
+// extraArgs are passed to the server process — "--channel" is the only one any
+// test uses.
+func agentPaneFixture(t *testing.T, extraArgs ...string) (*mcpClient, string) {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("requires tmux")
@@ -58,95 +60,10 @@ func agentPaneFixture(t *testing.T) (*mcpClient, string) {
 	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", name).Run() })
 
 	self := tmuxExec(t, "display-message", "-p", "-t", name, "#{pane_id}")
-	return newMCPClientInPane(t, self), self
+	return newMCPClientInPane(t, self, extraArgs...), self
 }
 
-// ---- The rule that must hold for every tool, including ones not yet written ----
-
-// TestSlotAndHeadlessAlwaysConflict enumerates tools/list rather than naming
-// tools, and that is the entire point of it.
-//
-// slot and headless:true are contradictory: a slot names a pane in the window
-// this server runs in, while a headless pane lives on a separate tmux server
-// with no window at all. Silently preferring either one hands the caller a pane
-// in the wrong universe with no way to notice — so the pair is an error.
-//
-// The rule lives in one function (resolvePaneArg), but a rule is only as good as
-// the number of handlers that route through it. By discovering the tools from
-// the server's own schema, this test covers the tenth tool somebody adds next
-// year without anyone remembering to extend it: declare a slot property, and you
-// are in this test.
-func TestSlotAndHeadlessAlwaysConflict(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-
-	raw := c.call(t, "tools/list", map[string]any{})
-	var list struct {
-		Tools []struct {
-			Name        string `json:"name"`
-			InputSchema struct {
-				Properties map[string]any `json:"properties"`
-			} `json:"inputSchema"`
-		} `json:"tools"`
-	}
-	if err := json.Unmarshal(raw, &list); err != nil {
-		t.Fatalf("unmarshal tools/list: %v", err)
-	}
-
-	// Every required argument any slot-taking tool has, so each call fails on the
-	// slot/headless contradiction rather than on a missing argument — a test that
-	// passed because the call was malformed would be guarding nothing.
-	args := map[string]any{
-		"slot":          1,
-		"headless":      true,
-		"keys":          "echo hi",
-		"command":       "true",
-		"pattern":       "never-matches-anything",
-		"input":         "1+1",
-		"promptPattern": ">>> ",
-		"text":          "hello",
-	}
-
-	var checked []string
-	for _, tool := range list.Tools {
-		if _, ok := tool.InputSchema.Properties["slot"]; !ok {
-			continue
-		}
-		checked = append(checked, tool.Name)
-		res := callTool(t, c, tool.Name, args)
-		if !res.IsError {
-			t.Errorf("%s accepted slot together with headless:true; the pair must be refused", tool.Name)
-			continue
-		}
-		msg := res.text(t, tool.Name)
-		if !strings.Contains(msg, "headless") {
-			t.Errorf("%s rejected the call for the wrong reason — the message does not mention "+
-				"headless, so something other than the argument checks refused it: %s", tool.Name, msg)
-			continue
-		}
-		// Which of the two refusals is correct depends on the tool. A tool with
-		// no headless mode at all refuses on that, and says so, which is the more
-		// useful answer; only a tool that genuinely implements headless gets as
-		// far as the slot-versus-headless contradiction. Both are errors, and the
-		// distinction is read off the schema rather than a hand-written list so a
-		// tool that gains or loses headless support cannot fall out of the test.
-		if _, hasHeadless := tool.InputSchema.Properties["headless"]; hasHeadless {
-			if !strings.Contains(msg, "slot") {
-				t.Errorf("%s implements headless, so its refusal must be the slot/headless "+
-					"contradiction and must name the slot: %s", tool.Name, msg)
-			}
-		}
-	}
-
-	// Ten tools take a slot, write-to-display being the most recent. The lower
-	// bound catches a registration that silently stopped declaring the property,
-	// which would otherwise make this test pass by checking nothing.
-	if len(checked) < 10 {
-		t.Errorf("only %d tools declare a slot property (%v); expected at least 10", len(checked), checked)
-	}
-}
+// ---- Descriptions must not advertise what the parser refuses ----
 
 // slotLiteral matches the form a description uses to show a slot value —
 // slot:2, slot:"all" — which is also the form an agent copies verbatim into its
@@ -229,7 +146,7 @@ func TestDescriptionsAdvertiseOnlySlotsThatParse(t *testing.T) {
 
 	// The lower bound is what stops this passing by finding nothing — a regex
 	// that stopped matching, or a schema that stopped carrying descriptions,
-	// would otherwise look like a clean run. split-pane alone shows two.
+	// would otherwise look like a clean run. open-pane alone shows two.
 	if checked < 3 {
 		t.Errorf("only %d slot literals were found in any tool description; the descriptions that "+
 			"teach an agent how to name a pane have gone missing, or this test has stopped "+
@@ -237,138 +154,7 @@ func TestDescriptionsAdvertiseOnlySlotsThatParse(t *testing.T) {
 	}
 }
 
-// ---- No consumer breaks ----
-
-// TestExplicitPaneIdResponsesAreUnchanged is the evidence for "paneId keeps
-// working everywhere", checked at the wire level rather than argued.
-//
-// send-keys is pinned to its exact bytes because it is the smallest response in
-// the server and the one most likely to be parsed by something rigid. The others
-// are checked for the absence of the new keys: omitempty is what makes a call
-// that named its pane produce the object it produced before slots existed, and
-// omitempty is easy to lose in an edit.
-//
-// # The byte comparison is deliberate and is not to be relaxed
-//
-// Comparing against pretty-printed bytes looks like over-coupling — the reflex
-// is to unmarshal both sides and compare maps — and that reflex is wrong here.
-// The promise made to existing consumers of an explicit paneId is a WIRE
-// promise, not a semantic one: a caller that string-matches this response, or
-// diffs it against a golden file, or feeds it to a model that was shown the old
-// shape, breaks the day jsonResult swaps MarshalIndent for Marshal, even though
-// every field survives. Nothing else in the suite would notice that swap.
-//
-// So jsonResult's formatting — two-space indent, one key per line, no trailing
-// newline — is part of the published contract, and this line is where that is
-// recorded. Changing it is a deliberate compatibility break that needs a version
-// bump and a note to consumers; it is not a test to loosen on the way past.
-//
-// start-and-watch is here because WatchResult is a fourth response shape — its
-// own struct, not the shared paneResolution the other three embed — so nothing
-// else in this test would notice if its Slot and Created lost their omitempty.
-// It is the shape agents block on for minutes at a time, which makes it the
-// worst one to break and, until this was added, the only one nobody watched.
-func TestExplicitPaneIdResponsesAreUnchanged(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
-
-	// enter:true is not incidental. send-keys without it leaves the text sitting
-	// unsubmitted in the shell's line editor, and the next tool call to the same
-	// pane would have its command concatenated onto it — the hazard documented on
-	// canAcquire, reproduced here by accident the first time this test was
-	// written, where it hung the execute-command below for two minutes.
-	got := callTool(t, c, "send-keys", map[string]any{
-		"paneId": paneID, "keys": "echo hi", "enter": true,
-	}).text(t, "send-keys")
-	want := fmt.Sprintf("{\n  \"paneId\": %q\n}", paneID)
-	if got != want {
-		t.Errorf("send-keys with an explicit paneId answered:\n%s\nwant exactly:\n%s", got, want)
-	}
-	waitForPaneIdle(t, c, paneID)
-
-	for _, tc := range []struct {
-		tool string
-		args map[string]any
-	}{
-		{"split-pane", map[string]any{"paneId": paneID}},
-		{"execute-command", map[string]any{"paneId": paneID, "command": "true"}},
-		{"pane-state", map[string]any{"paneId": paneID}},
-	} {
-		var out map[string]any
-		c.callToolJSON(t, tc.tool, tc.args, &out)
-		for _, key := range []string{"slot", "created"} {
-			if _, ok := out[key]; ok {
-				t.Errorf("%s with an explicit paneId returned a %q key (%v); the resolution fields "+
-					"must be omitted when the caller named the pane", tc.tool, key, out)
-			}
-		}
-	}
-
-	// The two tools whose body is not JSON. capture-pane answers with the pane's
-	// exact text and screenshot-pane with an image, so neither can carry the
-	// resolution in its content and both put it in structuredContent instead —
-	// which is a TOP-LEVEL key of the tool result, and one that neither tool had
-	// before slots existed. paneResolution.PaneID has no omitempty and cannot
-	// have one (a resolved call must always say which pane it picked), so an
-	// unconditional assignment hands a caller that named its own pane a new key
-	// containing the id it just passed in. That is not additive metadata, it is a
-	// changed response shape, and it shipped because this test watched neither
-	// tool.
-	//
-	// screenshot-pane is asked for html rather than its default PNG so the
-	// assertion cannot be skipped on a machine without headless Chrome — the
-	// resolution is attached the same way in every output mode.
-	for _, tc := range []struct {
-		tool string
-		args map[string]any
-	}{
-		{"capture-pane", map[string]any{"paneId": paneID}},
-		{"screenshot-pane", map[string]any{"paneId": paneID, "output": "html"}},
-	} {
-		res := callTool(t, c, tc.tool, tc.args)
-		if res.IsError {
-			t.Fatalf("%s errored: %s", tc.tool, res.text(t, tc.tool))
-		}
-		if res.StructuredContent != nil {
-			t.Errorf("%s with an explicit paneId answered with structuredContent %v; this tool had "+
-				"no such key before slots existed, and a call that names its pane must get back "+
-				"exactly what it always got", tc.tool, res.StructuredContent)
-		}
-	}
-
-	waitForPaneIdle(t, c, paneID)
-
-	// The WatchResult shape. The pattern is matched by the command's own output
-	// rather than by its echo — dropEcho removes the echo — so this returns in
-	// well under a second and the timeout is only there to bound a failure.
-	var watch map[string]any
-	c.callToolJSON(t, "start-and-watch", map[string]any{
-		"paneId":  paneID,
-		"command": "echo watch-compat",
-		"pattern": "watch-compat",
-		"timeout": 15,
-	}, &watch)
-	if watch["paneId"] != paneID {
-		t.Errorf("start-and-watch with an explicit paneId answered for pane %v, want %s",
-			watch["paneId"], paneID)
-	}
-	if event, _ := watch["event"].(string); !strings.Contains(event, "watch-compat") {
-		t.Fatalf("start-and-watch did not match its own pattern (event %q); the assertion below "+
-			"would then be checking a timeout rather than a real answer: %v", event, watch)
-	}
-	for _, key := range []string{"slot", "created"} {
-		if _, ok := watch[key]; ok {
-			t.Errorf("start-and-watch with an explicit paneId returned a %q key (%v); WatchResult's "+
-				"resolution fields must be omitted when the caller named the pane", key, watch)
-		}
-	}
-}
-
-// ---- Resolution order ----
+// ---- The default target ----
 
 // panesInWindow lists the panes tmux currently has in a window, in its order.
 //
@@ -381,104 +167,39 @@ func panesInWindow(t *testing.T, windowID string) []string {
 	return strings.Split(tmuxExec(t, "list-panes", "-t", windowID, "-F", "#{pane_id}"), "\n")
 }
 
-// TestExplicitPaneIdBeatsSlot pins the first line of §8's resolution order —
-// paneId wins, verbatim — for the one call shape nothing else covers: BOTH
-// arguments given at once.
-//
-// Every other test passes one or the other, so a resolver that read the slot
-// "as well, just in case" would be green everywhere today. It is not a
-// hypothetical shape either: an agent that has learned to pass slot on every
-// call, and then learns a concrete paneId, sends both — and the cost of
-// resolving the slot anyway is paid in the user's window. Slot 2 with no slot-1
-// pane present splits the agent's own pane, so the user watches a pane appear,
-// with a shell in it, titled "agent", for a call that named the pane it wanted
-// and had no need of a second one. Nothing in the response would mention it.
-//
-// The three assertions are one claim from three sides: the response names the
-// pane the caller named and carries no resolution fields; the window has the
-// same panes it had before; and no pane anywhere in it carries a slot marker,
-// which is what a resolution would have written. The last one also catches the
-// subtler version, where an idle pane is ADOPTED for the slot rather than
-// created — no new pane, no new keys in the response, and one of the user's
-// shells quietly claimed.
-func TestExplicitPaneIdBeatsSlot(t *testing.T) {
-	c, self := agentPaneFixture(t)
-	window := tmuxExec(t, "display-message", "-p", "-t", self, "#{window_id}")
-
-	// The user's own pane, made with raw tmux so the server has never marked it.
-	// It is both the pane being named and — being idle and unowned — exactly what
-	// an unwanted slot resolution would reach for.
-	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	waitForPaneIdle(t, c, usersPane)
-	before := panesInWindow(t, window)
-
-	var out map[string]any
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": usersPane, "slot": 2, "keys": "echo pinned-by-paneid", "enter": true,
-	}, &out)
-
-	if got, _ := out["paneId"].(string); got != usersPane {
-		t.Fatalf("send-keys({paneId, slot}) answered for pane %v, want the named pane %s",
-			out["paneId"], usersPane)
-	}
-	for _, key := range []string{"slot", "created"} {
-		if _, ok := out[key]; ok {
-			t.Errorf("send-keys returned a %q key (%v) for a call that named its pane; the slot was "+
-				"not resolved, so there is no slot to report", key, out)
+// containsString reports whether a list holds an exact string.
+func containsString(list []string, want string) bool {
+	for _, got := range list {
+		if got == want {
+			return true
 		}
 	}
-
-	after := panesInWindow(t, window)
-	if len(after) != len(before) {
-		t.Errorf("the window went from %d panes to %d (%v → %v): the slot was resolved as well as "+
-			"the paneId, and the caller was charged a pane it never asked for",
-			len(before), len(after), before, after)
-	}
-	for _, pane := range after {
-		if got := tmuxExec(t, "display-message", "-p", "-t", pane, "#{"+paneOptSlot+"}"); got != "" {
-			t.Errorf("pane %s carries %s=%q after a call that named its pane explicitly; slot 2 was "+
-				"resolved behind the caller's back, and if it was adopted rather than created it is "+
-				"one of the user's shells", pane, paneOptSlot, got)
-		}
-	}
-
-	// And the keys went where they were addressed, so the assertions above are not
-	// being satisfied by a call that quietly did nothing.
-	waitForPaneIdle(t, c, usersPane)
-	captured := c.callToolText(t, "capture-pane", map[string]any{"paneId": usersPane})
-	if !strings.Contains(flattenPane(captured), "pinned-by-paneid") {
-		t.Errorf("the keys never reached the named pane %s; it holds:\n%s", usersPane, captured)
-	}
+	return false
 }
 
-// ---- The default target ----
-
-// TestSendKeysWithNoPaneIdUsesSlotOne is the behaviour change stated as a test.
+// TestSendKeysWithNoSlotUsesSlotOne is the behaviour change stated as a test.
 //
 // A bare send-keys({keys}) used to be an error, and that refusal is what the
 // incident behind this design began with: an agent told "paneId is required"
 // went looking for $TMUX_PANE and started driving raw tmux. It now lands in
 // helper slot 1 — never in the agent's own pane, which is Invariant R and is
 // asserted here at the tool level as well as inside the resolver.
-func TestSendKeysWithNoPaneIdUsesSlotOne(t *testing.T) {
+func TestSendKeysWithNoSlotUsesSlotOne(t *testing.T) {
 	c, self := agentPaneFixture(t)
 
 	var first map[string]any
 	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo one"}, &first)
 
-	pane, _ := first["paneId"].(string)
-	if pane == "" {
-		t.Fatalf("send-keys with no paneId returned no pane: %v", first)
-	}
-	if pane == self {
-		t.Fatalf("send-keys resolved to the agent's own pane %s — it would be typing into the "+
-			"conversation the user is having", pane)
-	}
 	if slot, _ := first["slot"].(float64); int(slot) != 1 {
 		t.Errorf("send-keys reported slot %v, want 1", first["slot"])
 	}
-	if created, _ := first["created"].(bool); !created {
+	if first["created"] != true {
 		t.Error("the first send-keys had to create the slot-1 pane, so created must be true")
+	}
+	pane := slotPaneID(t, self, 1)
+	if pane == self {
+		t.Fatalf("send-keys resolved to the agent's own pane %s — it would be typing into the "+
+			"conversation the user is having", pane)
 	}
 
 	// The second call must land in the same pane, and must NOT claim to have
@@ -486,31 +207,30 @@ func TestSendKeysWithNoPaneIdUsesSlotOne(t *testing.T) {
 	// left running there is gone.
 	var second map[string]any
 	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo two"}, &second)
-	if second["paneId"] != pane {
-		t.Errorf("second send-keys went to %v, want the same pane %s", second["paneId"], pane)
+	if second["created"] != false {
+		t.Errorf("second send-keys reported created=%v for a pane it reused", second["created"])
 	}
-	if created, ok := second["created"]; ok && created == true {
-		t.Error("second send-keys reported created=true for a pane it reused")
+	if again := slotPaneID(t, self, 1); again != pane {
+		t.Errorf("second send-keys went to %s, want the same pane %s", again, pane)
 	}
 }
 
-// TestExecuteCommandWithNoPaneIdUsesSlotOne covers the tool the plan originally
+// TestExecuteCommandWithNoSlotUsesSlotOne covers the tool the plan originally
 // left out. execute-command delivers keystrokes exactly as send-keys does, and a
-// tool that still answered "paneId is required when headless=false" while its
-// siblings defaulted to slot 1 would be the loophole that sends an agent hunting
-// for the terminal by other means.
-func TestExecuteCommandWithNoPaneIdUsesSlotOne(t *testing.T) {
+// tool that still answered "paneId is required" while its siblings defaulted to
+// slot 1 would be the loophole that sends an agent hunting for the terminal by
+// other means.
+func TestExecuteCommandWithNoSlotUsesSlotOne(t *testing.T) {
 	c, self := agentPaneFixture(t)
 
 	var out map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{"command": "echo slotted-output"}, &out)
 
-	pane, _ := out["paneId"].(string)
-	if pane == "" || pane == self {
-		t.Fatalf("execute-command resolved to %q (self is %s)", pane, self)
-	}
 	if slot, _ := out["slot"].(float64); int(slot) != 1 {
 		t.Errorf("execute-command reported slot %v, want 1", out["slot"])
+	}
+	if pane := slotPaneID(t, self, 1); pane == self {
+		t.Fatalf("execute-command resolved to the agent's own pane %s", pane)
 	}
 	if output, _ := out["output"].(string); !strings.Contains(output, "slotted-output") {
 		t.Errorf("command did not run in the helper pane; output was %q", output)
@@ -518,22 +238,14 @@ func TestExecuteCommandWithNoPaneIdUsesSlotOne(t *testing.T) {
 	if code, _ := out["exitCode"].(float64); code != 0 {
 		t.Errorf("exit code %v, want 0", out["exitCode"])
 	}
-
-	// headless keeps working, and keeps being a different universe: no paneId
-	// comes back because the session is destroyed with the answer.
-	var headless map[string]any
-	c.callToolJSON(t, "execute-command", map[string]any{
-		"command": "echo headless-output", "headless": true,
-	}, &headless)
-	if _, ok := headless["paneId"]; ok {
-		t.Errorf("headless execute-command returned a paneId: %v", headless)
-	}
-	if output, _ := headless["output"].(string); !strings.Contains(output, "headless-output") {
-		t.Errorf("headless output was %q", output)
+	// timedOut is always present, never omitted: an absent key makes
+	// `result.timedOut === false` unsatisfiable for the caller.
+	if _, ok := out["timedOut"]; !ok {
+		t.Errorf("execute-command must always report timedOut: %v", out)
 	}
 }
 
-// TestWriteToDisplayWithNoPaneIdUsesSlotOne is the same behaviour change for the
+// TestWriteToDisplayWithNoSlotUsesSlotOne is the same behaviour change for the
 // last keystroke-delivering tool that still demanded an explicit pane.
 //
 // write-to-display calls SendKeys like the others, so refusing a bare call had
@@ -541,25 +253,22 @@ func TestExecuteCommandWithNoPaneIdUsesSlotOne(t *testing.T) {
 // for $TMUX_PANE. Landing in slot 1 is the fix, and slot 1 is never the agent's
 // own pane — which for this tool means the coaching text cannot end up in the
 // conversation it is designed to stay out of.
-func TestWriteToDisplayWithNoPaneIdUsesSlotOne(t *testing.T) {
+func TestWriteToDisplayWithNoSlotUsesSlotOne(t *testing.T) {
 	c, self := agentPaneFixture(t)
 
 	var first map[string]any
 	c.callToolJSON(t, "write-to-display", map[string]any{"text": "coaching-one"}, &first)
 
-	pane, _ := first["paneId"].(string)
-	if pane == "" {
-		t.Fatalf("write-to-display with no paneId returned no pane: %v", first)
-	}
-	if pane == self {
-		t.Fatalf("write-to-display resolved to the agent's own pane %s — the text would land in "+
-			"the conversation it exists to stay out of", pane)
-	}
 	if slot, _ := first["slot"].(float64); int(slot) != 1 {
 		t.Errorf("write-to-display reported slot %v, want 1", first["slot"])
 	}
-	if created, _ := first["created"].(bool); !created {
+	if first["created"] != true {
 		t.Error("the first write-to-display had to create the slot-1 pane, so created must be true")
+	}
+	pane := slotPaneID(t, self, 1)
+	if pane == self {
+		t.Fatalf("write-to-display resolved to the agent's own pane %s — the text would land in "+
+			"the conversation it exists to stay out of", pane)
 	}
 	// The one thing this tool must never return is the text itself: keeping it
 	// out of the model's context is the whole reason the tool exists.
@@ -570,7 +279,7 @@ func TestWriteToDisplayWithNoPaneIdUsesSlotOne(t *testing.T) {
 	// Whitespace is stripped before matching: a helper pane is half the window
 	// wide and can wrap a word mid-character.
 	sleep(300 * time.Millisecond)
-	captured := c.callToolText(t, "capture-pane", map[string]any{"paneId": pane})
+	captured := c.callToolText(t, "capture-pane", map[string]any{})
 	if !strings.Contains(flattenPane(captured), "coaching-one") {
 		t.Errorf("the text never reached the slot-1 pane; it holds:\n%s", captured)
 	}
@@ -579,30 +288,30 @@ func TestWriteToDisplayWithNoPaneIdUsesSlotOne(t *testing.T) {
 	// created it — created is the only signal that the pane is new to the slot.
 	var second map[string]any
 	c.callToolJSON(t, "write-to-display", map[string]any{"text": "coaching-two"}, &second)
-	if second["paneId"] != pane {
-		t.Errorf("second write-to-display went to %v, want the same pane %s", second["paneId"], pane)
+	if second["created"] != false {
+		t.Errorf("second write-to-display reported created=%v for a pane it reused", second["created"])
 	}
-	if created, ok := second["created"]; ok && created == true {
-		t.Error("second write-to-display reported created=true for a pane it reused")
+	if again := slotPaneID(t, self, 1); again != pane {
+		t.Errorf("second write-to-display went to %s, want the same pane %s", again, pane)
 	}
 }
 
-// TestStartAndWatchWithNoArgumentsUsesSlotOne covers the row §8's table calls
-// out by name, and it is the row with the most history behind it.
+// TestStartAndWatchWithNoArgumentsUsesSlotOne covers the default path, and it is
+// the one with the most history behind it.
 //
-// start-and-watch with no paneId, no slot and no headless used to create its own
-// detached session on a socket of its own. The command ran, the pattern matched,
-// the response was correct in every field — and the pane was somewhere the user
-// could not see, in a session no tool of theirs listed, holding a dev server
-// that survived until something eventually killed the session. That behaviour
-// would pass every OTHER test in this file, because the ones that exercise the
-// slot path all pass a slot; this is the default path, and it is the path an
-// agent following the tool description actually takes.
+// start-and-watch with no slot used to create its own detached session on a
+// socket of its own. The command ran, the pattern matched, the response was
+// correct in every field — and the pane was somewhere the user could not see, in
+// a session no tool of theirs listed, holding a dev server that survived until
+// something eventually killed the session. That behaviour would pass every OTHER
+// test in this file, because the ones that exercise the slot path all pass a
+// slot; this is the default path, and it is the path an agent following the tool
+// description actually takes.
 //
 // So the assertions are about WHERE the pane is, not just which fields came
 // back: slot 1, reported as created, in the agent's own window rather than a
 // session of the server's own making. The event assertion is what proves the
-// command ran in the pane being talked about — a response naming a pane the
+// command ran in the pane being talked about — a response naming a slot the
 // command never reached would satisfy the rest.
 func TestStartAndWatchWithNoArgumentsUsesSlotOne(t *testing.T) {
 	c, self := agentPaneFixture(t)
@@ -615,21 +324,10 @@ func TestStartAndWatchWithNoArgumentsUsesSlotOne(t *testing.T) {
 		"timeout": 15,
 	}, &watch)
 
-	pane, _ := watch["paneId"].(string)
-	if pane == "" {
-		t.Fatalf("start-and-watch with no arguments returned no pane: %v", watch)
-	}
-	if pane == self {
-		t.Fatalf("start-and-watch ran the command in the agent's own pane %s", pane)
-	}
-	if strings.HasPrefix(pane, headlessPrefix) {
-		t.Fatalf("start-and-watch went headless without being asked (pane %s); with neither slot "+
-			"nor paneId nor headless the command must land in slot 1, where the user can see it", pane)
-	}
 	if slot, _ := watch["slot"].(float64); int(slot) != 1 {
 		t.Errorf("start-and-watch reported slot %v, want 1", watch["slot"])
 	}
-	if created, _ := watch["created"].(bool); !created {
+	if watch["created"] != true {
 		t.Error("the first start-and-watch had to create the slot-1 pane, so created must be true")
 	}
 	if event, _ := watch["event"].(string); !strings.Contains(event, "default-path-ready") {
@@ -638,6 +336,10 @@ func TestStartAndWatchWithNoArgumentsUsesSlotOne(t *testing.T) {
 			event, watch)
 	}
 
+	pane := slotPaneID(t, self, 1)
+	if pane == self {
+		t.Fatalf("start-and-watch ran the command in the agent's own pane %s", pane)
+	}
 	if panes := panesInWindow(t, window); !containsString(panes, pane) {
 		t.Errorf("the slot-1 pane %s is not in the agent's own window %s (which holds %v) — the "+
 			"command is running somewhere the user cannot see it, which is the behaviour this "+
@@ -645,20 +347,10 @@ func TestStartAndWatchWithNoArgumentsUsesSlotOne(t *testing.T) {
 	}
 }
 
-// containsString reports whether a list holds an exact string.
-func containsString(list []string, want string) bool {
-	for _, got := range list {
-		if got == want {
-			return true
-		}
-	}
-	return false
-}
-
 // ---- The registry is in tmux, not in this process ----
 
-// TestSlotRecordLivesInTmuxNotInThisProcess is the test that makes §2.4's
-// storage decision falsifiable, and without it the decision is only a comment.
+// TestSlotRecordLivesInTmuxNotInThisProcess is the test that makes the storage
+// decision falsifiable, and without it the decision is only a comment.
 //
 // Every other test in this suite drives ONE client or ONE server child, so a
 // `map[int]string` guarded by slotMu would pass all of them: it is idempotent,
@@ -689,14 +381,14 @@ func TestSlotRecordLivesInTmuxNotInThisProcess(t *testing.T) {
 	window := tmuxExec(t, "display-message", "-p", "-t", self, "#{window_id}")
 
 	var opened map[string]any
-	first.callToolJSON(t, "split-pane", map[string]any{"slot": 1}, &opened)
-	pane, _ := opened["paneId"].(string)
-	if pane == "" || pane == self {
-		t.Fatalf("the first server resolved slot 1 to %q (its own pane is %s)", pane, self)
-	}
-	if created, _ := opened["created"].(bool); !created {
+	first.callToolJSON(t, "open-pane", map[string]any{"slot": 1}, &opened)
+	if opened["created"] != true {
 		t.Fatalf("slot 1 already existed in a fresh window, so this test is not exercising "+
 			"anything: %v", opened)
+	}
+	pane := slotPaneID(t, self, 1)
+	if pane == self {
+		t.Fatalf("the first server resolved slot 1 to its own pane %s", self)
 	}
 	before := panesInWindow(t, window)
 
@@ -706,16 +398,16 @@ func TestSlotRecordLivesInTmuxNotInThisProcess(t *testing.T) {
 	second := newMCPClientInPane(t, self)
 
 	var found map[string]any
-	second.callToolJSON(t, "split-pane", map[string]any{"slot": 1}, &found)
-	if got, _ := found["paneId"].(string); got != pane {
-		t.Errorf("the second server resolved slot 1 to %v, want %s — the pane the first server "+
-			"created. A registry held in the process cannot be read by another process, and the "+
-			"user gets a second identical pane", found["paneId"], pane)
-	}
-	if created, ok := found["created"].(bool); ok && created {
-		t.Errorf("the second server reported created=true for a pane that already existed (%v); "+
+	second.callToolJSON(t, "open-pane", map[string]any{"slot": 1}, &found)
+	if found["created"] != false {
+		t.Errorf("the second server reported created=%v for a pane that already existed (%v); "+
 			"created is what tells an agent its process is gone, so a false positive says a "+
-			"running dev server died", found)
+			"running dev server died", found["created"], found)
+	}
+	if got := slotPaneID(t, self, 1); got != pane {
+		t.Errorf("the second server resolved slot 1 to %s, want %s — the pane the first server "+
+			"created. A registry held in the process cannot be read by another process, and the "+
+			"user gets a second identical pane", got, pane)
 	}
 	if after := panesInWindow(t, window); len(after) != len(before) {
 		t.Errorf("the window went from %d panes to %d (%v → %v) when a second server resolved a "+
@@ -727,16 +419,16 @@ func TestSlotRecordLivesInTmuxNotInThisProcess(t *testing.T) {
 	tmuxExec(t, "kill-pane", "-t", pane)
 
 	var again map[string]any
-	second.callToolJSON(t, "split-pane", map[string]any{"slot": 1}, &again)
-	got, _ := again["paneId"].(string)
+	second.callToolJSON(t, "open-pane", map[string]any{"slot": 1}, &again)
+	if again["created"] != true {
+		t.Errorf("slot 1 reported created=%v after its pane was killed (%v); the agent is not told "+
+			"that whatever it left running there is gone", again["created"], again)
+	}
+	got := slotPaneID(t, self, 1)
 	if got == pane {
 		t.Errorf("slot 1 still resolves to %s after the pane was killed: the record outlived the "+
 			"pane, which it cannot do if it lives on the pane — and keystrokes sent to a dead pane "+
 			"are accepted and discarded in silence", pane)
-	}
-	if created, _ := again["created"].(bool); !created {
-		t.Errorf("slot 1 reported created=false for pane %v after its pane was killed (%v); the "+
-			"agent is not told that whatever it left running there is gone", got, again)
 	}
 	if got == self {
 		t.Fatalf("slot 1 resolved to the server's own pane %s after the helper was killed", got)
@@ -748,6 +440,8 @@ func TestSlotRecordLivesInTmuxNotInThisProcess(t *testing.T) {
 func flattenPane(captured string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(captured, "\n", ""), " ", "")
 }
+
+// ---- write-to-display's clear ----
 
 // TestWriteToDisplayClearRespectsPaneOwnership is the hazard that arrived with
 // the default target, in both directions.
@@ -780,7 +474,7 @@ func TestWriteToDisplayClearRespectsPaneOwnership(t *testing.T) {
 		// second file there rather than in the repository.
 		dir := t.TempDir()
 		usersPane := tmuxExec(t, "split-window", "-d", "-c", dir, "-t", self, "-P", "-F", "#{pane_id}")
-		waitForPaneIdle(t, c, usersPane)
+		waitForPaneIdle(t, usersPane)
 
 		// The user types a command and stops short of Enter. This is exactly the
 		// state canAcquire documents that it cannot see, which is why the pane is
@@ -803,13 +497,13 @@ func TestWriteToDisplayClearRespectsPaneOwnership(t *testing.T) {
 		c.callToolJSON(t, "write-to-display", map[string]any{
 			"text": "COACH-TEXT", "clear": true,
 		}, &out)
-		if out["paneId"] != usersPane {
-			t.Fatalf("the fixture did not exercise adoption: write-to-display resolved to %v, "+
-				"want the user's pane %s", out["paneId"], usersPane)
+		if got := slotPaneID(t, self, 1); got != usersPane {
+			t.Fatalf("the fixture did not exercise adoption: slot 1 is %s, want the user's pane %s",
+				got, usersPane)
 		}
 
 		sleep(300 * time.Millisecond)
-		flat := flattenPane(c.callToolText(t, "capture-pane", map[string]any{"paneId": usersPane}))
+		flat := flattenPane(c.callToolText(t, "capture-pane", map[string]any{}))
 		if !strings.Contains(flat, flattenPane("touch "+sentinel)) {
 			t.Errorf("clear:true destroyed the user's half-typed line on an adopted pane; the "+
 				"pane holds:\n%s", flat)
@@ -830,9 +524,8 @@ func TestWriteToDisplayClearRespectsPaneOwnership(t *testing.T) {
 		c.callToolJSON(t, "write-to-display", map[string]any{
 			"text": "STALE-TEXT", "clear": true,
 		}, &first)
-		pane, _ := first["paneId"].(string)
-		if pane == "" {
-			t.Fatalf("write-to-display returned no pane: %v", first)
+		if first["created"] != true {
+			t.Fatalf("the fixture did not create a pane of ours: %v", first)
 		}
 		sleep(300 * time.Millisecond)
 
@@ -841,7 +534,7 @@ func TestWriteToDisplayClearRespectsPaneOwnership(t *testing.T) {
 		}, &first)
 		sleep(300 * time.Millisecond)
 
-		flat := flattenPane(c.callToolText(t, "capture-pane", map[string]any{"paneId": pane}))
+		flat := flattenPane(c.callToolText(t, "capture-pane", map[string]any{}))
 		if strings.Contains(flat, "STALE-TEXT") {
 			t.Errorf("clear:true left the previous write behind on a pane the server created — the "+
 				"kill-line path must still run there, or the display accumulates instead of "+
@@ -857,43 +550,37 @@ func TestWriteToDisplayClearRespectsPaneOwnership(t *testing.T) {
 // enumerated, away from panes and keystrokes.
 //
 // The table is small and every row is a claim about what happens to somebody's
-// unsubmitted command line, so the two paths are walked in full rather than
-// sampled. The rows that matter are the ones where nothing positive is known: an
-// empty owner, or an owner kind this binary does not recognise. On the slot path
-// those must be the REDRAW, because a resolution that reported no owner is a
-// resolution that told us nothing, and "no evidence" is not evidence that the
-// pane is ours. On the explicit path they must be the kill, because that is what
-// this tool did before slots existed and what every caller that split its own
-// display pane relies on — a pane with no record there means "the one I made and
-// pointed you at", and the caller took the safety burden by naming it.
+// unsubmitted command line, so it is walked in full rather than sampled. The
+// rows that matter are the ones where nothing positive is known: an empty owner,
+// or an owner kind this binary does not recognise. Those must be the REDRAW,
+// because a resolution that reported no owner is a resolution that told us
+// nothing, and "no evidence" is not evidence that the pane is ours.
+//
+// The bySlot column is gone with the explicit-paneId path. It used to say that a
+// pane with NO record was ours to clear — true when the caller had named a
+// display pane it split itself, and unreachable now that every target is
+// resolved by slot.
 func TestClearDecisionNeverKillsALineOnEvidenceItDoesNotHave(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		owner  string
-		bySlot bool
-		want   bool
-		why    string
+		name  string
+		owner string
+		want  bool
+		why   string
 	}{
-		{"slot resolved to a pane we made", ownerAgent, true, true,
+		{"a pane we made", ownerAgent, true,
 			"the display pane is ours; each write must replace the last, which needs the kill"},
-		{"slot resolved to a pane we adopted", ownerAcquired, true, false,
+		{"a pane we adopted", ownerAcquired, false,
 			"the line in it is the user's half-typed command"},
-		{"slot resolved but reported no owner", "", true, false,
+		{"resolved but reported no owner", "", false,
 			"a resolution that says nothing is not permission to destroy a line"},
-		{"slot resolved with an owner kind we do not know", "future-owner-kind", true, false,
+		{"an owner kind we do not know", "future-owner-kind", false,
 			"an unrecognised owner is a pane whose semantics this binary does not implement"},
-		{"explicit paneId with no record", "", false, true,
-			"the pre-slot behaviour: the caller named a display pane it owns"},
-		{"explicit paneId on an adopted pane", ownerAcquired, false, false,
-			"the record positively says the user opened it"},
-		{"explicit paneId on a pane we made", ownerAgent, false, true,
-			"our own pane, named directly"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := clearKillsTheLine(tc.owner, tc.bySlot); got != tc.want {
+			if got := clearKillsTheLine(tc.owner); got != tc.want {
 				verb := map[bool]string{true: "C-u + clear + Enter", false: "C-l (redraw)"}
-				t.Errorf("owner=%q bySlot=%v chose %s, want %s — %s",
-					tc.owner, tc.bySlot, verb[got], verb[tc.want], tc.why)
+				t.Errorf("owner=%q chose %s, want %s — %s",
+					tc.owner, verb[got], verb[tc.want], tc.why)
 			}
 		})
 	}
@@ -904,14 +591,14 @@ func TestClearDecisionNeverKillsALineOnEvidenceItDoesNotHave(t *testing.T) {
 //
 // # What is being reproduced
 //
-// resolvePaneArg resolves a slot under slotMu and RELEASES the lock before
+// resolveSlot resolves a slot under slotMu and RELEASES the lock before
 // returning. write-to-display({clear:true}) then acts on that pane with no lock
 // held. A concurrent close-pane on the same slot releases the adopted pane —
 // releaseAcquiredLocked wipes @mcp_pane/@mcp_owner/@mcp_slot and leaves the pane
 // alive, handed back to the user. Land it in that window and a clear which reads
-// the registry AGAIN sees no record at all, reads that as "a pane the caller
-// named explicitly", and sends C-u + `clear` + Enter into a shell the user is
-// typing in: their line destroyed, and Enter pressed on what is left.
+// the registry AGAIN sees no record at all, reads that as a pane nobody owns,
+// and sends C-u + `clear` + Enter into a shell the user is typing in: their line
+// destroyed, and Enter pressed on what is left.
 //
 // The state is what does the damage, so the state is what this test builds:
 // resolution really adopts the user's pane and hands back owner=acquired, the
@@ -928,35 +615,36 @@ func TestClearDecisionNeverKillsALineOnEvidenceItDoesNotHave(t *testing.T) {
 // is green for the reason that makes the fix sound rather than lucky — C-l is
 // safe whatever has happened to the pane since.
 func TestClearForDisplayTrustsTheOwnerCapturedUnderTheLock(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
 	// The user's own pane, in a scratch directory so that a line submitted by
 	// accident leaves its file there rather than in the repository.
 	dir := t.TempDir()
-	usersPane := tmuxExec(t, "split-window", "-d", "-c", dir, "-t", self, "-P", "-F", "#{pane_id}")
-	waitForClientPaneIdle(t, client, usersPane)
+	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-c", dir, "-t", self.target(), "-P", "-F", "#{pane_id}"))
+	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	pane, slot, created, owner, err := client.resolveHelper(ctx, slotDefault)
+	tgt16, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	pane, slot, created, owner := tgt16.Ref, tgt16.Slot, tgt16.Created, tgt16.Owner
 	if pane != usersPane || owner != ownerAcquired {
 		t.Fatalf("the fixture did not exercise adoption: slot 1 resolved to %s (owner %q), want the "+
-			"user's pane %s adopted as %q", pane, owner, usersPane, ownerAcquired)
+			"user's pane %s adopted as %q", pane.target(), owner, usersPane.target(), ownerAcquired)
 	}
 	// The target the handler is holding when the lock goes away.
-	tgt := paneTarget{PaneID: pane, Slot: slot, Created: created, Owner: owner}
+	tgt := paneTarget{Ref: pane, Slot: slot, Created: created, Owner: owner}
 
 	// The concurrent close-pane lands. This is the mutation, verbatim: the
 	// registration is erased and the pane is left alive, which is what "released
 	// back to the user" means.
-	if err := client.clearPaneRegistration(ctx, usersPane); err != nil {
+	if err := sl.b.ClearMarks(ctx, usersPane); err != nil {
 		t.Fatalf("release the adopted pane: %v", err)
 	}
-	if _, found, err := client.paneRecordFor(ctx, usersPane); err != nil || found {
-		t.Fatalf("the pane still carries a registry record (found=%v err=%v); a re-read would find "+
-			"it and this test would not be reproducing the race at all", found, err)
+	if _, found := recordFor(t, sl, self, usersPane); found {
+		t.Fatal("the pane still carries a registry record; a re-read would find it and this test " +
+			"would not be reproducing the race at all")
 	}
 
 	// The pane is theirs again, and they start typing. The trailing space is
@@ -965,15 +653,15 @@ func TestClearForDisplayTrustsTheOwnerCapturedUnderTheLock(t *testing.T) {
 	// different file, so a submitted line would leave the sentinel absent and the
 	// assertion below would report success.
 	sentinel := filepath.Join(dir, "submitted")
-	tmuxExec(t, "send-keys", "-t", usersPane, "-l", "touch "+sentinel+" ")
+	tmuxExec(t, "send-keys", "-t", usersPane.target(), "-l", "touch "+sentinel+" ")
 	sleep(300 * time.Millisecond)
 
-	if err := client.clearForDisplay(ctx, tgt); err != nil {
+	if err := sl.clearForDisplay(ctx, tgt); err != nil {
 		t.Fatalf("clearForDisplay: %v", err)
 	}
 	sleep(300 * time.Millisecond)
 
-	content, err := client.CapturePane(ctx, usersPane, 0, false)
+	content, err := sl.b.Capture(ctx, usersPane, 0, false)
 	if err != nil {
 		t.Fatalf("capture the pane back: %v", err)
 	}
@@ -993,13 +681,16 @@ func TestClearForDisplayTrustsTheOwnerCapturedUnderTheLock(t *testing.T) {
 // ---- close-pane ----
 
 // closedEntries calls close-pane and returns the entries it reported.
+//
+// The response is a BARE ARRAY. It used to be wrapped in {"closed": […]}, and
+// the wrapper went with the release that made list-slots its neighbour: two
+// registry tools with two shapes is one more thing the model has to remember for
+// no gain.
 func closedEntries(t *testing.T, c *mcpClient, args map[string]any) []map[string]any {
 	t.Helper()
-	var out struct {
-		Closed []map[string]any `json:"closed"`
-	}
+	var out []map[string]any
 	c.callToolJSON(t, "close-pane", args, &out)
-	return out.Closed
+	return out
 }
 
 // paneExists reports whether tmux still knows about a pane.
@@ -1022,21 +713,22 @@ func paneExists(t *testing.T, paneID string) bool {
 // its own to destroy, and closing it must actually remove it rather than leave
 // an unslotted split behind for the user to tidy up.
 func TestClosePaneKillsAgentPane(t *testing.T) {
-	c, _ := agentPaneFixture(t)
+	c, self := agentPaneFixture(t)
 
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{"slot": 1}, &split)
-	pane := split["paneId"].(string)
+	pane := openSlot(t, c, self, 1)
 
 	entries := closedEntries(t, c, map[string]any{})
 	if len(entries) != 1 {
 		t.Fatalf("expected one entry, got %v", entries)
 	}
-	if entries[0]["action"] != "killed" {
-		t.Errorf("action is %v, want \"killed\" — the server created this pane", entries[0]["action"])
+	if entries[0]["action"] != actionKilled {
+		t.Errorf("action is %v, want %q — the server created this pane", entries[0]["action"], actionKilled)
 	}
-	if entries[0]["paneId"] != pane {
-		t.Errorf("closed %v, want %s", entries[0]["paneId"], pane)
+	if slot, _ := entries[0]["slot"].(float64); int(slot) != 1 {
+		t.Errorf("closed slot %v, want 1", entries[0]["slot"])
+	}
+	if _, hasPaneID := entries[0]["paneId"]; hasPaneID {
+		t.Errorf("close-pane answered with a paneId: %v", entries[0])
 	}
 	if paneExists(t, pane) {
 		t.Errorf("pane %s still exists after close-pane reported killing it", pane)
@@ -1045,8 +737,8 @@ func TestClosePaneKillsAgentPane(t *testing.T) {
 	// Closing an empty slot is a satisfied request, not an error: an agent must
 	// be able to tear down unconditionally without first checking what it opened.
 	again := closedEntries(t, c, map[string]any{})
-	if len(again) != 1 || again[0]["action"] != "none" {
-		t.Errorf("closing an empty slot answered %v, want a single action:\"none\" entry", again)
+	if len(again) != 1 || again[0]["action"] != actionNone {
+		t.Errorf("closing an empty slot answered %v, want a single action:%q entry", again, actionNone)
 	}
 }
 
@@ -1063,19 +755,18 @@ func TestClosePaneReleasesAcquired(t *testing.T) {
 	c, self := agentPaneFixture(t)
 
 	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	waitForPaneIdle(t, c, usersPane)
+	waitForPaneIdle(t, usersPane)
 
-	var sent map[string]any
-	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo adopted", "enter": true}, &sent)
-	if sent["paneId"] != usersPane {
-		t.Fatalf("the fixture did not exercise adoption: send-keys resolved to %v, want %s",
-			sent["paneId"], usersPane)
+	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo adopted", "enter": true},
+		&map[string]any{})
+	if got := slotPaneID(t, self, 1); got != usersPane {
+		t.Fatalf("the fixture did not exercise adoption: slot 1 is %s, want %s", got, usersPane)
 	}
-	waitForPaneIdle(t, c, usersPane)
+	waitForPaneIdle(t, usersPane)
 
 	entries := closedEntries(t, c, map[string]any{})
-	if len(entries) != 1 || entries[0]["action"] != "released" {
-		t.Fatalf("close-pane answered %v, want a single action:\"released\" entry", entries)
+	if len(entries) != 1 || entries[0]["action"] != actionReleased {
+		t.Fatalf("close-pane answered %v, want a single action:%q entry", entries, actionReleased)
 	}
 	if !paneExists(t, usersPane) {
 		t.Fatal("close-pane destroyed a pane the user opened; an adopted pane may only be released")
@@ -1087,45 +778,26 @@ func TestClosePaneReleasesAcquired(t *testing.T) {
 	}
 }
 
-// TestClosePaneRefusesUnmanagedPane pins the refusal that keeps close-pane from
-// becoming a second kill-pane. The pane must still be alive afterwards, and the
-// message must name kill-pane — an error that only says "no" is what sends an
-// agent looking for another way to do the same thing.
-func TestClosePaneRefusesUnmanagedPane(t *testing.T) {
-	c, self := agentPaneFixture(t)
-
-	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	waitForPaneIdle(t, c, usersPane)
-
-	res := callTool(t, c, "close-pane", map[string]any{"paneId": usersPane})
-	if !res.IsError {
-		t.Fatalf("close-pane accepted a pane it does not own: %v", res)
-	}
-	msg := res.text(t, "close-pane")
-	if !strings.Contains(msg, "kill-pane") {
-		t.Errorf("refusal must name the tool that CAN do this, got %q", msg)
-	}
-	if !paneExists(t, usersPane) {
-		t.Fatal("close-pane killed a pane it had just refused to close")
-	}
-}
-
 // TestClosePaneRefusesSelfPane is the regression for the one hole every other
-// path had already closed.
+// path had already closed — and the rewrite is the point of it.
 //
 // The fixture is the ordinary nested case, not a contrivance: an outer agent's
-// split-pane creates a pane, marks it agent-owned in slot 1 and titles it
+// open-pane creates a pane, marks it agent-owned in slot 1 and titles it
 // "agent"; a subagent's server is started inside that pane and inherits
 // TMUX_PANE. From the inner server the pane is indistinguishable from a helper —
 // the witness matches, the owner is "agent", the title says so — which is exactly
 // why the record cannot be the thing that authorises the close. The markers are
 // written with raw tmux because the outer server is not part of this test.
 //
-// The explicit-paneId branch is the one being driven, because it is the one that
-// went straight from "a record exists" to KillPane. The pane must survive, the
-// refusal must name kill-pane as the deliberate way to do this, and it must say
-// which pane it is refusing — an error that only says "no" is what sends an agent
-// looking for another route.
+// It used to drive close-pane({paneId}), the branch that went straight from "a
+// record exists" to KillPane. That argument is gone, so the guard's only
+// remaining route is the SLOT path: close-pane({slot:1}) on a server whose own
+// pane carries slot 1's marks. Deleting the old test with the old argument would
+// have left the guard live and untested — which is how a guard rots.
+//
+// The refusal must name the slot and must NOT name kill-pane, a tool this
+// release deletes: an error that points at something which does not exist is the
+// same failure as an error that says only "no".
 func TestClosePaneRefusesSelfPane(t *testing.T) {
 	c, self := agentPaneFixture(t)
 
@@ -1133,17 +805,25 @@ func TestClosePaneRefusesSelfPane(t *testing.T) {
 	tmuxExec(t, "set-option", "-p", "-t", self, paneOptOwner, ownerAgent)
 	tmuxExec(t, "set-option", "-p", "-t", self, paneOptSlot, "1")
 
-	res := callTool(t, c, "close-pane", map[string]any{"paneId": self})
-	if !res.IsError {
-		t.Fatalf("close-pane accepted the pane the server is running in: %v", res)
+	entries := closedEntries(t, c, map[string]any{"slot": 1})
+	if len(entries) != 1 {
+		t.Fatalf("expected one entry, got %v", entries)
 	}
-	msg := res.text(t, "close-pane")
-	if !strings.Contains(msg, "running in") {
+	if entries[0]["action"] != actionError {
+		t.Fatalf("close-pane({slot:1}) on the server's own pane answered action %v, want %q",
+			entries[0]["action"], actionError)
+	}
+	detail, _ := entries[0]["detail"].(string)
+	if !strings.Contains(detail, "slot 1 is the pane this server is running in") {
 		t.Errorf("the refusal does not explain that this is the server's own pane, so it reads "+
-			"like the unmanaged-pane refusal instead: %q", msg)
+			"like an ordinary failure instead: %q", detail)
 	}
-	if !strings.Contains(msg, "kill-pane") {
-		t.Errorf("refusal must name the tool that CAN do this, got %q", msg)
+	if strings.Contains(detail, "kill-pane") {
+		t.Errorf("the refusal points at kill-pane, which this release deletes: %q", detail)
+	}
+	if idInText.MatchString(detail) {
+		t.Errorf("the refusal carries a pane id, which reaches the model verbatim through "+
+			"detail: %q", detail)
 	}
 	if !paneExists(t, self) {
 		t.Fatal("close-pane killed the pane the server is running in — the agent destroyed its " +
@@ -1195,11 +875,9 @@ func TestClosePaneReapsDeadPane(t *testing.T) {
 		{"all", map[string]any{"slot": "all"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, _ := agentPaneFixture(t)
+			c, self := agentPaneFixture(t)
 
-			var split map[string]any
-			c.callToolJSON(t, "split-pane", map[string]any{"slot": 1}, &split)
-			pane := split["paneId"].(string)
+			pane := openSlot(t, c, self, 1)
 
 			// remain-on-exit is what makes a corpse instead of a removal; without
 			// it tmux takes the pane away the instant the shell exits and there is
@@ -1212,10 +890,10 @@ func TestClosePaneReapsDeadPane(t *testing.T) {
 			if len(entries) != 1 {
 				t.Fatalf("expected one entry, got %v", entries)
 			}
-			if entries[0]["action"] != "killed" {
-				t.Errorf("close-pane%v answered action %v for a dead slot-1 pane, want \"killed\" — "+
+			if entries[0]["action"] != actionKilled {
+				t.Errorf("close-pane%v answered action %v for a dead slot-1 pane, want %q — "+
 					"\"none\" would mean \"this slot is empty\", which is not what the user is "+
-					"looking at", tc.args, entries[0]["action"])
+					"looking at", tc.args, entries[0]["action"], actionKilled)
 			}
 			if paneExists(t, pane) {
 				t.Errorf("dead pane %s is still in the window; a corpse nobody can close also "+
@@ -1226,14 +904,14 @@ func TestClosePaneReapsDeadPane(t *testing.T) {
 			// the corpse gone, resolving slot 1 must produce a fresh live pane
 			// rather than rediscovering the body or failing.
 			var next map[string]any
-			c.callToolJSON(t, "split-pane", map[string]any{"slot": 1}, &next)
+			c.callToolJSON(t, "open-pane", map[string]any{"slot": 1}, &next)
 			if slot, _ := next["slot"].(float64); int(slot) != 1 {
 				t.Errorf("slot 1 resolved to slot %v after the corpse was reaped", next["slot"])
 			}
-			if created, _ := next["created"].(bool); !created {
+			if next["created"] != true {
 				t.Error("slot 1 reported created=false after its pane was reaped — it must be a new pane")
 			}
-			if got, _ := next["paneId"].(string); got == pane {
+			if got := slotPaneID(t, self, 1); got == pane {
 				t.Errorf("slot 1 handed back the reaped pane %s", got)
 			}
 		})
@@ -1250,31 +928,30 @@ func TestClosePaneAllReleasesAndKills(t *testing.T) {
 
 	// Slot 1: adopted from the user.
 	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	waitForPaneIdle(t, c, usersPane)
-	var one map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{"slot": 1}, &one)
-	if one["paneId"] != usersPane {
-		t.Fatalf("slot 1 resolved to %v, want the adopted pane %s", one["paneId"], usersPane)
+	waitForPaneIdle(t, usersPane)
+	c.callToolJSON(t, "open-pane", map[string]any{"slot": 1}, &map[string]any{})
+	if got := slotPaneID(t, self, 1); got != usersPane {
+		t.Fatalf("slot 1 resolved to %s, want the adopted pane %s", got, usersPane)
 	}
 
 	// Slot 2: created by the server.
-	var two map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{"slot": 2}, &two)
-	madePane := two["paneId"].(string)
+	madePane := openSlot(t, c, self, 2)
 
 	entries := closedEntries(t, c, map[string]any{"slot": "all"})
 	if len(entries) != 2 {
 		t.Fatalf("expected two entries, got %v", entries)
 	}
-	byPane := map[string]string{}
+	bySlot := map[int]string{}
 	for _, e := range entries {
-		byPane[e["paneId"].(string)] = e["action"].(string)
+		slot, _ := e["slot"].(float64)
+		action, _ := e["action"].(string)
+		bySlot[int(slot)] = action
 	}
-	if byPane[usersPane] != "released" {
-		t.Errorf("adopted pane %s got action %q, want \"released\"", usersPane, byPane[usersPane])
+	if bySlot[1] != actionReleased {
+		t.Errorf("slot 1 (adopted pane %s) got action %q, want %q", usersPane, bySlot[1], actionReleased)
 	}
-	if byPane[madePane] != "killed" {
-		t.Errorf("created pane %s got action %q, want \"killed\"", madePane, byPane[madePane])
+	if bySlot[2] != actionKilled {
+		t.Errorf("slot 2 (created pane %s) got action %q, want %q", madePane, bySlot[2], actionKilled)
 	}
 	if !paneExists(t, usersPane) {
 		t.Error("slot:\"all\" destroyed the pane the user opened")
@@ -1287,143 +964,149 @@ func TestClosePaneAllReleasesAndKills(t *testing.T) {
 	}
 }
 
-// ---- kill-pane stays blunt ----
+// ---- list-slots ----
 
-// TestKillPaneTakesNoSlot is the other half of close-pane's justification, and
-// it is the half nothing was checking.
+// TestListSlotsReportsWhatTheAgentHasOpen covers the tool that replaces
+// list-panes for an agent: not "what is on screen", but "what have I got".
 //
-// close-pane exists because destroying a pane should never be the accidental
-// outcome of tidying up: it refuses panes it does not own, refuses the pane this
-// server runs in, and releases what it merely borrowed. All of that is only
-// worth something while kill-pane stays what §4 and §8 say it is — an explicit
-// paneId and nothing else. Give kill-pane a slot and the argument collapses: a
-// bare kill-pane() would destroy the helper pane, kill-pane({slot:1}) would read
-// as tidy-up rather than demolition, and the tool an agent reaches for when it
-// wants something GONE would acquire a default target, which is exactly the
-// shape of the mistake close-pane was built to make impossible. The same
-// reasoning kept send-keys' default away from the agent's own pane; here it
-// keeps a destructive tool from having any default at all.
-//
-// The schema is read from tools/list rather than from the registration source,
-// because the schema is what an agent is shown and therefore what it will try.
-func TestKillPaneTakesNoSlot(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
+// The distinction is the assertion about the user's pane. list-panes answered
+// with every pane in the window, including ones the agent must never touch;
+// list-slots answers only for panes this server holds, and each entry carries
+// the number the agent passes back to every other tool.
+func TestListSlotsReportsWhatTheAgentHasOpen(t *testing.T) {
+	c, self := agentPaneFixture(t)
 
-	raw := c.call(t, "tools/list", map[string]any{})
-	var list struct {
-		Tools []struct {
-			Name        string `json:"name"`
-			InputSchema struct {
-				Properties map[string]any `json:"properties"`
-				Required   []string       `json:"required"`
-			} `json:"inputSchema"`
-		} `json:"tools"`
-	}
-	if err := json.Unmarshal(raw, &list); err != nil {
-		t.Fatalf("unmarshal tools/list: %v", err)
+	// A pane of the user's that we must not adopt: busy, so canAcquire refuses
+	// it, which keeps it out of the listing for a reason the test states.
+	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
+	tmuxExec(t, "send-keys", "-t", usersPane, "cat", "Enter")
+	waitForPaneBusy(t, usersPane)
+
+	var empty []map[string]any
+	c.callToolJSON(t, "list-slots", map[string]any{}, &empty)
+	if len(empty) != 0 {
+		t.Fatalf("a server that has opened nothing must list nothing, got %v", empty)
 	}
 
-	var found bool
-	for _, tool := range list.Tools {
-		if tool.Name != "kill-pane" {
-			continue
-		}
-		found = true
-		if _, hasSlot := tool.InputSchema.Properties["slot"]; hasSlot {
-			t.Error("kill-pane declares a slot property: the tool that destroys panes must be " +
-				"aimed by hand every time, or close-pane's refusals are just a slower way to the " +
-				"same accident")
-		}
-		if _, hasHeadless := tool.InputSchema.Properties["headless"]; hasHeadless {
-			t.Error("kill-pane declares a headless property; it kills the pane it is given and " +
-				"has no business creating a universe to look in")
-		}
-		if !containsString(tool.InputSchema.Required, "paneId") {
-			t.Errorf("kill-pane's required arguments are %v; paneId must stay required, because "+
-				"the alternative is a destructive tool with a default target",
-				tool.InputSchema.Required)
-		}
+	openSlot(t, c, self, 1)
+	c.callToolJSON(t, "execute-command", map[string]any{"slot": 2, "command": "echo two"},
+		&map[string]any{})
+
+	var listed []map[string]any
+	c.callToolJSON(t, "list-slots", map[string]any{}, &listed)
+	if len(listed) != 2 {
+		t.Fatalf("list-slots reported %d entries, want 2: %v", len(listed), listed)
 	}
-	if !found {
-		t.Fatal("kill-pane is not in tools/list — this test is guarding a tool that is not there")
+	for i, want := range []int{1, 2} {
+		got, _ := listed[i]["slot"].(float64)
+		if int(got) != want {
+			t.Errorf("entry %d is slot %v, want %d — list-slots is sorted by slot", i, listed[i]["slot"], want)
+		}
+		if listed[i]["origin"] != originCreated {
+			t.Errorf("slot %d origin is %v, want %q", want, listed[i]["origin"], originCreated)
+		}
+		if listed[i]["isAlive"] != true {
+			t.Errorf("slot %d is not alive: %v", want, listed[i])
+		}
+		if listed[i]["isolated"] != false {
+			t.Errorf("slot %d reports isolated=%v; every slot is visible in this release",
+				want, listed[i]["isolated"])
+		}
+		if cmd, _ := listed[i]["foregroundCmd"].(string); cmd == "" {
+			t.Errorf("slot %d reports no foregroundCmd; the field exists to say what is running "+
+				"in the pane: %v", want, listed[i])
+		}
+		if _, hasPaneID := listed[i]["paneId"]; hasPaneID {
+			t.Errorf("list-slots answered with a paneId: %v", listed[i])
+		}
 	}
 
-	// And the refusal is real rather than only declared: a schema is advisory,
-	// and some clients will send the call anyway.
-	res := callTool(t, c, "kill-pane", map[string]any{})
-	if !res.IsError {
-		t.Fatalf("kill-pane with no paneId was accepted: %v", res)
+	// The user's pane is not ours and is not listed — and the control for that
+	// assertion is that it is still there to have been missed.
+	if !paneExists(t, usersPane) {
+		t.Fatal("the user's pane is gone, so 'list-slots does not report it' proves nothing")
 	}
-	if msg := res.text(t, "kill-pane"); !strings.Contains(msg, "paneId") {
-		t.Errorf("the refusal does not name the argument that is missing, which is what tells an "+
-			"agent what to do next: %q", msg)
+
+	// A stale slot marker on the agent's OWN pane is what a subagent inherits
+	// when it is started into an outer agent's helper. list-slots must neither
+	// report it — the agent would address slot 3 and type into its own session —
+	// nor leave it in place, because a record nobody clears goes on steering
+	// every later call. Reading the registry is mildly mutating for exactly this
+	// reason, which is why the tool carries no readOnlyHint.
+	//
+	// close-pane answers differently for the same record, and deliberately: there
+	// it becomes an entry saying "slot 3 is the pane this server is running in",
+	// because "none" would tell the agent the slot is free.
+	tmuxExec(t, "set-option", "-p", "-t", self, paneOptWitness, self)
+	tmuxExec(t, "set-option", "-p", "-t", self, paneOptOwner, ownerAgent)
+	tmuxExec(t, "set-option", "-p", "-t", self, paneOptSlot, "3")
+
+	c.callToolJSON(t, "list-slots", map[string]any{}, &listed)
+	if listingHasSlot(listed, 3) {
+		t.Errorf("list-slots reported slot 3, which is the agent's own pane: %v", listed)
+	}
+	if got := tmuxExec(t, "display-message", "-p", "-t", self, "#{"+paneOptSlot+"}"); got != "" {
+		t.Errorf("the agent's own pane still carries %s=%q after list-slots; the stale claim goes "+
+			"on steering every later resolution", paneOptSlot, got)
 	}
 }
 
-// TestCapturePaneKeepsItsTextBody guards the one tool whose entire contract is
-// "the pane's exact content". The resolution metadata must ride in
-// structuredContent and never be prepended to the text, because a header there
-// would corrupt the answer for every existing caller and be indistinguishable
-// from pane output.
-func TestCapturePaneKeepsItsTextBody(t *testing.T) {
-	c, _ := agentPaneFixture(t)
+// ---- the two tools whose body is not JSON ----
 
-	var sent map[string]any
-	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo capture-marker", "enter": true}, &sent)
-	pane := sent["paneId"].(string)
-	waitForPaneIdle(t, c, pane)
+// TestCapturePaneKeepsItsTextBody guards the one tool whose entire contract is
+// "the pane's exact content". The slot must ride in structuredContent and never
+// be prepended to the text, because a header there would corrupt the answer for
+// every existing caller and be indistinguishable from pane output.
+func TestCapturePaneKeepsItsTextBody(t *testing.T) {
+	c, self := agentPaneFixture(t)
+
+	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo capture-marker", "enter": true},
+		&map[string]any{})
+	waitForPaneIdle(t, slotPaneID(t, self, 1))
 
 	res := callTool(t, c, "capture-pane", map[string]any{})
 	body := res.text(t, "capture-pane")
 	if !strings.Contains(body, "capture-marker") {
 		t.Errorf("capture-pane did not read the slot-1 pane; body was:\n%s", body)
 	}
-	if strings.Contains(body, "paneId") || strings.Contains(body, `"slot"`) {
+	if strings.Contains(body, `"slot"`) {
 		t.Errorf("capture-pane wrote resolution metadata into its text body:\n%s", body)
-	}
-	if res.StructuredContent["paneId"] != pane {
-		t.Errorf("structuredContent paneId is %v, want %s", res.StructuredContent["paneId"], pane)
 	}
 	if slot, _ := res.StructuredContent["slot"].(float64); int(slot) != 1 {
 		t.Errorf("structuredContent slot is %v, want 1", res.StructuredContent["slot"])
 	}
+	if _, hasPaneID := res.StructuredContent["paneId"]; hasPaneID {
+		t.Errorf("structuredContent carries a paneId: %v", res.StructuredContent)
+	}
 }
 
-// TestScreenshotPaneReportsItsResolvedPane is the positive half of the gate that
-// keeps structuredContent off the explicit-paneId path.
+// TestScreenshotPaneNamesTheSlotAndNotThePane is the caption leak, pinned.
 //
-// Withholding the key from a call that named its pane is a compatibility fix;
-// withholding it from a call that resolved a slot would be a feature deleted,
-// and the two are one line apart. A rendered pane cannot say which pane it is —
-// that is the whole reason the resolution rides alongside the image — so a slot
-// call that answers with no structuredContent leaves the caller unable to tell
-// which of its panes it is looking at.
+// A rendered pane cannot say which pane it is, which is why the slot rides
+// alongside the image in structuredContent — and why the image CAPTION names it
+// too. That caption used to read "Terminal screenshot of pane %3", which is a
+// pane id in the model's context arriving through a path no response type covers
+// and no schema check can see.
 //
 // html output rather than the default PNG: the assertion is about the metadata,
-// which is attached identically in every mode, and the PNG path needs headless
-// Chrome and would turn a compatibility check into a skip on half the machines
-// that run it.
-func TestScreenshotPaneReportsItsResolvedPane(t *testing.T) {
-	c, _ := agentPaneFixture(t)
+// and the PNG path needs headless Chrome, which would turn this into a skip on
+// half the machines that run it.
+func TestScreenshotPaneNamesTheSlotAndNotThePane(t *testing.T) {
+	c, self := agentPaneFixture(t)
 
-	var sent map[string]any
-	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo shot-marker", "enter": true}, &sent)
-	pane := sent["paneId"].(string)
-	waitForPaneIdle(t, c, pane)
+	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo shot-marker", "enter": true},
+		&map[string]any{})
+	waitForPaneIdle(t, slotPaneID(t, self, 1))
 
 	res := callTool(t, c, "screenshot-pane", map[string]any{"output": "html"})
 	if res.IsError {
 		t.Fatalf("screenshot-pane errored: %s", res.text(t, "screenshot-pane"))
 	}
-	if res.StructuredContent["paneId"] != pane {
-		t.Errorf("structuredContent paneId is %v, want the slot-1 pane %s; a rendered pane cannot "+
-			"name itself, so this key is the only answer the caller gets",
-			res.StructuredContent["paneId"], pane)
-	}
 	if slot, _ := res.StructuredContent["slot"].(float64); int(slot) != 1 {
-		t.Errorf("structuredContent slot is %v, want 1", res.StructuredContent["slot"])
+		t.Errorf("structuredContent slot is %v, want 1; a rendered pane cannot name itself, so "+
+			"this key is the only answer the caller gets", res.StructuredContent["slot"])
+	}
+	if _, hasPaneID := res.StructuredContent["paneId"]; hasPaneID {
+		t.Errorf("structuredContent carries a paneId: %v", res.StructuredContent)
 	}
 }

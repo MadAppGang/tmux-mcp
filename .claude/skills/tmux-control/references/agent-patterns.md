@@ -181,3 +181,10 @@ disposable with one `kill-server`.
 
 A good default: **use isolated unless the user benefits from watching.** It keeps
 their environment clean and makes cleanup a single command.
+
+**Before either, though:** if the tmux-mcp tools are available, a helper *slot*
+covers both cases without any of this bookkeeping — a slot is a pane beside the
+user by default, and `isolated: true` puts the same slot on a private server
+instead. You get one number that reaches the same pane every call, no ids to
+carry, and teardown via `close-pane`. Everything on this page is the manual
+version, for the jobs a single pane cannot do.

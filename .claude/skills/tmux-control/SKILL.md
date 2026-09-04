@@ -11,7 +11,11 @@ description: >-
   the user's own `tmux ls`. Trigger on any mention of tmux, splitting/managing
   panes or windows, "run this in a pane", "watch the output", side-by-side
   terminals, or background/isolated terminal sessions — even when tmux isn't
-  named explicitly but the task clearly needs terminal-pane control.
+  named explicitly but the task clearly needs terminal-pane control. If the
+  tmux-mcp tools (`open-pane`, `execute-command`, `start-and-watch`,
+  `capture-pane`, …) are available, prefer them for the ordinary "give me a pane
+  and run something in it" case and use this skill for what they do not expose:
+  windows, sessions, layouts, and reading panes the agent does not own.
 ---
 
 # tmux control for agents
@@ -19,6 +23,30 @@ description: >-
 tmux lets you place commands in terminal **panes** you can read, drive, and tear
 down programmatically — instead of blocking on a single shell. This skill is the
 command vocabulary for doing that well as an agent.
+
+## First: is the tmux-mcp server available? Then use it instead
+
+If your tools include `open-pane`, `execute-command`, `start-and-watch`,
+`capture-pane` and friends, you are talking to **tmux-mcp**, and that is the
+better road for the ordinary case. It gives you a pane beside the user, keeps
+the same pane under the same **slot** number across calls, watches processes
+with OS-level triggers instead of screen-scraping, refuses to touch the user's
+panes or your own, and cleans up after itself. Everything below you would have
+to get right by hand.
+
+Come here when the job genuinely needs tmux itself, which tmux-mcp deliberately
+does not expose:
+
+- windows, sessions, and layouts (`new-window`, `select-layout`, `resize-pane`)
+- inspecting or reading **someone else's** panes — the user's, another agent's
+- anything on a tmux server this process did not create
+
+**The two vocabularies do not mix.** tmux-mcp names a pane by a slot number and
+nothing else; it has no argument that takes a pane, window or session id, and a
+call carrying one is refused. Every `%…`/`@…` id on this page is a **`tmux` CLI
+target** — a value you pass to `tmux -t`, never to a tool. If you find yourself
+wanting to hand a captured id to an MCP tool, that is the signal you want a slot,
+not this skill.
 
 ## The mental model (read this first)
 
@@ -85,11 +113,13 @@ and you should consciously pick one:
 - **Relative / in-place** — operate *around your own pane* in the user's session:
   split next to `$MYPANE`, survey `$MYWIN`, reuse a pane you own. The user sees
   it. This is the default for "run this beside me / show me output."
-- **Isolated ("headless")** — a *separate disposable server* of your own
+- **Isolated** — a *separate disposable server* of your own
   (`-L sock -f /dev/null new-session`), do the work, then `kill-server`. The user
   never sees it. This is for sandboxed/throwaway jobs. (See "Isolated" below.)
-  Note "headless" here means *a separate server you spin up and tear down*, NOT a
-  split of your current window.
+  Isolated means *a separate server you spin up and tear down*, NOT a split of
+  your current window. If tmux-mcp is available, `isolated: true` on a slot does
+  this for you, including the teardown — reach for the raw form only when you
+  need the whole server, not one pane in it.
 
 > Edge case: if `$TMUX_PANE` ever seems wrong (rare — usually it's exactly your
 > pane), ground-truth it by PID: find the pane whose `#{pane_pid}` is an ancestor

@@ -1,117 +1,32 @@
 package main
 
-// missing_tests_test.go covers the 11 gaps identified by multi-model review.
+// missing_tests_test.go covers the gaps identified by multi-model review.
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
 
-// newMCPClientCustomScope starts a fresh tmux-mcp process with a specific
-// --scope value instead of the hard-coded --scope=all used by newMCPClient.
-// It performs the full MCP initialize handshake and returns a ready-to-use client.
-func newMCPClientCustomScope(t *testing.T, scope string, extraArgs ...string) *mcpClient {
-	t.Helper()
-
-	shellType := "zsh"
-	if s := os.Getenv("SHELL"); strings.Contains(s, "bash") {
-		shellType = "bash"
-	} else if strings.Contains(s, "fish") {
-		shellType = "fish"
-	}
-
-	args := append([]string{"--shell-type=" + shellType, "--scope=" + scope}, extraArgs...)
-	cmd := exec.Command(testBinaryPath, args...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("stdin pipe: %v", err)
-	}
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start process: %v", err)
-	}
-
-	c := &mcpClient{
-		cmd:                  cmd,
-		stdin:                stdin,
-		pending:              make(map[int64]*pendingCall),
-		channelNotifications: make(chan map[string]any, 64),
-	}
-
-	go c.readLoop(bufio.NewReader(stdoutPipe))
-
-	// MCP initialize handshake.
-	c.call(t, "initialize", map[string]any{
-		"protocolVersion": "2025-06-18",
-		"capabilities":    map[string]any{},
-		"clientInfo": map[string]any{
-			"name":    "e2e-test",
-			"version": "1.0.0",
-		},
-	})
-
-	// Send initialized notification.
-	notif := map[string]any{
-		"jsonrpc": "2.0",
-		"method":  "notifications/initialized",
-	}
-	data, _ := json.Marshal(notif)
-	_, _ = fmt.Fprintf(c.stdin, "%s\n", data)
-
-	t.Cleanup(func() { c.close() })
-	return c
-}
-
-// toolNames calls tools/list and returns a set of tool name strings.
-func toolNames(t *testing.T, c *mcpClient) map[string]bool {
-	t.Helper()
-	raw := c.call(t, "tools/list", map[string]any{})
-	var result struct {
-		Tools []struct {
-			Name string `json:"name"`
-		} `json:"tools"`
-	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		t.Fatalf("unmarshal tools/list result: %v\nraw: %s", err, raw)
-	}
-	names := make(map[string]bool, len(result.Tools))
-	for _, tool := range result.Tools {
-		names[tool.Name] = true
-	}
-	return names
-}
-
 // ---- 1. TestExecuteCommandTimeout ----
 
 func TestExecuteCommandTimeout(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, _ := agentPaneFixture(t)
 
 	// Command prints a marker immediately, then sleeps much longer than our timeout.
 	var result map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":         paneID,
 		"command":        "echo partial-output; sleep 60",
 		"timeoutSeconds": 3,
 	}, &result)
 
-	timedOut, _ := result["timedOut"].(bool)
-	if !timedOut {
+	timedOut, hasTimedOut := result["timedOut"]
+	if !hasTimedOut {
+		t.Fatalf("timedOut must always be present, even when false: %v", result)
+	}
+	if timedOut != true {
 		t.Fatalf("expected timedOut=true, got %v (full result: %v)", timedOut, result)
 	}
 
@@ -129,18 +44,12 @@ func TestExecuteCommandTimeout(t *testing.T) {
 // ---- 2. TestExecuteCommandExitFileRetry ----
 
 func TestExecuteCommandExitFileRetry(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, _ := agentPaneFixture(t)
 
 	// Run 10 rapid commands in sequence. All must succeed with exitCode 0.
 	for i := 0; i < 10; i++ {
 		var result map[string]any
 		c.callToolJSON(t, "execute-command", map[string]any{
-			"paneId":  paneID,
 			"command": fmt.Sprintf("echo run-%d", i),
 		}, &result)
 
@@ -153,260 +62,106 @@ func TestExecuteCommandExitFileRetry(t *testing.T) {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("run-%d: expected %q in output, got: %q", i, expected, output)
 		}
-	}
-}
-
-// ---- 3. TestCreateSessionIdempotent ----
-
-func TestCreateSessionIdempotent(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	name := uniqueSession(t)
-
-	// First create.
-	var first map[string]any
-	c.callToolJSON(t, "create-session", map[string]any{"name": name}, &first)
-	firstID, _ := first["sessionId"].(string)
-	if firstID == "" {
-		t.Fatal("first create-session returned no sessionId")
-	}
-	t.Cleanup(func() {
-		_ = callToolIgnoreError(c, "kill-session", map[string]any{"sessionId": firstID})
-	})
-
-	// Second create with same name — must return the SAME session ID.
-	var second map[string]any
-	c.callToolJSON(t, "create-session", map[string]any{"name": name}, &second)
-	secondID, _ := second["sessionId"].(string)
-	if secondID == "" {
-		t.Fatal("second create-session returned no sessionId")
-	}
-
-	if firstID != secondID {
-		t.Fatalf("idempotent create-session: expected same sessionId %q, got %q", firstID, secondID)
-	}
-}
-
-// ---- 4. TestKillSessionByName ----
-
-func TestKillSessionByName(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	name := uniqueSession(t)
-
-	var created map[string]any
-	c.callToolJSON(t, "create-session", map[string]any{"name": name}, &created)
-	sessionID, _ := created["sessionId"].(string)
-	if sessionID == "" {
-		t.Fatal("create-session returned no sessionId")
-	}
-
-	// Kill using the session name rather than the $N session ID.
-	var killed map[string]any
-	c.callToolJSON(t, "kill-session", map[string]any{"sessionId": name}, &killed)
-
-	// Verify the session is gone.
-	var sessions []map[string]any
-	c.callToolJSON(t, "list-sessions", map[string]any{}, &sessions)
-	for _, s := range sessions {
-		if s["id"] == sessionID {
-			t.Fatalf("session %s still present after kill-session by name", sessionID)
-		}
-		if s["name"] == name {
-			t.Fatalf("session with name %q still present after kill-session by name", name)
+		// Only the first call creates the pane; every one after it reuses it.
+		// That is the whole promise of a slot, and the field that reports it is
+		// the only warning an agent gets when a long-running process is gone.
+		wantCreated := i == 0
+		if result["created"] != wantCreated {
+			t.Fatalf("run-%d: created=%v, want %v — slot 1 must be the same pane every time",
+				i, result["created"], wantCreated)
 		}
 	}
 }
 
-// ---- 5. TestScopeAgentic ----
+// ---- 3. TestOpenPaneRunAndClose ----
 
-func TestScopeAgentic(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClientCustomScope(t, "agentic")
-	names := toolNames(t, c)
+// TestOpenPaneRunAndClose is the whole slot lifecycle through the tools that
+// remain: open a numbered slot, work in it, list it, close it, and see it go.
+//
+// It replaces a test that split a pane by id, listed the window and killed the
+// pane by id. All three of those tools are gone; the lifecycle they covered is
+// not, and this is what it looks like when the slot is the only handle.
+func TestOpenPaneRunAndClose(t *testing.T) {
+	c, self := agentPaneFixture(t)
 
-	agenticRequired := []string{
-		// Layer 1 (13 essential primitives)
-		"list-sessions",
-		"list-windows",
-		"list-panes",
-		"create-session",
-		"create-headless",
-		"split-pane",
-		"capture-pane",
-		"send-keys",
-		"execute-command",
-		"kill-session",
-		"kill-headless-server",
-		"kill-pane",
-		"screenshot-pane",
-		// Layer 2 (7 agent workflow tools)
-		"start-and-watch",
-		"watch-pane",
-		"pane-state",
-		"run-in-repl",
-		"write-to-display",
-		"display-message",
-		// close-pane is the owner-aware inverse of slot resolution, and belongs
-		// in Layer 2 rather than beside kill-pane: it is a workflow tool that
-		// knows which panes are the agent's, not a primitive that destroys what
-		// it is pointed at.
-		"close-pane",
+	var opened map[string]any
+	c.callToolJSON(t, "open-pane", map[string]any{"slot": 2}, &opened)
+	if opened["created"] != true {
+		t.Fatalf("the first open-pane for slot 2 must report created:true, got %v", opened)
 	}
-	for _, tool := range agenticRequired {
-		if !names[tool] {
-			t.Errorf("agentic scope: expected tool %q to be present, but it is missing", tool)
-		}
+	pane := slotPaneID(t, self, 2)
+
+	// A second call is the same pane, and says so.
+	var reopened map[string]any
+	c.callToolJSON(t, "open-pane", map[string]any{"slot": 2}, &reopened)
+	if reopened["created"] != false {
+		t.Fatalf("re-opening slot 2 must report created:false, got %v", reopened)
+	}
+	if again := slotPaneID(t, self, 2); again != pane {
+		t.Fatalf("slot 2 moved from %s to %s between calls", pane, again)
 	}
 
-	primitiveOnly := []string{
-		"resize-pane",
-		"rename-session",
-		"create-window",
-		"kill-window",
-	}
-	for _, tool := range primitiveOnly {
-		if names[tool] {
-			t.Errorf("agentic scope: expected tool %q to be absent (primitives only), but it is present", tool)
-		}
-	}
-
-	// Verify exact tool count to catch accidental additions/removals.
-	expectedCount := len(agenticRequired)
-	actualCount := len(names)
-	if actualCount != expectedCount {
-		t.Errorf("agentic scope: expected %d tools, got %d", expectedCount, actualCount)
-	}
-}
-
-// ---- 5b. TestAgenticSplitAndList ----
-// Validates the real agent workflow: create session, split pane, list panes,
-// execute command in split — all within agentic scope.
-
-func TestAgenticSplitAndList(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClientCustomScope(t, "agentic")
-
-	// Create session.
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
-	sessionID := sess["sessionId"].(string)
-
-	// Split pane — this was previously missing from agentic scope.
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneID,
-		"direction": "horizontal",
-	}, &split)
-	splitPaneID := split["paneId"].(string)
-	if splitPaneID == "" {
-		t.Fatal("split-pane returned no paneId")
-	}
-	if splitPaneID == paneID {
-		t.Fatal("split-pane returned the same paneId as the original")
-	}
-
-	// List windows — also previously missing from agentic scope.
-	var windows []map[string]any
-	c.callToolJSON(t, "list-windows", map[string]any{"sessionId": sessionID}, &windows)
-	if len(windows) == 0 {
-		t.Fatal("list-windows returned no windows")
-	}
-	windowID := windows[0]["id"].(string)
-
-	// List panes — should see both original and split pane.
-	var panes []map[string]any
-	c.callToolJSON(t, "list-panes", map[string]any{"windowId": windowID}, &panes)
-	if len(panes) < 2 {
-		t.Fatalf("expected at least 2 panes after split, got %d", len(panes))
-	}
-
-	// Execute command in the split pane.
 	var execResult map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  splitPaneID,
-		"command": "echo hello-from-split",
+		"slot":    2,
+		"command": "echo hello-from-slot-two",
 	}, &execResult)
-	output := execResult["output"].(string)
-	if !strings.Contains(output, "hello-from-split") {
-		t.Fatalf("expected 'hello-from-split' in output, got: %s", output)
-	}
-	exitCode := int(execResult["exitCode"].(float64))
-	if exitCode != 0 {
-		t.Fatalf("expected exit code 0, got %d", exitCode)
+	output, _ := execResult["output"].(string)
+	if !strings.Contains(output, "hello-from-slot-two") {
+		t.Fatalf("expected 'hello-from-slot-two' in output, got: %s", output)
 	}
 
-	// Kill the split pane — also previously missing from agentic scope.
-	c.callToolJSON(t, "kill-pane", map[string]any{"paneId": splitPaneID}, &map[string]any{})
+	var listed []map[string]any
+	c.callToolJSON(t, "list-slots", map[string]any{}, &listed)
+	if !listingHasSlot(listed, 2) {
+		t.Fatalf("list-slots does not report slot 2: %v", listed)
+	}
 
-	// Verify only original pane remains.
-	var panesAfter []map[string]any
-	c.callToolJSON(t, "list-panes", map[string]any{"windowId": windowID}, &panesAfter)
-	if len(panesAfter) != 1 {
-		t.Fatalf("expected 1 pane after kill, got %d", len(panesAfter))
+	var closed []map[string]any
+	c.callToolJSON(t, "close-pane", map[string]any{"slot": 2}, &closed)
+	if len(closed) != 1 || closed[0]["action"] != actionKilled {
+		t.Fatalf("close-pane({slot:2}) should have killed one pane, got %v", closed)
+	}
+	if paneExists(t, pane) {
+		t.Fatalf("pane %s survived close-pane({slot:2})", pane)
+	}
+
+	c.callToolJSON(t, "list-slots", map[string]any{}, &listed)
+	if listingHasSlot(listed, 2) {
+		t.Fatalf("list-slots still reports slot 2 after it was closed: %v", listed)
 	}
 }
 
-// ---- 6. TestScopePrimitives ----
-
-func TestScopePrimitives(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClientCustomScope(t, "primitives")
-	names := toolNames(t, c)
-
-	if !names["send-keys"] {
-		t.Error("primitives scope: expected 'send-keys' to be present")
-	}
-
-	agenticOnly := []string{
-		"start-and-watch",
-		"watch-pane",
-		"close-pane",
-	}
-	for _, tool := range agenticOnly {
-		if names[tool] {
-			t.Errorf("primitives scope: expected tool %q to be absent (agentic only), but it is present", tool)
+func listingHasSlot(listings []map[string]any, slot int) bool {
+	for _, l := range listings {
+		if n, ok := l["slot"].(float64); ok && int(n) == slot {
+			return true
 		}
 	}
+	return false
 }
 
-// ---- 7. TestRunInReplExitDetection ----
+// ---- 4. TestRunInReplExitDetection ----
 
 func TestRunInReplExitDetection(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, self := agentPaneFixture(t)
+	pane := openSlot(t, c, self, 1)
 
 	// Enable remain-on-exit so the pane stays alive (marked dead) after python3
 	// exits. Without this, tmux destroys the pane immediately on Linux and
 	// run-in-repl cannot observe the exit state.
-	exec.Command("tmux", "set-option", "-t", paneID, "remain-on-exit", "on").Run() //nolint:errcheck
+	tmuxExec(t, "set-option", "-t", pane, "remain-on-exit", "on")
 
 	// Start python3 REPL.
 	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneID,
-		"keys":   "python3",
-		"enter":  true,
+		"keys":  "python3",
+		"enter": true,
 	}, &map[string]any{})
 	sleep(800 * time.Millisecond)
 
 	// Verify the REPL is running by evaluating a simple expression.
 	var r1 map[string]any
 	c.callToolJSON(t, "run-in-repl", map[string]any{
-		"paneId":        paneID,
 		"input":         "1 + 1",
 		"promptPattern": `>>> `,
 		"timeout":       10,
@@ -420,7 +175,6 @@ func TestRunInReplExitDetection(t *testing.T) {
 	start := time.Now()
 	var r2 map[string]any
 	c.callToolJSON(t, "run-in-repl", map[string]any{
-		"paneId":        paneID,
 		"input":         "exit()",
 		"promptPattern": `>>> `,
 		"timeout":       15,
@@ -436,18 +190,22 @@ func TestRunInReplExitDetection(t *testing.T) {
 	}
 }
 
-// ---- 8. TestChannelNotificationContentValidation ----
+// ---- 5. TestChannelNotificationContentValidation ----
 
 func TestChannelNotificationContentValidation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	c := newMCPClient(t, "--channel")
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	name := uniqueSession(t)
+	tmuxExec(t, "new-session", "-d", "-x", "200", "-y", "50", "-s", name)
+	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", name).Run() })
+	self := tmuxExec(t, "display-message", "-p", "-t", name, "#{pane_id}")
+
+	c := newMCPClientInPane(t, self, "--channel")
+	pane := openSlot(t, c, self, 1)
 
 	// Enable remain-on-exit so tmux keeps the pane alive after the shell exits.
-	exec.Command("tmux", "set-option", "-t", paneID, "remain-on-exit", "on").Run() //nolint:errcheck
+	tmuxExec(t, "set-option", "-t", pane, "remain-on-exit", "on")
 
 	drainNotifications(c)
 
@@ -456,7 +214,6 @@ func TestChannelNotificationContentValidation(t *testing.T) {
 	go func() {
 		var result map[string]any
 		c.callToolJSON(t, "watch-pane", map[string]any{
-			"paneId":   paneID,
 			"triggers": "exit",
 			"mode":     "quick",
 			"timeout":  15,
@@ -465,7 +222,7 @@ func TestChannelNotificationContentValidation(t *testing.T) {
 	}()
 
 	sleep(500 * time.Millisecond)
-	exec.Command("tmux", "send-keys", "-t", paneID, "exit 42", "Enter").Run() //nolint:errcheck
+	exec.Command("tmux", "send-keys", "-t", pane, "exit 42", "Enter").Run() //nolint:errcheck
 
 	// Wait for watch-pane to complete.
 	select {
@@ -487,8 +244,8 @@ func TestChannelNotificationContentValidation(t *testing.T) {
 	if content == "" {
 		t.Error("notification content is empty")
 	}
-	if !strings.Contains(content, paneID) {
-		t.Errorf("notification content should contain paneId %q, got: %q", paneID, content)
+	if !strings.Contains(content, "slot 1") {
+		t.Errorf("notification content should name slot 1, got: %q", content)
 	}
 
 	meta, ok := notif["meta"].(map[string]any)
@@ -499,8 +256,8 @@ func TestChannelNotificationContentValidation(t *testing.T) {
 	if meta["event"] != "exit" {
 		t.Errorf("meta.event: expected 'exit', got %q", meta["event"])
 	}
-	if meta["paneId"] != paneID {
-		t.Errorf("meta.paneId: expected %q, got %q", paneID, meta["paneId"])
+	if meta["slot"] != "1" {
+		t.Errorf("meta.slot: expected \"1\", got %v", meta["slot"])
 	}
 	exitCode, _ := meta["exitCode"].(string)
 	if exitCode == "" {
@@ -531,21 +288,15 @@ func TestChannelNotificationContentValidation(t *testing.T) {
 	}
 }
 
-// ---- 9. TestWatchPaneIdleTrigger ----
+// ---- 6. TestWatchPaneIdleTrigger ----
 
 func TestWatchPaneIdleTrigger(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, _ := agentPaneFixture(t)
 
 	// Run a command that finishes quickly, then go quiet.
 	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneID,
-		"keys":   "echo done",
-		"enter":  true,
+		"keys":  "echo done",
+		"enter": true,
 	}, &map[string]any{})
 	sleep(300 * time.Millisecond)
 
@@ -553,7 +304,6 @@ func TestWatchPaneIdleTrigger(t *testing.T) {
 	start := time.Now()
 	var result map[string]any
 	c.callToolJSON(t, "watch-pane", map[string]any{
-		"paneId":   paneID,
 		"triggers": "idle:2",
 		"mode":     "quick",
 		"timeout":  20,
@@ -570,25 +320,20 @@ func TestWatchPaneIdleTrigger(t *testing.T) {
 	}
 }
 
-// ---- 10. TestWatchPanePatternTrigger ----
+// ---- 7. TestWatchPanePatternTrigger ----
 
 func TestWatchPanePatternTrigger(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, self := agentPaneFixture(t)
+	pane := openSlot(t, c, self, 1)
 
 	// Send "echo READY" after a short delay so watch-pane is already running.
 	go func() {
 		sleep(800 * time.Millisecond)
-		exec.Command("tmux", "send-keys", "-t", paneID, "echo READY", "Enter").Run() //nolint:errcheck
+		exec.Command("tmux", "send-keys", "-t", pane, "echo READY", "Enter").Run() //nolint:errcheck
 	}()
 
 	var result map[string]any
 	c.callToolJSON(t, "watch-pane", map[string]any{
-		"paneId":   paneID,
 		"triggers": "pattern:READY",
 		"mode":     "quick",
 		"timeout":  15,
@@ -597,33 +342,5 @@ func TestWatchPanePatternTrigger(t *testing.T) {
 	event, _ := result["event"].(string)
 	if !strings.Contains(event, "pattern") {
 		t.Fatalf("expected event to contain 'pattern', got %q", event)
-	}
-}
-
-// ---- 11. TestInvalidPaneIdError ----
-
-func TestInvalidPaneIdError(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-
-	// Ensure at least one session exists so tmux is running.
-	createSession(t, c, uniqueSession(t))
-
-	raw := c.callToolRaw(t, "capture-pane", map[string]any{"paneId": "%99999"})
-
-	var result struct {
-		IsError bool `json:"isError"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		t.Fatalf("unmarshal capture-pane result: %v\nraw: %s", err, raw)
-	}
-	if !result.IsError {
-		t.Fatalf("expected isError=true for non-existent pane %%99999, got result: %v", result)
 	}
 }

@@ -11,10 +11,14 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// This file is the single place that reads the pane-selecting arguments —
-// paneId, slot, headless — of every tool that takes them. Nothing else parses
-// them. See resolvePaneArg for why that restriction is the mechanism rather than
-// a convention.
+// This file is the single place that reads the pane-selecting argument — the
+// slot — of every tool that takes one, and the single place that refuses the
+// arguments this contract does not have. Nothing else parses either.
+//
+// The paneId branch is gone, not deprecated. A slot is the only handle at the
+// wire, so there is no id to prefer over a slot, no "explicit wins" ordering,
+// and no Slot == 0 sentinel meaning "the caller named the pane" — the four call
+// sites that had to agree about what a zero meant are gone with it.
 
 // ---- Schema ----
 
@@ -46,9 +50,9 @@ func jsonSchemaType(types ...string) mcp.PropertyOption {
 }
 
 // slotProperty is the single declaration of the slot argument, shared by every
-// tool that takes one. One definition means one description, and the nine tools
-// cannot drift apart — a caller that learns what slot means from one tool's
-// schema has learned it for all of them.
+// tool that takes one. One definition means one description, and the twelve
+// tools cannot drift apart — a caller that learns what a slot means from one
+// tool's schema has learned it for all of them.
 //
 // The bounds are declared as well as enforced. checkedSlot rejects out-of-range
 // values anyway, but a caller that can see the range in the schema does not have
@@ -58,10 +62,67 @@ func slotProperty() mcp.ToolOption {
 		jsonSchemaType("integer"),
 		mcp.Min(slotDefault),
 		mcp.Max(maxSlot),
-		mcp.Description(`Helper pane to use: 1 (the default), 2, 3, … Omit both slot and paneId `+
-			`to use slot 1. Slot panes are created beside this agent's pane, are reused across `+
-			`calls, and are never the agent's own pane. Cannot be combined with headless:true.`),
+		mcp.Description(`Which helper pane to use: 1 (the default), 2, 3, … Omit it to use slot 1. `+
+			`A slot is a pane beside this agent in the window the user is looking at, and the same `+
+			`slot number returns the SAME pane every time — so a process started in slot 2 is still `+
+			`running there on the next call. It is never the agent's own pane.`),
 	)
+}
+
+// isolatedProperty is the single declaration of the isolated argument, shared by
+// the six tools that can CREATE a pane. The four reading tools do not declare it
+// at all, and a request that sends one to them is refused rather than ignored —
+// see resolveSlot.
+//
+// The description has to carry one fact the schema cannot: omitting it is not
+// the same as sending false. Absent means "whichever kind of pane this slot
+// already is", which is what makes an invisible slot addressable by its number
+// on every later call; false is a claim that the slot is the visible one, and a
+// claim can conflict.
+func isolatedProperty() mcp.ToolOption {
+	return mcp.WithBoolean("isolated",
+		mcp.Description(`Open the pane where nobody can see it — on a private terminal server `+
+			`with no window, so nothing appears beside the user. Use it for work they should not `+
+			`have to watch. It needs a slot number, because a pane you cannot see has to be `+
+			`addressable later; every tool then reaches it by that number alone. Omit this `+
+			`argument to use whichever kind of pane the slot already holds, or to get a visible `+
+			`one when the slot is empty.`),
+	)
+}
+
+// ---- Argument rejection ----
+
+// rejectIdArgs refuses the four arguments this surface does not have.
+//
+// Refusing rather than ignoring is the safety rule, not a strictness
+// preference. An MCP server that drops an unknown property resolves the call to
+// slot 1 and SUCCEEDS: a caller that sent paneId gets keystrokes delivered to a
+// pane it did not name, and a caller that sent headless:true — asking for a pane
+// nobody can see — gets a visible one beside the user. Both are the failure a
+// refusal makes impossible.
+//
+// The refusal names the property that was sent: a caller that gets "paneId is
+// not accepted" after sending windowId learns nothing about its own request.
+// The order is fixed so the message is deterministic when more than one is
+// present.
+//
+// It runs from addAgenticTool, before any handler body — see there for why the
+// check cannot live in the resolver.
+func rejectIdArgs(req mcp.CallToolRequest) error {
+	args := req.GetArguments()
+	for _, name := range []string{"paneId", "windowId", "sessionId"} {
+		if _, ok := args[name]; ok {
+			return fmt.Errorf("%s is not accepted; address the pane by slot", name)
+		}
+	}
+	if _, ok := args["headless"]; ok {
+		// Deliberately not the literal "headless:" — the release's grep gate
+		// scans the shipped strings for it, and this sentence is the one place
+		// the word has to appear at all.
+		return errors.New("headless is not accepted; open an invisible pane with " +
+			"isolated: true and a slot number")
+	}
+	return nil
 }
 
 // ---- Parsing ----
@@ -69,12 +130,12 @@ func slotProperty() mcp.ToolOption {
 // parseSlotArg reads the "slot" argument. present is false when the caller
 // omitted it.
 //
-// ONLY resolvePaneArg may call this; see resolvePaneArg for why.
+// ONLY resolveSlot and parseCloseSlotArg may call this.
 //
 // The raw argument is inspected rather than going through req.GetInt, and that
 // is not fastidiousness. GetInt runs an unparseable value through strconv.Atoi
 // and silently substitutes the default, so any typo — slot "tow", slot "1x" —
-// becomes slot 0, which resolvePaneArg then reads as "omitted" and turns into
+// becomes slot 0, which resolveSlot then reads as "omitted" and turns into
 // slot 1. The caller's mistake would land as a real write to the shared default
 // pane, with no error raised anywhere. Every malformed value has to fail loudly
 // instead, which means parsing it here.
@@ -143,113 +204,197 @@ func slotArgError(raw any) error {
 
 // ---- Resolution ----
 
-// paneTarget is the outcome of the single resolution path shared by every
-// pane-taking tool.
+// paneTarget is the outcome of the one resolution path every slot-taking tool
+// shares.
 //
-// Owner is the only field a handler cannot obtain for itself, and that is the
-// reason it is carried here rather than looked up when needed. It is the
-// registry's answer as resolveHelper read it under slotMu, in the same hold that
-// chose the pane; a handler asking the same question afterwards asks it of a
-// registry that a concurrent close-pane may already have erased, and gets "no
-// record" for a pane that was ours a millisecond ago and is now the user's
-// again. clearForDisplay is the consumer, and there the difference between those
-// two answers is whether the user's half-typed command line survives.
+// Slot is always 1..maxSlot. The old "Slot == 0 means the caller named a pane"
+// sentinel is gone with the paneId path that produced it, and so are Resolved()
+// and the four call sites that had to agree about what a zero meant.
 //
-// It is empty on the explicit-paneId path, where nothing was resolved and so
-// nothing was read. Slot is what tells the two apart — 0 means the caller named
-// the pane — and a consumer must branch on that rather than on Owner being
-// empty, because "we did not look" and "we looked and found nothing" are
-// different facts.
+// Owner is carried rather than looked up, and the reason has not changed: it is
+// the registry's answer as resolution read it under slotMu, in the same hold
+// that chose the pane. A handler that asks again after the lock is released can
+// be told "no record" for a pane that was ours a millisecond ago, because a
+// concurrent close-pane released it — and in clearForDisplay the difference
+// between those two answers is whether the user's half-typed command line
+// survives.
 type paneTarget struct {
-	PaneID  string // concrete and non-empty on success, unless Headless
-	Slot    int    // 0 when the caller named a pane explicitly
-	Created bool   // this call created or adopted the pane
-	Owner   string // ownerAgent or ownerAcquired as read under slotMu during slot
-	// resolution; empty when the caller named the pane
-	Headless bool // caller asked for a headless pane and named none;
-	// only ever set for tools that declare AllowHeadless
+	Ref      paneRef
+	Slot     int
+	Created  bool
+	Owner    string
+	Isolated bool
 }
 
-// paneArgSpec declares what the calling tool actually implements, so that
-// resolvePaneArg can reject an argument the tool does not honour instead of
-// ignoring it.
-type paneArgSpec struct {
-	AllowHeadless bool
-}
-
-// Resolved reports whether this target came from slot resolution rather than a
-// paneId the caller named.
+// slotResolution is what a CREATING tool puts in its response.
 //
-// The fact itself is just Slot != 0, and the reason it earns a method is that
-// four call sites across two files have to agree about it, and they decide
-// different things with it: whether to attach resolution metadata to a response
-// (capture-pane, split-pane, screenshot-pane) and whether it is safe to clear a
-// pane's line (write-to-display). Slot 0 meaning "explicit paneId" is a sentinel
-// this package chose, not something the type enforces, so spelling it out four
-// times is four places to update if that ever changes and nothing linking them.
-func (tgt paneTarget) Resolved() bool { return tgt.Slot != 0 }
-
-// resolution projects a target into the fields tools put in their responses.
-func (tgt paneTarget) resolution() paneResolution {
-	return paneResolution{PaneID: tgt.PaneID, Slot: tgt.Slot, Created: tgt.Created}
+// Created is a POINTER, and "absent" and "false" have to be different answers on
+// the wire. created is a discontinuity signal, not a success flag: every call
+// succeeds, and what created reports is whether this slot already had a pane. An
+// agent that started a dev server in slot 1 and later sees created:true has
+// learned the only way it can that the user closed that pane and its process
+// died with it.
+//
+// On a reading tool the question does not arise, and a field that is
+// structurally always false would teach the model that a read might create. nil
+// means "not applicable"; it is never nil on a creating tool, which is what
+// keeps "created is always present" true for the callers that rule was written
+// for. See TestCreatedIsPresentOnCreatingToolsAndAbsentOnReading, which cannot
+// be satisfied by a plain bool.
+type slotResolution struct {
+	Slot    int   `json:"slot"`
+	Created *bool `json:"created,omitempty"`
 }
 
-// paneResolution is embedded in tool responses so a caller that named no pane
-// can still see which one it got, and whether the pane is new.
-//
-// Slot and Created are omitempty, so a call that passed an explicit paneId
-// produces byte-identical JSON to the version before slots existed: send-keys
-// still answers exactly {"paneId":"%3"}. That is what "paneId keeps working
-// everywhere" means at the wire level, and it is checkable rather than merely
-// intended — see TestExplicitPaneIdResponsesAreUnchanged.
-type paneResolution struct {
-	PaneID  string `json:"paneId"`
-	Slot    int    `json:"slot,omitempty"`
-	Created bool   `json:"created,omitempty"`
+// creating is the pointer a creating tool puts in slotResolution.Created. It
+// exists so no handler has to take the address of a local, which is the shape a
+// future edit accidentally shares between two responses.
+func creating(created bool) *bool { return &created }
+
+// slotRef is what a READING tool puts in its response: the slot, and nothing
+// else.
+type slotRef struct {
+	Slot int `json:"slot"`
 }
 
 // paneStateResult is pane-state's response: the process state it has always
-// returned, plus the resolution. PaneState carries no paneId of its own, so the
-// two embeddings cannot collide, and Go promotes the exported fields of an
-// embedded unexported struct type — which is subtle enough to be pinned by
-// TestPaneResolutionFlattens rather than trusted.
+// returned, plus the slot it was read from. PaneState carries no slot of its
+// own, so the two embeddings cannot collide, and Go promotes the exported fields
+// of an embedded unexported struct type — which is subtle enough to be pinned by
+// TestSlotRefFlattens rather than trusted.
 type paneStateResult struct {
 	*PaneState
-	paneResolution
+	slotRef
 }
 
 // replResult is run-in-repl's response.
 //
-// It replaces three separate anonymous structs, each of which carried its own
-// PaneID field. Keeping that field alongside the embedded paneResolution would
-// have produced an object with two "paneId" keys — legal Go, invalid-ish JSON,
-// and a bug that only shows up in whichever key the client's parser happens to
-// keep. Exited is omitempty so the ordinary "prompt came back" answer is the
-// same object it always was.
+// Exited has no omitempty, deliberately. An absent key makes
+// `result.exited === false` unsatisfiable and gives a model reading the response
+// no way to learn the field exists at all — the same defect the pointer above
+// removes from created, sitting on a field nobody enumerated.
 type replResult struct {
-	paneResolution
+	slotResolution
 	Output string `json:"output"`
-	Exited bool   `json:"exited,omitempty"`
+	Exited bool   `json:"exited"`
 }
 
-// checkHeadlessArg applies the two headless rules, and exists as its own
-// function because close-pane needs them without needing resolution: it selects
-// panes but never creates one, so it cannot go through resolvePaneArg, and a
-// second hand-written copy of these rules is how the two would drift apart.
-func checkHeadlessArg(req mcp.CallToolRequest, spec paneArgSpec, hasSlot bool) (bool, error) {
-	headless := req.GetBool("headless", false)
-	if headless && !spec.AllowHeadless {
-		return false, errors.New(
-			"this tool has no headless mode; omit headless, or create the pane with " +
-				"create-headless / execute-command(headless:true) and pass the returned paneId")
+// execResult is execute-command's response. timedOut loses its omitempty for
+// the reason replResult.Exited does.
+type execResult struct {
+	slotResolution
+	Output   string `json:"output"`
+	ExitCode int    `json:"exitCode"`
+	TimedOut bool   `json:"timedOut"`
+}
+
+// oneShotResult is the ephemeral execute-command's response, and what it OMITS
+// is the contract: no slot, and no created.
+//
+// The pane was opened, used and destroyed inside the call, so there is no number
+// that would reach it again. Reporting one would be an invitation to address a
+// pane that no longer exists, and reporting created:true would say a slot had
+// been opened when none was.
+type oneShotResult struct {
+	Output   string `json:"output"`
+	ExitCode int    `json:"exitCode"`
+	TimedOut bool   `json:"timedOut"`
+}
+
+// openedPane is open-pane's response.
+//
+// It reports the kind as well as the slot because open-pane is the one tool
+// whose entire job is to hand back a pane: an agent that asked for an invisible
+// one has no other way to confirm it got one, since there is nothing to look at,
+// and an agent that omitted the argument learns which kind the slot already was.
+// It carries no omitempty for the same reason created does not: a field that
+// disappears when false teaches the model that false cannot happen.
+type openedPane struct {
+	slotResolution
+	Isolated bool `json:"isolated"`
+}
+
+// paneArgSpec declares what the calling tool implements, so that resolveSlot can
+// reject an argument the tool does not honour instead of ignoring it.
+//
+// Ignoring is the failure both fields exist to prevent. An MCP server that drops
+// an unknown property resolves the call to slot 1 and SUCCEEDS, so a caller that
+// asked for a pane nobody can see would get a visible one beside the user and be
+// told it worked.
+type paneArgSpec struct {
+	// NoCreate marks a READING tool. Two consequences follow from the one fact:
+	// the tool declares no isolated argument, so a request carrying one is
+	// refused; and a slot that does not exist is an error rather than a pane.
+	NoCreate bool
+
+	// AllowEphemeral marks execute-command, the only tool where isolated with no
+	// slot means something: a pane created, used and destroyed inside the call.
+	// Everywhere else that combination is the refusal in isolatedNeedsSlotText,
+	// because a pane you cannot see and cannot name again is a pane nothing can
+	// ever reach.
+	AllowEphemeral bool
+}
+
+// isolatedNeedsSlotText is the refusal for isolated with no slot.
+//
+// It says WHY rather than merely "slot is required", because the reason is the
+// rule the caller has to internalise: a visible pane can be found again by
+// looking at the screen, and an invisible one cannot be found again by any means
+// except its number.
+const isolatedNeedsSlotText = "isolated needs a slot number, because a pane you cannot see " +
+	"must be addressable later"
+
+// isolatedNotAcceptedText is the refusal for an isolated argument on a reading
+// tool. Ignoring it would be the worse answer: a caller that asked for an
+// invisible pane and was quietly answered about a visible one has been told its
+// request succeeded.
+const isolatedNotAcceptedText = "isolated is not accepted here; this tool only reads a slot " +
+	"that already exists"
+
+// parseKindArg reads the "isolated" argument into the tri-state the resolver
+// speaks. hasSlot decides whether the isolated form is even legal, so the two
+// arguments are parsed together rather than independently.
+//
+// ephemeral is true only for the one call shape that means "a pane for this
+// command and nothing else": execute-command, isolated, no slot. Every other
+// tool refuses that shape.
+func parseKindArg(
+	req mcp.CallToolRequest, spec paneArgSpec, hasSlot bool,
+) (kind kindRequest, ephemeral bool, err error) {
+	raw, present := req.GetArguments()["isolated"]
+	if !present || raw == nil {
+		return kindUnstated, false, nil
 	}
-	if headless && hasSlot {
-		return false, errors.New(
-			"slot and headless:true cannot be combined: a slot names a pane in the window this " +
-				"server runs in, while a headless pane lives on a separate tmux server with no " +
-				"window at all — drop one")
+	if spec.NoCreate {
+		return kindUnstated, false, errors.New(isolatedNotAcceptedText)
 	}
-	return headless, nil
+	isolated, ok := raw.(bool)
+	if !ok {
+		// Some clients stringify every argument, and "true"/"false" are the only
+		// two spellings that can mean anything here. Anything else is a caller
+		// belief about this argument that is not true, and rounding it to false
+		// would hand back a visible pane to someone who asked for an invisible
+		// one — the exact failure the rejection exists to prevent.
+		s, isString := raw.(string)
+		if !isString {
+			return kindUnstated, false, fmt.Errorf("isolated must be true or false, got %v", raw)
+		}
+		parsed, parseErr := strconv.ParseBool(strings.TrimSpace(s))
+		if parseErr != nil {
+			return kindUnstated, false, fmt.Errorf("isolated must be true or false, got %q", s)
+		}
+		isolated = parsed
+	}
+	if !isolated {
+		return kindVisible, false, nil
+	}
+	if hasSlot {
+		return kindIsolated, false, nil
+	}
+	if spec.AllowEphemeral {
+		return kindIsolated, true, nil
+	}
+	return kindUnstated, false, errors.New(isolatedNeedsSlotText)
 }
 
 // closeSlotProperty is close-pane's variant of the slot argument.
@@ -261,16 +406,72 @@ func checkHeadlessArg(req mcp.CallToolRequest, spec paneArgSpec, hasSlot bool) (
 func closeSlotProperty() mcp.ToolOption {
 	return mcp.WithAny("slot",
 		jsonSchemaType("integer", "string"),
-		mcp.Description(`Helper slot to close: 1 (the default), 2, 3, … or "all" to close every `+
-			`helper pane in this window. Panes the server created are killed; panes it adopted `+
-			`from the user are interrupted and released, never killed.`),
+		// "all" reaches both kinds, and saying so is not decoration: an agent
+		// that reads "every helper pane in this window" reasonably concludes the
+		// invisible ones survive, and then leaves live shells behind on a server
+		// nobody can see. It also takes no isolated argument, deliberately —
+		// there is no version of "close everything" that should leave some of it
+		// open — and one sent anyway is REFUSED rather than ignored, which is the
+		// half that was missing: see parseCloseSlotArg.
+		mcp.Description(`Which helper slot to close: 1 (the default), 2, 3, … or "all" to close `+
+			`every helper pane this server opened, visible and isolated alike. Panes the server `+
+			`created are killed; panes it adopted from the user are interrupted and released, `+
+			`never killed.`),
 	)
+}
+
+// closeKindNotAcceptedText is close-pane's refusal for an isolated argument.
+//
+// It names the way out, because the request behind it is a real one: an agent
+// that opened an invisible pane and wants it gone has to be told how, or it will
+// send the argument again in another shape.
+const closeKindNotAcceptedText = "isolated is not accepted here; close-pane closes whichever " +
+	"kind of pane the slot holds, and slot: \"all\" closes both kinds"
+
+// noPaneArgumentText is the refusal for a pane-selecting argument on the two
+// tools that select no pane.
+const noPaneArgumentText = "%s is not accepted here; this tool takes no pane argument"
+
+// rejectPaneArgs refuses slot and isolated on list-slots and notify.
+//
+// Neither tool declares either argument, and neither resolves a slot, so without
+// this the rule stops one short again: notify({slot:2}) would put the message on
+// the user's status line — which is where notify ALWAYS puts it — and report
+// success to a caller who believed it had addressed a pane.
+//
+// It is deliberately narrow. Only the two argument names that mean "I am
+// naming a pane" are refused; an unknown property is left alone, because
+// refusing every extra key is a different and much larger promise than the one
+// this contract makes.
+func rejectPaneArgs(req mcp.CallToolRequest) error {
+	args := req.GetArguments()
+	for _, name := range []string{"slot", "isolated"} {
+		if _, ok := args[name]; ok {
+			return fmt.Errorf(noPaneArgumentText, name)
+		}
+	}
+	return nil
 }
 
 // parseCloseSlotArg reads close-pane's slot argument. all reports slot:"all";
 // present is false when the caller omitted the argument entirely, which
 // close-pane reads as slot 1.
+//
+// It also refuses isolated, and that refusal has to live here because close-pane
+// never reaches parseKindArg: it does not resolve a slot, it tears one down. An
+// ignored isolated is the destructive version of the failure the whole rejection
+// rule exists for — close-pane({slot:2, isolated:true}) on a VISIBLE slot 2 kills
+// the pane beside the user, leaves the invisible one running, and reports
+// success. The caller stated a belief about which pane it meant and the server
+// acted on the other one.
+//
+// Any present value is refused, false included. isolated:false is as much a
+// claim about the kind as isolated:true, and close-pane honours neither: it
+// closes what the slot holds.
 func parseCloseSlotArg(req mcp.CallToolRequest) (slot int, all bool, present bool, err error) {
+	if _, stated := req.GetArguments()["isolated"]; stated {
+		return 0, false, false, errors.New(closeKindNotAcceptedText)
+	}
 	if raw, ok := req.GetArguments()["slot"]; ok {
 		if s, isString := raw.(string); isString && strings.EqualFold(strings.TrimSpace(s), "all") {
 			return 0, true, true, nil
@@ -283,63 +484,98 @@ func parseCloseSlotArg(req mcp.CallToolRequest) (slot int, all bool, present boo
 	return slot, false, present, nil
 }
 
-// resolvePaneArg is the ONLY place that reads the paneId, slot and headless
-// arguments of a pane-taking tool. Every such handler calls it, and no handler
-// parses those arguments itself.
+// resolveSlot is the ONLY place that turns a tool's arguments into a pane.
+// Every slot-taking handler calls it, and no handler resolves for itself.
 //
-// That restriction is the mechanism, not a style preference. Three rules have to
-// hold across nine handlers, and nine copies of a rule is nine chances to omit
-// one:
+// That restriction is the mechanism, not a style preference. Two rules have to
+// hold across eleven handlers, and eleven copies of a rule is eleven chances to
+// omit one:
 //
-//  1. slot together with headless:true is an error, never a silent preference.
-//     Slots name panes in the window this server runs in; a headless pane lives
-//     on a different tmux socket, in a session with no relation to that window.
-//     Preferring either one would hand the caller a pane in the wrong universe
-//     and no way to notice.
-//  2. headless:true against a tool with no headless mode is an error, for the
-//     same reason: silently giving that caller a visible slot pane is worse than
-//     refusing, because it succeeds.
-//  3. the pane returned for a slot is never this server's own pane — Invariant
+//  1. a malformed slot is an error rather than slot 1 — see parseSlotArg, where
+//     the silent default would land a caller's typo as a real write to the
+//     shared default pane;
+//  2. the pane returned for a slot is never this server's own pane — Invariant
 //     R, enforced inside resolveHelper, which is reachable only through here.
 //
-// Resolution order: an explicit paneId wins verbatim, because a caller that
-// names a pane has taken the safety burden for it; then slot; then the default
-// slot 1. A caller that passes both paneId and slot gets the pane it named, and
-// the response reports slot 0 — the slot is not resolved at all, so no pane is
-// created for it.
-func (t *tmuxClient) resolvePaneArg(
+// A missing slot argument means slot 1, so the overwhelmingly common request —
+// "run this somewhere I can see" — needs no argument at all.
+//
+// The ephemeral form of execute-command is the one call shape this function
+// cannot answer, because there is no slot to resolve and nothing to reuse. It is
+// reported through the second return value rather than handled here: the pane's
+// whole lifetime is one handler body, and putting a create-use-destroy sequence
+// behind the resolver would make "resolveSlot returned a pane" mean two
+// different things about who has to clean it up.
+func (s *slots) resolveSlot(
 	ctx context.Context, req mcp.CallToolRequest, spec paneArgSpec,
 ) (paneTarget, error) {
+	tgt, ephemeral, err := s.resolveSlotOrEphemeral(ctx, req, spec)
+	if err != nil {
+		return paneTarget{}, err
+	}
+	if ephemeral {
+		// Unreachable: only execute-command sets AllowEphemeral, and it calls
+		// resolveSlotOrEphemeral directly.
+		return paneTarget{}, errors.New(isolatedNeedsSlotText)
+	}
+	return tgt, nil
+}
+
+// resolveSlotOrEphemeral is resolveSlot plus the one-shot answer. ephemeral is
+// true when the caller asked for an isolated pane with no slot on the only tool
+// that allows it; tgt is then the zero value and the caller opens its own pane.
+func (s *slots) resolveSlotOrEphemeral(
+	ctx context.Context, req mcp.CallToolRequest, spec paneArgSpec,
+) (tgt paneTarget, ephemeral bool, err error) {
 	slot, hasSlot, err := parseSlotArg(req)
 	if err != nil {
-		return paneTarget{}, err
+		return paneTarget{}, false, err
 	}
-
-	headless, err := checkHeadlessArg(req, spec, hasSlot)
+	kind, ephemeral, err := parseKindArg(req, spec, hasSlot)
 	if err != nil {
-		return paneTarget{}, err
+		return paneTarget{}, false, err
 	}
-
-	if paneID := req.GetString("paneId", ""); paneID != "" {
-		// No Owner, and no lookup to obtain one. Nothing was resolved, so the
-		// registry was never consulted and there is no locked answer to carry —
-		// the caller named a pane and took the safety burden for it, which is the
-		// same trade this function's doc comment makes for every other rule. A
-		// consumer that needs an owner on this path reads it itself, knowing it is
-		// reading it now rather than at resolution time; clearForDisplay does
-		// exactly that, and says why it is safe there.
-		return paneTarget{PaneID: paneID}, nil
+	if ephemeral {
+		return paneTarget{}, true, nil
 	}
-	if headless {
-		return paneTarget{Headless: true}, nil
-	}
-
 	if !hasSlot {
 		slot = slotDefault
 	}
-	paneID, resolved, created, owner, err := t.resolveHelper(ctx, slot)
-	if err != nil {
-		return paneTarget{}, err
+	if spec.NoCreate {
+		tgt, err = s.lookupOnly(ctx, slot, kind)
+		return tgt, false, err
 	}
-	return paneTarget{PaneID: paneID, Slot: resolved, Created: created, Owner: owner}, nil
+	tgt, err = s.resolveHelper(ctx, slot, kind)
+	if err != nil {
+		return paneTarget{}, false, visibleError(err)
+	}
+	return tgt, false, nil
+}
+
+// lookupOnly answers a READING tool: it finds the pane occupying a slot and
+// never makes one.
+//
+// A read that creates is the defect this removes, and it was not a small one.
+// capture-pane({slot:3}) on an empty slot used to SPLIT the user's window, or
+// ADOPT one of their idle shells — writing three tmux options into a pane they
+// opened and renaming it — in order to answer a question about a pane that did
+// not exist. The answer was then a screenshot of a fresh prompt, which tells the
+// caller nothing and costs the user a pane they have to close.
+//
+// Created is false and stays false. Reading tools do not report it at all (the
+// field is nil on the wire), and a value here would be a value nothing consumes.
+func (s *slots) lookupOnly(ctx context.Context, slot int, kind kindRequest) (paneTarget, error) {
+	holder, found, err := s.lookupSlot(ctx, slot, kind)
+	if err != nil {
+		return paneTarget{}, visibleError(err)
+	}
+	if !found {
+		return paneTarget{}, fmt.Errorf(missingSlotText, slot)
+	}
+	return paneTarget{
+		Ref:      holder.Record.Ref,
+		Slot:     slot,
+		Owner:    holder.Record.Owner,
+		Isolated: holder.Isolated,
+	}, nil
 }

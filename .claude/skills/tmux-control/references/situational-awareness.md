@@ -148,7 +148,9 @@ tmux send-keys -t "$P" 'your-command' Enter
 ```
 
 This is the raw-tmux equivalent of the reuse logic the tmux-mcp server builds
-into `split-pane` — here you own the policy explicitly.
+into a helper **slot** (`open-pane`, and every other tool that takes `slot`) —
+there the server owns the policy and hands you a number; here you own the policy
+explicitly and hold the pane id yourself.
 
 ---
 

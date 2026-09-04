@@ -1,11 +1,18 @@
 package main
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
+
+// Every scenario here drives the tools the way an agent does: by slot. The
+// fixture starts a server that believes it lives in a real pane, and slots 1, 2
+// and 3 are the panes it opens beside itself — so what these tests exercise is
+// the same resolution path a bare send-keys takes in production, rather than a
+// pane id the test picked.
 
 // ---- Channel / non-channel E2E chain tests ----
 
@@ -14,20 +21,11 @@ import (
 // watch for the exit event — verifying both tool results and channel
 // notifications arrive for each event.
 func TestScenario_ChannelDevServerWorkflow(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t, "--channel")
-	sess := createSession(t, c, uniqueSession(t))
-	serverPane := sess["paneId"].(string)
+	c, self := agentPaneFixture(t, "--channel")
 
-	// Split off a work pane.
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    serverPane,
-		"direction": "horizontal",
-	}, &split)
-	workPane := split["paneId"].(string)
+	// Slot 1 runs the server, slot 2 is the work pane.
+	serverPane := openSlot(t, c, self, 1)
+	openSlot(t, c, self, 2)
 
 	// Drain any notifications that arrived during setup.
 	drainNotifications(c)
@@ -35,7 +33,6 @@ func TestScenario_ChannelDevServerWorkflow(t *testing.T) {
 	// Start python HTTP server via start-and-watch; wait for pattern match.
 	var serverResult map[string]any
 	c.callToolJSON(t, "start-and-watch", map[string]any{
-		"paneId":   serverPane,
 		"command":  "python3 -m http.server 8766",
 		"pattern":  "Serving HTTP",
 		"timeout":  20,
@@ -48,7 +45,7 @@ func TestScenario_ChannelDevServerWorkflow(t *testing.T) {
 		t.Fatalf("expected pattern event from start-and-watch, got %q", event)
 	}
 
-	// A channel notification must also have arrived.
+	// A channel notification must also have arrived, naming the slot.
 	notif := waitNotification(t, c, 5*time.Second)
 	metaMap, _ := notif["meta"].(map[string]any)
 	if metaMap == nil {
@@ -58,15 +55,14 @@ func TestScenario_ChannelDevServerWorkflow(t *testing.T) {
 	if !strings.Contains(notifEvent, "pattern") {
 		t.Fatalf("channel notification event: expected pattern, got %q", notifEvent)
 	}
-	notifPane, _ := metaMap["paneId"].(string)
-	if notifPane != serverPane {
-		t.Fatalf("channel notification paneId: expected %q, got %q", serverPane, notifPane)
+	if notifSlot, _ := metaMap["slot"].(string); notifSlot != "1" {
+		t.Fatalf("channel notification slot: expected \"1\", got %q", notifSlot)
 	}
 
 	// Curl the server from the work pane.
 	var curlResult map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  workPane,
+		"slot":    2,
 		"command": "curl -s http://localhost:8766",
 	}, &curlResult)
 	curlOutput, _ := curlResult["output"].(string)
@@ -79,11 +75,10 @@ func TestScenario_ChannelDevServerWorkflow(t *testing.T) {
 	exec.Command("tmux", "send-keys", "-t", serverPane, "C-c", "").Run() //nolint:errcheck
 	sleep(300 * time.Millisecond)
 
-	// Watch for exit on the server pane.
+	// Watch for exit on the server slot.
 	drainNotifications(c)
 	var exitResult map[string]any
 	c.callToolJSON(t, "watch-pane", map[string]any{
-		"paneId":   serverPane,
 		"triggers": "exit,shell",
 		"timeout":  10,
 	}, &exitResult)
@@ -95,7 +90,6 @@ func TestScenario_ChannelDevServerWorkflow(t *testing.T) {
 	drainNotifications(c)
 	var exitResult2 map[string]any
 	c.callToolJSON(t, "watch-pane", map[string]any{
-		"paneId":   serverPane,
 		"triggers": "exit",
 		"timeout":  10,
 	}, &exitResult2)
@@ -111,7 +105,7 @@ func TestScenario_ChannelDevServerWorkflow(t *testing.T) {
 	if exitMeta == nil {
 		t.Fatalf("exit channel notification missing meta: %v", exitNotif)
 	}
-	t.Logf("exit notification: event=%v paneId=%v", exitMeta["event"], exitMeta["paneId"])
+	t.Logf("exit notification: event=%v slot=%v", exitMeta["event"], exitMeta["slot"])
 }
 
 // TestScenario_RegularDevServerWorkflow is the same workflow as
@@ -119,25 +113,14 @@ func TestScenario_ChannelDevServerWorkflow(t *testing.T) {
 // It verifies that tool results match channel-mode behaviour and that NO
 // channel notifications are emitted.
 func TestScenario_RegularDevServerWorkflow(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t) // no --channel flag
-	sess := createSession(t, c, uniqueSession(t))
-	serverPane := sess["paneId"].(string)
+	c, self := agentPaneFixture(t) // no --channel flag
 
-	// Split off a work pane.
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    serverPane,
-		"direction": "horizontal",
-	}, &split)
-	workPane := split["paneId"].(string)
+	serverPane := openSlot(t, c, self, 1)
+	openSlot(t, c, self, 2)
 
 	// Start python HTTP server and wait for readiness pattern.
 	var serverResult map[string]any
 	c.callToolJSON(t, "start-and-watch", map[string]any{
-		"paneId":   serverPane,
 		"command":  "python3 -m http.server 8767",
 		"pattern":  "Serving HTTP",
 		"timeout":  20,
@@ -152,7 +135,7 @@ func TestScenario_RegularDevServerWorkflow(t *testing.T) {
 	// Curl the server.
 	var curlResult map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  workPane,
+		"slot":    2,
 		"command": "curl -s http://localhost:8767",
 	}, &curlResult)
 	curlOutput, _ := curlResult["output"].(string)
@@ -177,19 +160,13 @@ func TestScenario_RegularDevServerWorkflow(t *testing.T) {
 // notifications: a successful build that matches a pattern, and a failing build
 // that fires an exit or error trigger.
 func TestScenario_ChannelBuildMonitoring(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t, "--channel")
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, _ := agentPaneFixture(t, "--channel")
 
 	drainNotifications(c)
 
 	// Successful build: pattern "Build complete" should match.
 	var successResult map[string]any
 	c.callToolJSON(t, "start-and-watch", map[string]any{
-		"paneId":   paneID,
 		"command":  "echo 'Building...' && sleep 0.5 && echo 'Build complete: 0 errors'",
 		"pattern":  "Build complete",
 		"timeout":  15,
@@ -217,7 +194,6 @@ func TestScenario_ChannelBuildMonitoring(t *testing.T) {
 	drainNotifications(c)
 	var failResult map[string]any
 	c.callToolJSON(t, "start-and-watch", map[string]any{
-		"paneId":   paneID,
 		"command":  "echo 'Building...' && sleep 0.3 && echo 'FATAL ERROR: compilation failed'",
 		"pattern":  "FATAL ERROR",
 		"timeout":  15,
@@ -238,102 +214,57 @@ func TestScenario_ChannelBuildMonitoring(t *testing.T) {
 	t.Logf("failed build notification: event=%v detail=%v", failMeta["event"], failMeta["detail"])
 }
 
-// TestScenario_ChannelMultiPaneMonitoring watches multiple panes simultaneously
-// in channel mode and verifies that notifications arrive from distinct panes.
-func TestScenario_ChannelMultiPaneMonitoring(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t, "--channel")
-	sess := createSession(t, c, uniqueSession(t))
-	paneA := sess["paneId"].(string)
+// TestScenario_ChannelMultiSlotMonitoring watches several slots in channel mode
+// and verifies that notifications name the slot they came from.
+//
+// The slot is the whole point of the assertion at the end. Before this contract
+// the event carried a pane id, and an agent watching two things at once told
+// them apart by an identifier no tool would accept back. Now it tells them apart
+// by the number it passes to capture-pane.
+func TestScenario_ChannelMultiSlotMonitoring(t *testing.T) {
+	c, self := agentPaneFixture(t, "--channel")
 
-	// Occupy paneA so split-pane from paneB won't reuse it.
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneA,
-		"keys":   "cat",
-		"enter":  true,
-	}, &map[string]any{})
-	waitForPaneBusy(t, c, paneA)
-
-	// Create pane B.
-	var splitB map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneA,
-		"direction": "horizontal",
-	}, &splitB)
-	paneB := splitB["paneId"].(string)
-
-	// Occupy paneB so split-pane from paneB won't reuse paneA again.
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneB,
-		"keys":   "cat",
-		"enter":  true,
-	}, &map[string]any{})
-	waitForPaneBusy(t, c, paneB)
-
-	// Create pane C.
-	var splitC map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneB,
-		"direction": "vertical",
-	}, &splitC)
-	paneC := splitC["paneId"].(string)
-
-	// Exit cat in panes A and B, then wait until both are back at a shell
-	// prompt before driving them — a fixed sleep raced against prompt redraw.
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId":  paneA,
-		"keys":    "C-d",
-		"literal": false,
-	}, &map[string]any{})
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId":  paneB,
-		"keys":    "C-d",
-		"literal": false,
-	}, &map[string]any{})
-	waitForPaneIdle(t, c, paneA)
-	waitForPaneIdle(t, c, paneB)
+	openSlot(t, c, self, 1)
+	openSlot(t, c, self, 2)
+	paneC := openSlot(t, c, self, 3)
 
 	drainNotifications(c)
 
-	// Pane A: start-and-watch with a readiness message. start-and-watch
-	// captures its baseline after sending the command, so an instantaneous
-	// echo can land in the baseline and never register as new output. A short
-	// sleep before the echo guarantees the readiness line is printed *during*
-	// monitoring (same approach as TestScenario_ChannelBuildMonitoring).
+	// Slot 1: start-and-watch with a readiness message. A short sleep before the
+	// echo guarantees the readiness line is printed *during* monitoring rather
+	// than landing in the baseline.
 	var resultA map[string]any
 	c.callToolJSON(t, "start-and-watch", map[string]any{
-		"paneId":   paneA,
-		"command":  "sleep 0.3 && echo 'pane-a-ready'",
-		"pattern":  "pane-a-ready",
+		"slot":     1,
+		"command":  "sleep 0.3 && echo 'slot-one-ready'",
+		"pattern":  "slot-one-ready",
 		"timeout":  10,
 		"triggers": "exit",
 	}, &resultA)
 	eventA, _ := resultA["event"].(string)
 	if !strings.Contains(eventA, "pattern") && eventA != "exit" {
-		t.Fatalf("pane A: expected pattern or exit event, got %q", eventA)
+		t.Fatalf("slot 1: expected pattern or exit event, got %q", eventA)
 	}
 
-	// Collect notification for pane A.
+	// Collect notification for slot 1.
 	notifA := waitNotification(t, c, 5*time.Second)
 	metaA, _ := notifA["meta"].(map[string]any)
 	if metaA == nil {
-		t.Fatalf("pane A notification missing meta: %v", notifA)
+		t.Fatalf("slot 1 notification missing meta: %v", notifA)
 	}
 
-	// Pane B: execute-command (no blocking watch — just fire and forget).
+	// Slot 2: execute-command (no blocking watch — just fire and forget).
 	var resultB map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  paneB,
-		"command": "echo 'pane-b-work'",
+		"slot":    2,
+		"command": "echo 'slot-two-work'",
 	}, &resultB)
 	outputB, _ := resultB["output"].(string)
-	if !strings.Contains(outputB, "pane-b-work") {
-		t.Fatalf("pane B: expected 'pane-b-work' in output, got: %q", outputB)
+	if !strings.Contains(outputB, "slot-two-work") {
+		t.Fatalf("slot 2: expected 'slot-two-work' in output, got: %q", outputB)
 	}
 
-	// Pane C: send exit in a goroutine so it doesn't race with watch-pane,
+	// Slot 3: send exit in a goroutine so it doesn't race with watch-pane,
 	// then call watch-pane synchronously (it blocks until exit fires).
 	drainNotifications(c)
 	go func() {
@@ -343,52 +274,44 @@ func TestScenario_ChannelMultiPaneMonitoring(t *testing.T) {
 
 	var resultC map[string]any
 	c.callToolJSON(t, "watch-pane", map[string]any{
-		"paneId":   paneC,
+		"slot":     3,
 		"triggers": "exit",
 		"timeout":  15,
 	}, &resultC)
 
 	eventC, _ := resultC["event"].(string)
-	t.Logf("pane C watch event: %q", eventC)
+	t.Logf("slot 3 watch event: %q", eventC)
 
-	// Wait for the channel notification from pane C.
+	// Wait for the channel notification from slot 3.
 	notifC := waitNotification(t, c, 5*time.Second)
 	metaC, _ := notifC["meta"].(map[string]any)
 	if metaC == nil {
-		t.Fatalf("pane C notification missing meta: %v", notifC)
+		t.Fatalf("slot 3 notification missing meta: %v", notifC)
 	}
 
-	// The two notifications must come from different panes.
-	paneFromA, _ := metaA["paneId"].(string)
-	paneFromC, _ := metaC["paneId"].(string)
-	if paneFromA == paneFromC {
-		t.Fatalf("expected notifications from different panes, both reported %q", paneFromA)
+	// The two notifications must name the two different slots they came from.
+	slotFromA, _ := metaA["slot"].(string)
+	slotFromC, _ := metaC["slot"].(string)
+	if slotFromA != "1" || slotFromC != "3" {
+		t.Fatalf("notifications should name slots 1 and 3, got %q and %q", slotFromA, slotFromC)
 	}
-	t.Logf("pane A notification paneId=%q, pane C notification paneId=%q", paneFromA, paneFromC)
 }
 
 // TestScenario_NoChannelNotificationsInRegularMode is a comprehensive negative
 // test that runs many operations in regular mode and asserts that zero channel
 // notifications are ever emitted.
 func TestScenario_NoChannelNotificationsInRegularMode(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t) // no --channel flag
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, _ := agentPaneFixture(t) // no --channel flag
 
 	// execute-command.
 	var ecResult map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  paneID,
 		"command": "echo hello",
 	}, &ecResult)
 
 	// start-and-watch with pattern.
 	var sawResult map[string]any
 	c.callToolJSON(t, "start-and-watch", map[string]any{
-		"paneId":   paneID,
 		"command":  "echo 'ready-marker'",
 		"pattern":  "ready-marker",
 		"timeout":  10,
@@ -398,7 +321,6 @@ func TestScenario_NoChannelNotificationsInRegularMode(t *testing.T) {
 	// watch-pane with timeout (no trigger should fire quickly; use short timeout).
 	var wpResult map[string]any
 	c.callToolJSON(t, "watch-pane", map[string]any{
-		"paneId":   paneID,
 		"triggers": "exit",
 		"timeout":  2,
 	}, &wpResult)
@@ -448,23 +370,35 @@ func drainNotifications(c *mcpClient) {
 	}
 }
 
-// waitForPaneIdle polls pane-state until the pane is an idle shell at its
-// prompt — the exact condition split-pane's reuse logic checks. It mirrors
-// paneIsIdleShell in tmux.go: a shell foreground process that is also the
-// pane's own process (no child command running). It does NOT key off
-// waitingForInput, which is unreliable across platforms (an idle shell reports
-// false on Linux, true on macOS). Fatal on timeout so a stuck pane surfaces as
-// a failure rather than a silently-skipped wait.
-func waitForPaneIdle(t *testing.T, c *mcpClient, paneID string) {
+// The three waits below read the pane's OS-level state DIRECTLY rather than
+// through pane-state, and that is forced rather than preferred: no tool takes a
+// pane id any more, and several of the panes these tests wait on are the user's
+// own rather than a slot of ours. Reading tmux is also what the user could do,
+// which keeps the waits honest — a test that waited through the tool would be
+// asserting against the same code path it is exercising.
+
+// paneStateNow reads one pane's process state, or fails the test.
+func paneStateNow(t *testing.T, paneID string) *PaneState {
+	t.Helper()
+	state, err := newTmuxClient("bash").GetPaneState(context.Background(), paneID)
+	if err != nil {
+		t.Fatalf("read the state of pane %s: %v", paneID, err)
+	}
+	return state
+}
+
+// waitForPaneIdle polls until the pane is an idle shell at its prompt — the
+// exact condition slot adoption checks. It mirrors paneIsIdleShell in
+// backend_tmux.go: a shell foreground process that is also the pane's own
+// process (no child command running). It does NOT key off waitingForInput, which
+// is unreliable across platforms (an idle shell reports false on Linux, true on
+// macOS). Fatal on timeout so a stuck pane surfaces as a failure rather than a
+// silently-skipped wait.
+func waitForPaneIdle(t *testing.T, paneID string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		var state map[string]any
-		c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state)
-		cmd, _ := state["foregroundCmd"].(string)
-		fgPid, _ := state["foregroundPid"].(float64)
-		panePid, _ := state["panePid"].(float64)
-		if isShellProcess(cmd) && fgPid == panePid {
+		if paneIsIdleShell(paneStateNow(t, paneID)) {
 			return
 		}
 		sleep(50 * time.Millisecond)
@@ -472,18 +406,15 @@ func waitForPaneIdle(t *testing.T, c *mcpClient, paneID string) {
 	t.Fatalf("pane %s did not return to an idle shell prompt within 5s", paneID)
 }
 
-// waitForPaneBusy polls pane-state until the pane's foreground process is no
-// longer a shell — i.e. a launched command has taken over. Used after
-// send-keys that start a process (cat, yes) so the test does not proceed until
-// the process is actually running. Fatal on timeout.
-func waitForPaneBusy(t *testing.T, c *mcpClient, paneID string) {
+// waitForPaneBusy polls until the pane's foreground process is no longer a
+// shell — i.e. a launched command has taken over. Used after send-keys that
+// start a process (cat, yes) so the test does not proceed until the process is
+// actually running. Fatal on timeout.
+func waitForPaneBusy(t *testing.T, paneID string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		var state map[string]any
-		c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state)
-		cmd, _ := state["foregroundCmd"].(string)
-		if cmd != "" && !isShellProcess(cmd) {
+		if cmd := paneStateNow(t, paneID).ForegroundCmd; cmd != "" && !isShellProcess(cmd) {
 			return
 		}
 		sleep(50 * time.Millisecond)
@@ -491,8 +422,8 @@ func waitForPaneBusy(t *testing.T, c *mcpClient, paneID string) {
 	t.Fatalf("pane %s did not start a foreground process within 5s", paneID)
 }
 
-// waitForPaneRunning polls pane-state until the pane's foreground process is the
-// named command. Fatal on timeout.
+// waitForPaneRunning polls until the pane's foreground process is the named
+// command. Fatal on timeout.
 //
 // This is stricter than waitForPaneBusy, and the strictness is the point.
 // "Foreground is not a shell" is also satisfied by a prompt hook that a rich
@@ -500,13 +431,11 @@ func waitForPaneBusy(t *testing.T, c *mcpClient, paneID string) {
 // segment — so waitForPaneBusy can return while the command under test has not
 // started yet. A test that then acts on that pane races the shell and blames the
 // product for it. Waiting for the command by name removes the race.
-func waitForPaneRunning(t *testing.T, c *mcpClient, paneID, want string) {
+func waitForPaneRunning(t *testing.T, paneID, want string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		var state map[string]any
-		c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state)
-		if cmd, _ := state["foregroundCmd"].(string); cmd == want {
+		if paneStateNow(t, paneID).ForegroundCmd == want {
 			return
 		}
 		sleep(50 * time.Millisecond)
@@ -515,27 +444,16 @@ func waitForPaneRunning(t *testing.T, c *mcpClient, paneID, want string) {
 }
 
 // TestScenario_DevServerWorkflow simulates an agent starting a dev server,
-// waiting for readiness, and running work in a second pane.
+// waiting for readiness, and running work in a second slot.
 func TestScenario_DevServerWorkflow(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	serverPane := sess["paneId"].(string)
+	c, self := agentPaneFixture(t)
 
-	// Split off a work pane.
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    serverPane,
-		"direction": "horizontal",
-	}, &split)
-	workPane := split["paneId"].(string)
+	serverPane := openSlot(t, c, self, 1)
+	openSlot(t, c, self, 2)
 
 	// Start python HTTP server via start-and-watch.
 	var serverResult map[string]any
 	c.callToolJSON(t, "start-and-watch", map[string]any{
-		"paneId":  serverPane,
 		"command": "python3 -m http.server 8765",
 		"pattern": "Serving HTTP",
 		"timeout": 20,
@@ -545,10 +463,10 @@ func TestScenario_DevServerWorkflow(t *testing.T) {
 		t.Fatalf("expected pattern event from start-and-watch, got %q", event)
 	}
 
-	// Run curl in work pane.
+	// Run curl in the work slot.
 	var curlResult map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  workPane,
+		"slot":    2,
 		"command": "curl -s http://localhost:8765",
 	}, &curlResult)
 
@@ -566,18 +484,12 @@ func TestScenario_DevServerWorkflow(t *testing.T) {
 // TestScenario_REPLSession simulates an agent opening a shell REPL and
 // running multiple expressions across multiple run-in-repl calls.
 func TestScenario_REPLSession(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, _ := agentPaneFixture(t)
 
 	// Start a lightweight sh REPL with a known prompt.
 	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneID,
-		"keys":   "env PS1='REPL> ' sh --norc --noprofile",
-		"enter":  true,
+		"keys":  "env PS1='REPL> ' sh --norc --noprofile",
+		"enter": true,
 	}, &map[string]any{})
 	sleep(300 * time.Millisecond)
 
@@ -586,7 +498,6 @@ func TestScenario_REPLSession(t *testing.T) {
 	// Expression 1: set a variable.
 	var r1 map[string]any
 	c.callToolJSON(t, "run-in-repl", map[string]any{
-		"paneId":        paneID,
 		"input":         "x=42",
 		"promptPattern": promptPattern,
 		"timeout":       10,
@@ -595,7 +506,6 @@ func TestScenario_REPLSession(t *testing.T) {
 	// Expression 2: evaluate x * 2 — should produce 84.
 	var r2 map[string]any
 	c.callToolJSON(t, "run-in-repl", map[string]any{
-		"paneId":        paneID,
 		"input":         "echo $((x * 2))",
 		"promptPattern": promptPattern,
 		"timeout":       10,
@@ -605,22 +515,22 @@ func TestScenario_REPLSession(t *testing.T) {
 	if !strings.Contains(output, "84") {
 		t.Fatalf("expected '84' in REPL output, got: %q", output)
 	}
+	// The second call reuses the pane the first one resolved — which is the only
+	// reason the variable is still set.
+	if r2["created"] != false {
+		t.Fatalf("the second run-in-repl must report created:false; a new pane would have "+
+			"lost the REPL and the variable in it: %v", r2)
+	}
 }
 
 // TestScenario_BuildMonitoring simulates an agent running builds and checking
 // success/failure via exit code.
 func TestScenario_BuildMonitoring(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, _ := agentPaneFixture(t)
 
 	// Successful build.
 	var success map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  paneID,
 		"command": "echo 'Building...' && sleep 0.2 && echo 'Build complete: 0 errors'",
 	}, &success)
 
@@ -636,7 +546,6 @@ func TestScenario_BuildMonitoring(t *testing.T) {
 	// Failed build.
 	var failure map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  paneID,
 		"command": "echo 'Building...' && sleep 0.2 && echo 'FATAL: compilation failed' && exit 1",
 	}, &failure)
 
@@ -650,34 +559,23 @@ func TestScenario_BuildMonitoring(t *testing.T) {
 	}
 }
 
-// TestScenario_CoachingDisplay simulates an agent using a split pane as a
-// coaching display while running work in the main pane.
+// TestScenario_CoachingDisplay simulates an agent using a second slot as a
+// coaching display while running work in the first.
 func TestScenario_CoachingDisplay(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	mainPane := sess["paneId"].(string)
+	c, self := agentPaneFixture(t)
 
-	// Create display pane.
-	var split map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    mainPane,
-		"direction": "horizontal",
-	}, &split)
-	displayPane := split["paneId"].(string)
+	openSlot(t, c, self, 1)
+	openSlot(t, c, self, 2)
 
-	// Write first status to display.
+	// Write first status to the display slot.
 	c.callToolJSON(t, "write-to-display", map[string]any{
-		"paneId": displayPane,
-		"text":   "Running tests...",
+		"slot": 2,
+		"text": "Running tests...",
 	}, &map[string]any{})
 
-	// Run work in main pane.
+	// Run work in the main slot.
 	var workResult map[string]any
 	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  mainPane,
 		"command": "echo 'test passed'",
 	}, &workResult)
 
@@ -688,147 +586,87 @@ func TestScenario_CoachingDisplay(t *testing.T) {
 
 	// Update display with result (clear=true).
 	c.callToolJSON(t, "write-to-display", map[string]any{
-		"paneId": displayPane,
-		"text":   "Tests passed!",
-		"clear":  true,
+		"slot":  2,
+		"text":  "Tests passed!",
+		"clear": true,
 	}, &map[string]any{})
 
 	sleep(400 * time.Millisecond)
 
-	// capture-pane on display — should contain "Tests passed".
+	// capture-pane on the display slot — should contain "Tests passed".
 	// Strip all whitespace when comparing: terminal line-wrapping in narrow split
 	// panes can break words mid-character, so we compare without any whitespace.
-	displayText := c.callToolText(t, "capture-pane", map[string]any{"paneId": displayPane})
+	displayText := c.callToolText(t, "capture-pane", map[string]any{"slot": 2})
 	displayNoWS := strings.ReplaceAll(strings.ReplaceAll(displayText, "\n", ""), " ", "")
 	if !strings.Contains(displayNoWS, "Testspassed") {
 		t.Fatalf("expected 'Tests passed' in display pane, got:\n%s", displayText)
 	}
 
-	// capture-pane on main — should contain "test passed".
-	mainText := c.callToolText(t, "capture-pane", map[string]any{"paneId": mainPane})
+	// capture-pane on the work slot — should contain "test passed".
+	mainText := c.callToolText(t, "capture-pane", map[string]any{"slot": 1})
 	if !strings.Contains(mainText, "test passed") {
-		t.Fatalf("expected 'test passed' in main pane, got:\n%s", mainText)
+		t.Fatalf("expected 'test passed' in the work pane, got:\n%s", mainText)
 	}
 }
 
-// TestScenario_MultiPaneOrchestration simulates creating multiple panes and
+// TestScenario_MultiSlotOrchestration simulates opening several slots and
 // running distinct commands in each.
-func TestScenario_MultiPaneOrchestration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneA := sess["paneId"].(string)
-	windowID := sess["windowId"].(string)
+func TestScenario_MultiSlotOrchestration(t *testing.T) {
+	c, self := agentPaneFixture(t)
 
-	// Occupy paneA so it won't be reused by subsequent splits (pane-reuse
-	// skips panes whose foreground process is not a shell).
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneA,
-		"keys":   "cat",
-		"enter":  true,
-	}, &map[string]any{})
-	waitForPaneBusy(t, c, paneA)
+	paneA := openSlot(t, c, self, 1)
+	paneB := openSlot(t, c, self, 2)
+	paneC := openSlot(t, c, self, 3)
 
-	// Split pane A horizontally → pane B.
-	var splitB map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneA,
-		"direction": "horizontal",
-	}, &splitB)
-	paneB := splitB["paneId"].(string)
-
-	// Occupy paneB so it won't be reused by the next split.
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneB,
-		"keys":   "cat",
-		"enter":  true,
-	}, &map[string]any{})
-	waitForPaneBusy(t, c, paneB)
-
-	// Split pane B vertically → pane C.
-	var splitC map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneB,
-		"direction": "vertical",
-	}, &splitC)
-	paneC := splitC["paneId"].(string)
-
-	// Exit cat in panes A and B, then wait until both are back at a shell
-	// prompt before the rest of the test drives them.
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId":  paneA,
-		"keys":    "C-d",
-		"literal": false,
-	}, &map[string]any{})
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId":  paneB,
-		"keys":    "C-d",
-		"literal": false,
-	}, &map[string]any{})
-	waitForPaneIdle(t, c, paneA)
-	waitForPaneIdle(t, c, paneB)
-
-	// Verify we have 3 panes.
-	var panes []map[string]any
-	c.callToolJSON(t, "list-panes", map[string]any{"windowId": windowID}, &panes)
-	if len(panes) < 3 {
-		t.Fatalf("expected at least 3 panes, got %d", len(panes))
+	// Three slots, three distinct panes. A resolver that handed the same pane
+	// to two slots would satisfy every command assertion below.
+	if paneA == paneB || paneB == paneC || paneA == paneC {
+		t.Fatalf("slots 1, 2 and 3 must be three different panes, got %s %s %s", paneA, paneB, paneC)
 	}
 
-	// Run different commands in each pane.
-	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  paneA,
-		"command": "echo pane-alpha",
-	}, &map[string]any{})
-	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  paneB,
-		"command": "echo pane-beta",
-	}, &map[string]any{})
-	c.callToolJSON(t, "execute-command", map[string]any{
-		"paneId":  paneC,
-		"command": "echo pane-gamma",
-	}, &map[string]any{})
+	var listed []map[string]any
+	c.callToolJSON(t, "list-slots", map[string]any{}, &listed)
+	if len(listed) != 3 {
+		t.Fatalf("list-slots should report the 3 open slots, got %d: %v", len(listed), listed)
+	}
+
+	words := map[int]string{1: "pane-alpha", 2: "pane-beta", 3: "pane-gamma"}
+
+	// Run different commands in each slot.
+	for slot, word := range words {
+		c.callToolJSON(t, "execute-command", map[string]any{
+			"slot":    slot,
+			"command": "echo " + word,
+		}, &map[string]any{})
+	}
 
 	// capture-pane each and verify distinct content.
-	textA := c.callToolText(t, "capture-pane", map[string]any{"paneId": paneA})
-	textB := c.callToolText(t, "capture-pane", map[string]any{"paneId": paneB})
-	textC := c.callToolText(t, "capture-pane", map[string]any{"paneId": paneC})
-
-	if !strings.Contains(textA, "pane-alpha") {
-		t.Errorf("pane A: expected 'pane-alpha', got:\n%s", textA)
-	}
-	if !strings.Contains(textB, "pane-beta") {
-		t.Errorf("pane B: expected 'pane-beta', got:\n%s", textB)
-	}
-	if !strings.Contains(textC, "pane-gamma") {
-		t.Errorf("pane C: expected 'pane-gamma', got:\n%s", textC)
+	for slot, word := range words {
+		text := c.callToolText(t, "capture-pane", map[string]any{"slot": slot})
+		if !strings.Contains(text, word) {
+			t.Errorf("slot %d: expected %q, got:\n%s", slot, word, text)
+		}
 	}
 
 	// pane-state on each — all should be alive.
-	for _, paneID := range []string{paneA, paneB, paneC} {
+	for slot := 1; slot <= 3; slot++ {
 		var state map[string]any
-		c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state)
+		c.callToolJSON(t, "pane-state", map[string]any{"slot": slot}, &state)
 		if state["isAlive"] != true {
-			t.Errorf("pane %s: expected isAlive=true, got %v", paneID, state["isAlive"])
+			t.Errorf("slot %d: expected isAlive=true, got %v", slot, state["isAlive"])
 		}
 	}
 }
 
 // TestScenario_NativeInputDetection simulates detecting when a process needs input.
 func TestScenario_NativeInputDetection(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, self := agentPaneFixture(t)
+	openSlot(t, c, self, 1)
 
 	// 1. Shell at prompt — waitingForInput=true.
 	sleep(500 * time.Millisecond)
 	var idleState map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &idleState)
+	c.callToolJSON(t, "pane-state", map[string]any{}, &idleState)
 	if idleState["isAlive"] != true {
 		t.Fatalf("expected isAlive=true for idle shell")
 	}
@@ -836,14 +674,13 @@ func TestScenario_NativeInputDetection(t *testing.T) {
 
 	// 2. Start `cat` with no args — reads from stdin.
 	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneID,
-		"keys":   "cat",
-		"enter":  true,
+		"keys":  "cat",
+		"enter": true,
 	}, &map[string]any{})
 	sleep(700 * time.Millisecond)
 
 	var catState map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &catState)
+	c.callToolJSON(t, "pane-state", map[string]any{}, &catState)
 	t.Logf("cat: waitingForInput=%v foregroundCmd=%v", catState["waitingForInput"], catState["foregroundCmd"])
 	if catState["isAlive"] != true {
 		t.Fatalf("expected isAlive=true while cat runs")
@@ -851,7 +688,6 @@ func TestScenario_NativeInputDetection(t *testing.T) {
 
 	// 3. Send Ctrl-D (EOF) to cat using literal=false so tmux interprets "C-d".
 	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId":  paneID,
 		"keys":    "C-d",
 		"literal": false,
 	}, &map[string]any{})
@@ -859,7 +695,7 @@ func TestScenario_NativeInputDetection(t *testing.T) {
 
 	// 4. Back to shell.
 	var shellState map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &shellState)
+	c.callToolJSON(t, "pane-state", map[string]any{}, &shellState)
 	t.Logf("after C-d: waitingForInput=%v foregroundCmd=%v", shellState["waitingForInput"], shellState["foregroundCmd"])
 	if shellState["isAlive"] != true {
 		t.Fatalf("expected isAlive=true after cat exits")
@@ -868,17 +704,13 @@ func TestScenario_NativeInputDetection(t *testing.T) {
 
 // TestScenario_ProcessLifecycle simulates tracking a full process lifecycle.
 func TestScenario_ProcessLifecycle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneID := sess["paneId"].(string)
+	c, self := agentPaneFixture(t)
+	openSlot(t, c, self, 1)
 
 	// 1. Shell at prompt: isAlive=true.
 	sleep(400 * time.Millisecond)
 	var state1 map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state1)
+	c.callToolJSON(t, "pane-state", map[string]any{}, &state1)
 	if state1["isAlive"] != true {
 		t.Fatalf("step 1: expected isAlive=true, got %v", state1["isAlive"])
 	}
@@ -886,14 +718,13 @@ func TestScenario_ProcessLifecycle(t *testing.T) {
 
 	// 2. Run sleep 2: isAlive=true, foregroundCmd should be "sleep".
 	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneID,
-		"keys":   "sleep 2",
-		"enter":  true,
+		"keys":  "sleep 2",
+		"enter": true,
 	}, &map[string]any{})
 	sleep(500 * time.Millisecond)
 
 	var state2 map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state2)
+	c.callToolJSON(t, "pane-state", map[string]any{}, &state2)
 	if state2["isAlive"] != true {
 		t.Fatalf("step 2: expected isAlive=true while sleep runs, got %v", state2["isAlive"])
 	}
@@ -904,228 +735,9 @@ func TestScenario_ProcessLifecycle(t *testing.T) {
 	// 3. Wait for sleep to finish: isAlive=true, back to shell.
 	sleep(3 * time.Second)
 	var state3 map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneID}, &state3)
+	c.callToolJSON(t, "pane-state", map[string]any{}, &state3)
 	if state3["isAlive"] != true {
 		t.Fatalf("step 3: expected isAlive=true after sleep, got %v", state3["isAlive"])
 	}
 	t.Logf("step 3 (after sleep): foregroundCmd=%v waitingForInput=%v", state3["foregroundCmd"], state3["waitingForInput"])
-}
-
-// ---- Pane-reuse tests ----
-
-// TestScenario_SplitPaneReusesIdlePane verifies that split-pane reuses an
-// existing idle pane in the same window instead of creating a new split.
-func TestScenario_SplitPaneReusesIdlePane(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneA := sess["paneId"].(string)
-
-	// Split paneA → get paneB (new pane, should not be reused).
-	var splitB map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneA,
-		"direction": "horizontal",
-	}, &splitB)
-	paneB := splitB["paneId"].(string)
-	if paneB == "" {
-		t.Fatal("split-pane returned empty paneId for paneB")
-	}
-	reusedB, _ := splitB["reused"].(bool)
-	t.Logf("first split: paneB=%s reused=%v", paneB, reusedB)
-
-	// Leave paneB idle (shell at prompt). Poll until it is genuinely an idle
-	// shell (foreground == the shell itself, no transient prompt-hook child).
-	waitForPaneIdle(t, c, paneB)
-
-	// Split paneA again → should reuse paneB since it's idle.
-	var splitReuse map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneA,
-		"direction": "horizontal",
-	}, &splitReuse)
-	reusedPane := splitReuse["paneId"].(string)
-	reusedFlag, _ := splitReuse["reused"].(bool)
-
-	t.Logf("second split: paneId=%s reused=%v", reusedPane, reusedFlag)
-
-	if reusedPane != paneB {
-		t.Fatalf("expected reused paneId=%s, got %s", paneB, reusedPane)
-	}
-	if !reusedFlag {
-		t.Fatalf("expected reused=true, got false")
-	}
-}
-
-// TestScenario_SplitPaneCreatesNewWhenAllBusy verifies that split-pane creates
-// a new pane when all existing sibling panes are busy (running a process).
-func TestScenario_SplitPaneCreatesNewWhenAllBusy(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneA := sess["paneId"].(string)
-
-	// Split paneA → get paneB.
-	var splitB map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneA,
-		"direction": "horizontal",
-	}, &splitB)
-	paneB := splitB["paneId"].(string)
-	if paneB == "" {
-		t.Fatal("split-pane returned empty paneId for paneB")
-	}
-
-	// Start an external process in paneB to make it busy.
-	// Use `yes > /dev/null` which spawns a real foreground process that is
-	// actively running (not in interruptible sleep), so pane-state detects
-	// it as not waiting for input.
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneB,
-		"keys":   "yes > /dev/null",
-		"enter":  true,
-	}, &map[string]any{})
-	sleep(1000 * time.Millisecond)
-
-	// Verify paneB is busy (not waiting for input).
-	var busyState map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneB}, &busyState)
-	t.Logf("paneB state: waitingForInput=%v foregroundCmd=%v", busyState["waitingForInput"], busyState["foregroundCmd"])
-
-	// Split paneA again → should create a NEW pane since paneB is busy.
-	var splitC map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneA,
-		"direction": "horizontal",
-	}, &splitC)
-	paneC := splitC["paneId"].(string)
-	reusedFlag, _ := splitC["reused"].(bool)
-
-	t.Logf("split while busy: paneC=%s reused=%v", paneC, reusedFlag)
-
-	if paneC == paneB {
-		t.Fatalf("expected a new pane, but got busy paneB=%s", paneB)
-	}
-	if reusedFlag {
-		t.Fatalf("expected reused=false for new pane, got true")
-	}
-
-	// Clean up: send C-c to paneB to stop yes.
-	exec.Command("tmux", "send-keys", "-t", paneB, "C-c", "").Run() //nolint:errcheck
-}
-
-// TestScenario_SplitPaneReusesCorrectPaneAmongMultiple verifies that when
-// multiple sibling panes exist, split-pane reuses an idle one and skips busy ones.
-func TestScenario_SplitPaneReusesCorrectPaneAmongMultiple(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires tmux")
-	}
-	c := newMCPClient(t)
-	sess := createSession(t, c, uniqueSession(t))
-	paneA := sess["paneId"].(string)
-
-	// Every wait here polls for the condition it actually needs rather than
-	// sleeping a fixed interval. A fixed sleep races the shell: if `yes` has not
-	// yet seized the terminal when we look, the pane still reads as idle and the
-	// reuse logic legitimately picks it, so the test fails on a product that is
-	// behaving correctly. The sibling reuse scenarios were converted to polling
-	// for exactly this reason; this one was missed, and it fails about half the
-	// time as a result.
-
-	// Make paneA busy so that subsequent splits cannot reuse it.
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneA,
-		"keys":   "yes > /dev/null",
-		"enter":  true,
-	}, &map[string]any{})
-	waitForPaneRunning(t, c, paneA, "yes")
-
-	// Split paneA → paneB (new pane, paneA is busy so no reuse).
-	var splitB map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneA,
-		"direction": "horizontal",
-	}, &splitB)
-	paneB := splitB["paneId"].(string)
-	if paneB == "" {
-		t.Fatal("split-pane returned empty paneId for paneB")
-	}
-	t.Logf("created paneB=%s reused=%v", paneB, splitB["reused"])
-
-	// Make paneB busy too.
-	waitForPaneIdle(t, c, paneB)
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneB,
-		"keys":   "yes > /dev/null",
-		"enter":  true,
-	}, &map[string]any{})
-	waitForPaneRunning(t, c, paneB, "yes")
-
-	// Split paneA → paneC (new pane, both paneA and paneB are busy).
-	var splitC map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneA,
-		"direction": "vertical",
-	}, &splitC)
-	paneC := splitC["paneId"].(string)
-	if paneC == "" {
-		t.Fatal("split-pane returned empty paneId for paneC")
-	}
-	t.Logf("created paneC=%s reused=%v", paneC, splitC["reused"])
-
-	// Now we have 3 panes: paneA (busy), paneB (busy), paneC (idle).
-	// Stop paneB's busy process to leave it idle too, but keep paneA busy.
-	exec.Command("tmux", "send-keys", "-t", paneB, "C-c", "").Run() //nolint:errcheck
-	waitForPaneIdle(t, c, paneB)
-
-	// Now: paneA=busy, paneB=idle, paneC=idle.
-	// Make paneB busy again, so paneC is the only idle sibling.
-	c.callToolJSON(t, "send-keys", map[string]any{
-		"paneId": paneB,
-		"keys":   "yes > /dev/null",
-		"enter":  true,
-	}, &map[string]any{})
-	waitForPaneRunning(t, c, paneB, "yes")
-
-	// paneC must be settled at its prompt, or it is not a reuse candidate either.
-	waitForPaneIdle(t, c, paneC)
-
-	// Now: paneA=busy, paneB=busy, paneC=idle.
-	var stateA map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneA}, &stateA)
-	t.Logf("paneA: waitingForInput=%v foregroundCmd=%v", stateA["waitingForInput"], stateA["foregroundCmd"])
-
-	var stateB map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneB}, &stateB)
-	t.Logf("paneB: waitingForInput=%v foregroundCmd=%v", stateB["waitingForInput"], stateB["foregroundCmd"])
-
-	var stateC map[string]any
-	c.callToolJSON(t, "pane-state", map[string]any{"paneId": paneC}, &stateC)
-	t.Logf("paneC: waitingForInput=%v foregroundCmd=%v", stateC["waitingForInput"], stateC["foregroundCmd"])
-
-	// Split paneA → should reuse paneC (the only idle one among siblings).
-	var splitReuse map[string]any
-	c.callToolJSON(t, "split-pane", map[string]any{
-		"paneId":    paneA,
-		"direction": "horizontal",
-	}, &splitReuse)
-	reusedPane := splitReuse["paneId"].(string)
-	reusedFlag, _ := splitReuse["reused"].(bool)
-
-	t.Logf("split with mixed panes: reusedPane=%s reused=%v", reusedPane, reusedFlag)
-
-	if !reusedFlag {
-		t.Fatalf("expected reused=true, got false")
-	}
-	if reusedPane != paneC {
-		t.Fatalf("expected to reuse idle paneC=%s, got %s", paneC, reusedPane)
-	}
-
-	// Clean up: send C-c to busy panes.
-	exec.Command("tmux", "send-keys", "-t", paneA, "C-c", "").Run() //nolint:errcheck
-	exec.Command("tmux", "send-keys", "-t", paneB, "C-c", "").Run() //nolint:errcheck
 }

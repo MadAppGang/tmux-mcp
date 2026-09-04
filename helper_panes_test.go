@@ -33,7 +33,10 @@ import (
 // The window is deliberately large. At tmux's default 80x24 a chain of 50%
 // splits runs out of rows after three panes, and a placement test would then be
 // measuring tmux's minimum-size clamping rather than the placement rules.
-func slotFixture(t *testing.T) (*tmuxClient, string) {
+// It returns the policy layer rather than the tmux client, because policy is
+// what these tests exercise; the backend underneath is reachable as sl.b for the
+// handful of assertions that read or write a mark directly.
+func slotFixture(t *testing.T) (*slots, paneRef) {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("requires tmux")
@@ -44,23 +47,41 @@ func slotFixture(t *testing.T) (*tmuxClient, string) {
 
 	self := tmuxExec(t, "display-message", "-p", "-t", name, "#{pane_id}")
 	t.Setenv("TMUX_PANE", self)
-	return newTmuxClient("bash"), self
+	return newSlots(newTmuxBackend(newTmuxClient("bash"))), newPaneRef(self)
 }
 
 // paneSize returns a pane's width and height in cells, which is how a test sees
 // that a pane was NOT split: tmux takes the room for a new pane out of its
 // anchor, so an anchor's size before and after is the only direct evidence of
 // which pane was chosen.
-func paneSize(t *testing.T, paneID string) (width, height int) {
+// recordFor reads one pane's registry record out of the window registry.
+//
+// It exists because Backend has no single-pane read any more: the one it had
+// served the explicit-paneId path, and when that path went the method had no
+// caller left in the product. A port method kept alive by tests is a port method
+// that invites a policy caller, so the tests do the lookup themselves — through
+// Records, which applies the same witness rule, so a record this helper returns
+// is a record resolution would also have believed.
+func recordFor(t *testing.T, sl *slots, self, pane paneRef) (paneRecord, bool) {
 	t.Helper()
-	return paneCells(t, paneID, "#{pane_width}\t#{pane_height}")
+	reg, err := sl.b.Records(context.Background(), self)
+	if err != nil {
+		t.Fatalf("read the pane registry: %v", err)
+	}
+	rec, ok := reg[pane]
+	return rec, ok
+}
+
+func paneSize(t *testing.T, pane paneRef) (width, height int) {
+	t.Helper()
+	return paneCells(t, pane, "#{pane_width}\t#{pane_height}")
 }
 
 // paneOrigin returns a pane's top-left cell, used to prove which pane a split
 // was carved out of.
-func paneOrigin(t *testing.T, paneID string) (left, top int) {
+func paneOrigin(t *testing.T, pane paneRef) (left, top int) {
 	t.Helper()
-	return paneCells(t, paneID, "#{pane_left}\t#{pane_top}")
+	return paneCells(t, pane, "#{pane_left}\t#{pane_top}")
 }
 
 // paneCells reads a pair of integer cell coordinates from a tmux format string.
@@ -70,12 +91,13 @@ func paneOrigin(t *testing.T, paneID string) (left, top int) {
 // numbers. Keeping the named wrappers means the tests still read as paneSize and
 // paneOrigin rather than as format strings, while the parsing that would
 // otherwise be copied between them exists once.
-func paneCells(t *testing.T, paneID, format string) (int, int) {
+func paneCells(t *testing.T, pane paneRef, format string) (int, int) {
 	t.Helper()
-	out := tmuxExec(t, "display-message", "-p", "-t", paneID, format)
+	out := tmuxExec(t, "display-message", "-p", "-t", pane.target(), format)
 	parts := strings.Split(out, "\t")
 	if len(parts) != 2 {
-		t.Fatalf("pane %s answered %q for format %q, want two tab-separated numbers", paneID, out, format)
+		t.Fatalf("pane %s answered %q for format %q, want two tab-separated numbers",
+			pane.target(), out, format)
 	}
 	first, _ := strconv.Atoi(parts[0])
 	second, _ := strconv.Atoi(parts[1])
@@ -90,13 +112,14 @@ func paneCells(t *testing.T, paneID, format string) (int, int) {
 // next. A resolver that created a pane per call would be a slower split-pane
 // with a friendlier name.
 func TestResolveSlotIsIdempotent(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
-	first, slot, created, owner, err := client.resolveHelper(ctx, slotDefault)
+	tgt1, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("first resolveHelper: %v", err)
 	}
+	first, slot, created, owner := tgt1.Ref, tgt1.Slot, tgt1.Created, tgt1.Owner
 	if first == self {
 		t.Fatalf("resolveHelper returned the server's own pane %s", first)
 	}
@@ -114,10 +137,11 @@ func TestResolveSlotIsIdempotent(t *testing.T) {
 		t.Errorf("a pane this server split reported owner %q, want %q", owner, ownerAgent)
 	}
 
-	second, slot, created, owner, err := client.resolveHelper(ctx, slotDefault)
+	tgt2, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("second resolveHelper: %v", err)
 	}
+	second, slot, created, owner := tgt2.Ref, tgt2.Slot, tgt2.Created, tgt2.Owner
 	if second != first {
 		t.Errorf("second resolveHelper returned %s, want the same pane %s", second, first)
 	}
@@ -134,7 +158,7 @@ func TestResolveSlotIsIdempotent(t *testing.T) {
 			owner, ownerAgent)
 	}
 
-	if title := tmuxExec(t, "display-message", "-p", "-t", first, "#{pane_title}"); title != "agent" {
+	if title := tmuxExec(t, "display-message", "-p", "-t", first.target(), "#{pane_title}"); title != "agent" {
 		t.Errorf("helper pane title is %q, want \"agent\" — the label is how the user tells our panes apart", title)
 	}
 }
@@ -145,21 +169,23 @@ func TestResolveSlotIsIdempotent(t *testing.T) {
 // only signal the agent gets that the dev server it is still reporting on died
 // some time ago.
 func TestResolveSlotAfterKillCreatesAgain(t *testing.T) {
-	client, _ := slotFixture(t)
+	sl, _ := slotFixture(t)
 	ctx := context.Background()
 
-	first, _, _, _, err := client.resolveHelper(ctx, slotDefault)
+	tgt3, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("first resolveHelper: %v", err)
 	}
-	if err := client.KillPane(ctx, first); err != nil {
+	first, _, _, _ := tgt3.Ref, tgt3.Slot, tgt3.Created, tgt3.Owner
+	if err := sl.b.Close(ctx, first); err != nil {
 		t.Fatalf("kill helper pane: %v", err)
 	}
 
-	second, _, created, _, err := client.resolveHelper(ctx, slotDefault)
+	tgt4, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("second resolveHelper: %v", err)
 	}
+	second, _, created, _ := tgt4.Ref, tgt4.Slot, tgt4.Created, tgt4.Owner
 	if second == first {
 		t.Fatalf("resolveHelper returned the killed pane %s", second)
 	}
@@ -175,17 +201,19 @@ func TestResolveSlotAfterKillCreatesAgain(t *testing.T) {
 // conversation in. Sharing slot 1's left edge while starting lower down is what
 // "split out of slot 1, vertically" looks like from the outside.
 func TestSlotPlacement(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
-	one, _, _, _, err := client.resolveHelper(ctx, 1)
+	tgt5, err := sl.resolveHelper(ctx, 1, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolve slot 1: %v", err)
 	}
-	two, slot, _, _, err := client.resolveHelper(ctx, 2)
+	one, _, _, _ := tgt5.Ref, tgt5.Slot, tgt5.Created, tgt5.Owner
+	tgt6, err := sl.resolveHelper(ctx, 2, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolve slot 2: %v", err)
 	}
+	two, slot, _, _ := tgt6.Ref, tgt6.Slot, tgt6.Created, tgt6.Owner
 	if slot != 2 {
 		t.Errorf("slot 2 resolution reported slot %d", slot)
 	}
@@ -210,7 +238,7 @@ func TestSlotPlacement(t *testing.T) {
 		t.Errorf("slot 2 starts at row %d, want below slot 1's row %d", twoTop, oneTop)
 	}
 
-	if title := tmuxExec(t, "display-message", "-p", "-t", two, "#{pane_title}"); title != "agent:2" {
+	if title := tmuxExec(t, "display-message", "-p", "-t", two.target(), "#{pane_title}"); title != "agent:2" {
 		t.Errorf("slot 2 pane title is %q, want \"agent:2\"", title)
 	}
 }
@@ -233,39 +261,41 @@ func TestSlotPlacement(t *testing.T) {
 // registry. Where slot 2 does land is checked too, so a placement that avoided
 // the user's pane by putting the helper somewhere absurd is not read as success.
 func TestSlotTwoNeverSplitsAnAdoptedPane(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
 	// The user's own pane, made with raw tmux so the server has never marked it.
-	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	waitForClientPaneIdle(t, client, usersPane)
+	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
+	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	one, _, _, owner, err := client.resolveHelper(ctx, slotDefault)
+	tgt7, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolve slot 1: %v", err)
 	}
+	one, _, _, owner := tgt7.Ref, tgt7.Slot, tgt7.Created, tgt7.Owner
 	if one != usersPane || owner != ownerAcquired {
 		t.Fatalf("the fixture did not exercise adoption: slot 1 resolved to %s (owner %q), want the "+
-			"user's pane %s adopted as %q", one, owner, usersPane, ownerAcquired)
+			"user's pane %s adopted as %q", one.target(), owner, usersPane.target(), ownerAcquired)
 	}
 	beforeW, beforeH := paneSize(t, usersPane)
 
-	two, slot, _, _, err := client.resolveHelper(ctx, 2)
+	tgt8, err := sl.resolveHelper(ctx, 2, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolve slot 2: %v", err)
 	}
+	two, slot, _, _ := tgt8.Ref, tgt8.Slot, tgt8.Created, tgt8.Owner
 	if slot != 2 {
 		t.Errorf("slot 2 resolution reported slot %d", slot)
 	}
 	if two == usersPane || two == self {
-		t.Fatalf("slot 2 resolved to %s, which is the user's pane or the agent's own", two)
+		t.Fatalf("slot 2 resolved to %s, which is the user's pane or the agent's own", two.target())
 	}
 
 	if afterW, afterH := paneSize(t, usersPane); afterW != beforeW || afterH != beforeH {
 		t.Errorf("the user's adopted pane %s went from %dx%d to %dx%d when slot 2 was opened: it "+
 			"was split in half to make room. We may type into a pane we adopted; we may not "+
 			"rearrange the layout it sits in, which is the rule anchorOrSelf applies one function "+
-			"away", usersPane, beforeW, beforeH, afterW, afterH)
+			"away", usersPane.target(), beforeW, beforeH, afterW, afterH)
 	}
 
 	// And it went where the fallback says it should: out of the agent's own pane,
@@ -288,15 +318,16 @@ func TestSlotTwoNeverSplitsAnAdoptedPane(t *testing.T) {
 // back for slot 3 but does not carry @mcp_slot=3 would be re-created on the very
 // next call, and the caller's process would vanish with no error anywhere.
 func TestNumberedSlotsAreIndependent(t *testing.T) {
-	client, _ := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
-	seen := map[string]int{}
+	seen := map[paneRef]int{}
 	for _, want := range []int{1, 2, 3} {
-		pane, slot, created, _, err := client.resolveHelper(ctx, want)
+		tgt9, err := sl.resolveHelper(ctx, want, kindUnstated)
 		if err != nil {
 			t.Fatalf("resolve slot %d: %v", want, err)
 		}
+		pane, slot, created, _ := tgt9.Ref, tgt9.Slot, tgt9.Created, tgt9.Owner
 		if slot != want {
 			t.Errorf("resolve slot %d reported slot %d", want, slot)
 		}
@@ -304,13 +335,13 @@ func TestNumberedSlotsAreIndependent(t *testing.T) {
 			t.Errorf("slot %d already existed in a fresh fixture", want)
 		}
 		if prev, dup := seen[pane]; dup {
-			t.Fatalf("slot %d returned pane %s, already handed out for slot %d", want, pane, prev)
+			t.Fatalf("slot %d returned pane %s, already handed out for slot %d", want, pane.target(), prev)
 		}
 		seen[pane] = want
 
-		if rec, found, err := client.paneRecordFor(ctx, pane); err != nil || !found || rec.Slot != want {
-			t.Errorf("pane %s does not carry slot %d back (found=%v rec=%+v err=%v)",
-				pane, want, found, rec, err)
+		if rec, found := recordFor(t, sl, self, pane); !found || rec.Slot != want {
+			t.Errorf("pane %s does not carry slot %d back (found=%v rec=%+v)",
+				pane.target(), want, found, rec)
 		}
 	}
 }
@@ -325,23 +356,25 @@ func TestNumberedSlotsAreIndependent(t *testing.T) {
 // helper pane", and every send-keys after that types into the agent's own
 // session. Nothing about that failure is visible from outside the process.
 func TestResolveHelperNeverReturnsSelf(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
 	// The inherited claim: exactly what an outer agent's slot-1 pane looks like.
-	if err := client.markPaneOwnedAs(ctx, "", self, ownerAgent, slotDefault); err != nil {
+	if err := sl.b.Claim(ctx, self, ownerAgent, slotDefault); err != nil {
 		t.Fatalf("mark self as a slot-1 pane: %v", err)
 	}
-	if rec, found, err := client.paneRecordFor(ctx, self); err != nil || !found || rec.Slot != slotDefault {
-		t.Fatalf("fixture is not exercising the case: self carries no slot-1 record (found=%v rec=%+v err=%v)", found, rec, err)
+	if rec, found := recordFor(t, sl, self, self); !found || rec.Slot != slotDefault {
+		t.Fatalf("fixture is not exercising the case: self carries no slot-1 record (found=%v rec=%+v)", found, rec)
 	}
 
-	pane, _, created, _, err := client.resolveHelper(ctx, slotDefault)
+	tgt10, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	pane, _, created, _ := tgt10.Ref, tgt10.Slot, tgt10.Created, tgt10.Owner
 	if pane == self {
-		t.Fatalf("resolveHelper returned the server's own pane %s — the agent would type into its own session", pane)
+		t.Fatalf("resolveHelper returned the server's own pane %s — the agent would type into its own session",
+			pane.target())
 	}
 	if !created {
 		t.Error("with self excluded there was no candidate left, so the pane must be reported as created")
@@ -349,10 +382,7 @@ func TestResolveHelperNeverReturnsSelf(t *testing.T) {
 
 	// The stale marker is cleared rather than merely skipped, so the same pane is
 	// not re-examined on every later call.
-	rec, found, err := client.paneRecordFor(ctx, self)
-	if err != nil {
-		t.Fatalf("read self's record back: %v", err)
-	}
+	rec, found := recordFor(t, sl, self, self)
 	if found && rec.Slot != 0 {
 		t.Errorf("self still carries slot %d; the stale marker must be cleared", rec.Slot)
 	}
@@ -377,7 +407,7 @@ func TestSlotWitnessSurvivesSessionScopedLeak(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	client := newTmuxClient("bash")
+	sl := newSlots(newTmuxBackend(newTmuxClient("bash")))
 	ctx := context.Background()
 
 	name := uniqueSession(t)
@@ -385,10 +415,10 @@ func TestSlotWitnessSurvivesSessionScopedLeak(t *testing.T) {
 	defer exec.Command("tmux", "kill-session", "-t", name).Run() //nolint:errcheck
 
 	windowID := tmuxExec(t, "display-message", "-p", "-t", name, "#{window_id}")
-	self := tmuxExec(t, "display-message", "-p", "-t", name, "#{pane_id}")
+	self := newPaneRef(tmuxExec(t, "display-message", "-p", "-t", name, "#{pane_id}"))
 	tmuxExec(t, "split-window", "-d", "-t", windowID)
 	tmuxExec(t, "split-window", "-d", "-t", windowID)
-	t.Setenv("TMUX_PANE", self)
+	t.Setenv("TMUX_PANE", self.target())
 
 	// The slip: session scope, because -p was omitted. Both options leak, and
 	// still no witness exists anywhere.
@@ -400,20 +430,21 @@ func TestSlotWitnessSurvivesSessionScopedLeak(t *testing.T) {
 		t.Fatalf("fixture is not exercising the leak: %d of 3 panes see the session-scoped slot", got)
 	}
 
-	reg, err := client.paneRegistryInWindow(ctx, windowID)
+	reg, err := sl.b.Records(ctx, self)
 	if err != nil {
-		t.Fatalf("paneRegistryInWindow: %v", err)
+		t.Fatalf("Records: %v", err)
 	}
 	if len(reg) != 0 {
 		t.Fatalf("a session-scoped @mcp_slot produced %d registry records; the witness must reject all of them", len(reg))
 	}
 
-	rec, found, err := client.resolveHelperNoCreate(ctx, slotDefault)
+	holder, found, err := sl.lookupSlot(ctx, slotDefault, kindUnstated)
 	if err != nil {
-		t.Fatalf("resolveHelperNoCreate: %v", err)
+		t.Fatalf("lookupSlot: %v", err)
 	}
 	if found {
-		t.Fatalf("slot 1 resolved to pane %s off a leaked option — that is one of the user's shells", rec.PaneID)
+		t.Fatalf("slot 1 resolved to pane %s off a leaked option — that is one of the user's shells",
+			holder.Record.Ref.target())
 	}
 }
 
@@ -421,16 +452,16 @@ func TestSlotWitnessSurvivesSessionScopedLeak(t *testing.T) {
 
 // waitForClientPaneIdle polls the client directly, for the tests that have no
 // MCP server to ask.
-func waitForClientPaneIdle(t *testing.T, client *tmuxClient, paneID string) {
+func waitForClientPaneIdle(t *testing.T, b Backend, pane paneRef) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if state, err := client.GetPaneState(context.Background(), paneID); err == nil && paneIsIdleShell(state) {
+		if state, err := b.Foreground(context.Background(), pane); err == nil && paneIsIdleShell(state) {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("pane %s did not settle at an idle shell prompt within 5s", paneID)
+	t.Fatalf("pane %s did not settle at an idle shell prompt within 5s", pane.target())
 }
 
 // TestAcquireIdleUnownedPane covers the half of this design that touches panes
@@ -442,27 +473,29 @@ func waitForClientPaneIdle(t *testing.T, client *tmuxClient, paneID string) {
 // instead — and marked "acquired" rather than "agent", because the difference
 // decides whether close-pane may kill it later.
 func TestAcquireIdleUnownedPane(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
 	// The user's own pane: made with raw tmux, so the server never marked it.
-	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	waitForClientPaneIdle(t, client, usersPane)
+	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
+	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	pane, _, created, _, err := client.resolveHelper(ctx, slotDefault)
+	tgt11, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	pane, _, created, _ := tgt11.Ref, tgt11.Slot, tgt11.Created, tgt11.Owner
 	if pane != usersPane {
-		t.Fatalf("resolveHelper returned %s instead of adopting the idle pane %s", pane, usersPane)
+		t.Fatalf("resolveHelper returned %s instead of adopting the idle pane %s",
+			pane.target(), usersPane.target())
 	}
 	if !created {
 		t.Error("an adopted pane is new to the slot, so created must be true")
 	}
 
-	rec, found, err := client.paneRecordFor(ctx, usersPane)
-	if err != nil || !found {
-		t.Fatalf("adopted pane carries no registry record (found=%v err=%v)", found, err)
+	rec, found := recordFor(t, sl, self, usersPane)
+	if !found {
+		t.Fatal("adopted pane carries no registry record")
 	}
 	if rec.Owner != ownerAcquired {
 		t.Errorf("adopted pane is marked %q, want %q — the owner kind is what stops close-pane "+
@@ -473,8 +506,8 @@ func TestAcquireIdleUnownedPane(t *testing.T) {
 	}
 
 	// And it must not be adopted twice into different slots.
-	if _, ok := client.ownedPanesInWindow(ctx, tmuxExec(t, "display-message", "-p", "-t", self, "#{window_id}")); ok != nil {
-		t.Fatalf("ownedPanesInWindow: %v", ok)
+	if _, ok := sl.b.Records(ctx, self); ok != nil {
+		t.Fatalf("Records: %v", ok)
 	}
 }
 
@@ -513,47 +546,47 @@ func TestAcquireIdleUnownedPane(t *testing.T) {
 // The happy path runs first so that an adoption which simply always fails
 // cannot pass this test.
 func TestFailedAdoptionLeavesNoPartialMark(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
-	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	waitForClientPaneIdle(t, client, usersPane)
+	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
+	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	if !client.adoptCandidateLocked(ctx, usersPane, slotDefault) {
+	if !sl.adoptCandidateLocked(ctx, usersPane, slotDefault) {
 		t.Fatalf("adoption of the idle pane %s failed outright; the failure path below would then "+
-			"be the only thing this test exercises", usersPane)
+			"be the only thing this test exercises", usersPane.target())
 	}
-	rec, found, err := client.paneRecordFor(ctx, usersPane)
-	if err != nil || !found || rec.Owner != ownerAcquired || rec.Slot != slotDefault {
-		t.Fatalf("a successful adoption left record %+v (found=%v err=%v), want owner %q slot %d",
-			rec, found, err, ownerAcquired, slotDefault)
+	rec, found := recordFor(t, sl, self, usersPane)
+	if !found || rec.Owner != ownerAcquired || rec.Slot != slotDefault {
+		t.Fatalf("a successful adoption left record %+v (found=%v), want owner %q slot %d",
+			rec, found, ownerAcquired, slotDefault)
 	}
 
 	// Back to an unclaimed pane, then to the prefix a mark interrupted after its
 	// second write leaves: witness and owner, no slot.
-	if err := client.clearPaneRegistration(ctx, usersPane); err != nil {
+	if err := sl.b.ClearMarks(ctx, usersPane); err != nil {
 		t.Fatalf("reset the pane: %v", err)
 	}
-	if err := client.markPaneOwnedAs(ctx, "", usersPane, ownerAcquired, 0); err != nil {
+	if err := sl.b.Claim(ctx, usersPane, ownerAcquired, 0); err != nil {
 		t.Fatalf("write the partial mark: %v", err)
 	}
 
 	dead, cancel := context.WithCancel(ctx)
 	cancel()
-	if client.adoptCandidateLocked(dead, usersPane, slotDefault) {
+	if sl.adoptCandidateLocked(dead, usersPane, slotDefault) {
 		t.Fatal("adoption reported success on a cancelled context, so nothing was written and the " +
 			"pane was claimed anyway — every keystroke sent to it after this would be sent to a " +
 			"pane we cannot identify again")
 	}
 
 	for _, opt := range []string{paneOptSlot, paneOptOwner, paneOptWitness} {
-		if got := tmuxExec(t, "display-message", "-t", usersPane, "-p", "#{"+opt+"}"); got != "" {
+		if got := tmuxExec(t, "display-message", "-t", usersPane.target(), "-p", "#{"+opt+"}"); got != "" {
 			t.Errorf("%s is still %q on %s after the adoption failed; the pane is stranded — no slot "+
 				"lookup matches it, close-pane({slot:\"all\"}) does not see it, and the owner mark "+
-				"stops it being adopted ever again", opt, got, usersPane)
+				"stops it being adopted ever again", opt, got, usersPane.target())
 		}
 	}
-	if !client.canAcquire(ctx, usersPane, self) {
+	if !sl.canAcquire(ctx, usersPane, self) {
 		t.Error("the pane cannot be adopted again after a failed adoption; an attempt that did not " +
 			"succeed has to leave the pane exactly as unclaimed as it found it")
 	}
@@ -568,37 +601,38 @@ func TestFailedAdoptionLeavesNoPartialMark(t *testing.T) {
 // which is what paneIsIdleShell tests. Adopting it would send the agent's
 // command into cat's stdin, where it would be echoed and never run.
 func TestAcquireRejectsPaneRunningCat(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
-	busy := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	waitForClientPaneIdle(t, client, busy)
-	tmuxExec(t, "send-keys", "-t", busy, "cat", "Enter")
+	busy := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
+	waitForClientPaneIdle(t, sl.b, busy)
+	tmuxExec(t, "send-keys", "-t", busy.target(), "cat", "Enter")
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		state, err := client.GetPaneState(ctx, busy)
+		state, err := sl.b.Foreground(ctx, busy)
 		if err == nil && !paneIsIdleShell(state) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("pane %s never picked up the cat process", busy)
+			t.Fatalf("pane %s never picked up the cat process", busy.target())
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	if client.canAcquire(ctx, busy, self) {
+	if sl.canAcquire(ctx, busy, self) {
 		t.Error("canAcquire accepted a pane running cat; the shell is not the foreground process")
 	}
 
-	pane, _, _, _, err := client.resolveHelper(ctx, slotDefault)
+	tgt12, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	pane, _, _, _ := tgt12.Ref, tgt12.Slot, tgt12.Created, tgt12.Owner
 	if pane == busy {
-		t.Fatalf("resolveHelper adopted the busy pane %s", pane)
+		t.Fatalf("resolveHelper adopted the busy pane %s", pane.target())
 	}
-	if rec, found, _ := client.paneRecordFor(ctx, busy); found {
+	if rec, found := recordFor(t, sl, self, busy); found {
 		t.Errorf("the busy pane was marked anyway: %+v", rec)
 	}
 }
@@ -639,51 +673,52 @@ func TestAcquireRejectsForeignUID(t *testing.T) {
 // loser must be handed back properly instead: every marker gone, the label gone,
 // the pane itself untouched.
 func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
 
 	// Two of the user's own panes, both claimed as slot 1 — the state the race
 	// leaves behind, written directly because the second server is not part of
 	// this test.
-	first := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	second := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
-	waitForClientPaneIdle(t, client, first)
-	waitForClientPaneIdle(t, client, second)
-	for _, pane := range []string{first, second} {
-		if err := client.markPaneOwnedAs(ctx, "", pane, ownerAcquired, slotDefault); err != nil {
-			t.Fatalf("mark %s as an acquired slot-1 pane: %v", pane, err)
+	first := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
+	second := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
+	waitForClientPaneIdle(t, sl.b, first)
+	waitForClientPaneIdle(t, sl.b, second)
+	for _, pane := range []paneRef{first, second} {
+		if err := sl.b.Claim(ctx, pane, ownerAcquired, slotDefault); err != nil {
+			t.Fatalf("mark %s as an acquired slot-1 pane: %v", pane.target(), err)
 		}
-		if err := client.setPaneTitle(ctx, pane, helperTitle(slotDefault)); err != nil {
-			t.Fatalf("title %s: %v", pane, err)
+		if err := sl.b.SetTitle(ctx, pane, helperTitle(slotDefault)); err != nil {
+			t.Fatalf("title %s: %v", pane.target(), err)
 		}
 	}
 
-	winner, _, _, _, err := client.resolveHelper(ctx, slotDefault)
+	tgt13, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
+	winner, _, _, _ := tgt13.Ref, tgt13.Slot, tgt13.Created, tgt13.Owner
 	if winner != first {
-		t.Fatalf("resolveHelper kept %s, want the oldest pane %s", winner, first)
+		t.Fatalf("resolveHelper kept %s, want the oldest pane %s", winner.target(), first.target())
 	}
 
 	// The loser is the user's pane again: alive, unmarked, unlabelled.
-	if !paneExists(t, second) {
+	if !paneExists(t, second.target()) {
 		t.Fatal("healing destroyed the losing pane; an adopted pane may only be released")
 	}
 	for _, opt := range []string{paneOptSlot, paneOptOwner, paneOptWitness} {
-		if got := tmuxExec(t, "display-message", "-t", second, "-p", "#{"+opt+"}"); got != "" {
+		if got := tmuxExec(t, "display-message", "-t", second.target(), "-p", "#{"+opt+"}"); got != "" {
 			t.Errorf("%s is still %q on the released loser %s; leaving the owner mark retires the "+
-				"pane forever, because acquisition requires it to be unset", opt, got, second)
+				"pane forever, because acquisition requires it to be unset", opt, got, second.target())
 		}
 	}
-	if title := tmuxExec(t, "display-message", "-t", second, "-p", "#{pane_title}"); title == "agent" {
+	if title := tmuxExec(t, "display-message", "-t", second.target(), "-p", "#{pane_title}"); title == "agent" {
 		t.Errorf("the released loser is still titled %q; to the user that is a pane the agent "+
 			"claims and will not use", title)
 	}
 
 	// And it can be adopted again, which is the property the owner mark would
 	// otherwise have destroyed.
-	if !client.canAcquire(ctx, second, self) {
+	if !sl.canAcquire(ctx, second, self) {
 		t.Error("the released loser cannot be re-adopted; releasing it has to leave it exactly as " +
 			"unclaimed as it was before")
 	}
@@ -703,19 +738,16 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 // split.
 //
 // Only a permitted SET is asserted, and nothing is required to be in it. The
-// design (§5.3 step 1) reads `self ← selfPane()` at the top of resolveHelper,
-// while the implementation reaches it one level down through selfWindow so that
-// resolution and teardown share one answer per call; both are the same rule, and
-// a rewrite that moved the call between them was previously RED for no reason
-// anyone could defend. So every function named here is a place the spec already
-// allows to ask the question, and which of them happens to ask it this month is
-// an implementation detail, not a safety property. registerSplitPane stays on
-// the list for the same reason it was ever on it: §4 sanctions split-pane's
-// no-argument default precisely because splitting delivers no keystrokes, so
-// that handler may know the answer even though no other handler may.
+// design (§5.3 step 1) reads the self pane at the top of resolveHelper, while
+// the implementation reaches it wherever the answer is needed once per call;
+// both are the same rule, and a rewrite that moved the call between them was
+// previously RED for no reason anyone could defend. So every function named here
+// is a place the spec already allows to ask the question, and which of them
+// happens to ask it this month is an implementation detail, not a safety
+// property.
 //
 // What may never appear here is a handler that types. A future send-keys that
-// reaches for selfPane, or for os.Getenv("TMUX_PANE") directly to dodge this
+// reaches for Backend.Self, or for os.Getenv("TMUX_PANE") directly to dodge this
 // test, fails the build's test step — which is the only way a rule like this
 // survives nine handlers and a year of edits, because the failure it prevents is
 // invisible from outside the process: the agent's own transcript fills with its
@@ -724,16 +756,187 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 // The one thing still required is that SOMETHING asks. A package where nothing
 // resolves its own pane cannot be excluding it either, and this test would then
 // be passing over a resolver that no longer knows what to leave out.
+//
+// # The second rule: who may run a command at all
+//
+// The same walk answers a wider question, because it is the same kind of
+// question and the same parse. Only backend_tmux.go may talk to the
+// multiplexer, and os/exec is the only way to talk to it, so an import of
+// os/exec anywhere else in the package is either a second tmux call site or the
+// start of one.
+//
+// screenshot.go is the one exception and it is not a tmux exception: it runs
+// headless Chrome to render a PNG, and `open`/`xdg-open` to show one. Those are
+// not multiplexer access, which is why the permitted set below carries a reason
+// per file rather than a bare list — a future entry has to justify itself in
+// the same sentence.
+//
+// The rule matters more than a tidiness rule would, because the id policy must
+// never see is a tmux id: a file that can run tmux can read one, and every leak
+// this design guards against starts there.
+// audit is what one walk of the package found. Every field is a question the
+// test asks of the source rather than of a running server, because all four
+// rules below are about code that does not exist yet: the handler somebody adds
+// next year, not the ones here today.
+type audit struct {
+	selfCallers    map[string]string // function name → the reason it is permitted to ask, or ""
+	execImporters  map[string]bool   // file → imports os/exec
+	targetCallers  []string          // "file.function calls target()" — outside the adapter
+	addToolCallers map[string]string // "file.function" → outside addAgenticTool
+
+	sawSelfDecl   bool // Backend.Self is declared somewhere
+	sawTargetCall bool // the adapter itself turns a handle back into an id
+	sawAddTool    bool // addAgenticTool itself registers a tool
+}
+
+func newAudit() *audit {
+	return &audit{
+		selfCallers:    map[string]string{},
+		execImporters:  map[string]bool{},
+		addToolCallers: map[string]string{},
+	}
+}
+
+// inspect walks one parsed file and records every violation-shaped fact in it.
+//
+// It takes the file NAME rather than reading it from the fset so the same
+// function can be run over a source string that pretends to be an ordinary
+// policy file — which is how the controls below prove the analyzer detects
+// anything at all.
+func (a *audit) inspect(name string, file *ast.File) {
+	const adapter = "backend_tmux.go"
+
+	for _, imp := range file.Imports {
+		if imp.Path.Value == `"os/exec"` {
+			a.execImporters[name] = true
+		}
+	}
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fn.Name.Name == "Self" {
+			a.sawSelfDecl = true
+			continue // the accessor itself is where os.Getenv belongs
+		}
+		where := name + "." + fn.Name.Name
+		ast.Inspect(fn, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			// newPaneRef is the constructor half of the same rule: it turns an id
+			// INTO a handle, so a policy file that calls it has an id in hand.
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "newPaneRef" {
+				if name == adapter {
+					a.sawTargetCall = true
+				} else {
+					a.targetCallers = append(a.targetCallers, where+" calls newPaneRef")
+				}
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch sel.Sel.Name {
+			case "Self":
+				a.selfCallers[fn.Name.Name] = name
+			case "target":
+				if name == adapter {
+					a.sawTargetCall = true
+				} else {
+					a.targetCallers = append(a.targetCallers, where+" calls target()")
+				}
+			case "AddTool":
+				if fn.Name.Name == "addAgenticTool" {
+					a.sawAddTool = true
+				} else {
+					a.addToolCallers[where] = "AddTool"
+				}
+			case "Getenv":
+				// os.Getenv("TMUX_PANE") is the same knowledge by another route,
+				// and reading it directly would bypass both this test and the
+				// single accessor it protects.
+				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "os" && len(call.Args) == 1 {
+					if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Value == `"TMUX_PANE"` {
+						a.selfCallers[fn.Name.Name] = name
+					}
+				}
+			}
+			return true
+		})
+	}
+}
+
+// TestOnlyPolicyCodeKnowsOurOwnPane enforces the four rules that keep a pane id
+// out of policy code and out of the model's context, by parsing the package
+// rather than by trusting review.
+//
+// # Rule 1: who may ask which pane this server runs in
+//
+// Knowing that is permitted only where the pane is used as a split ANCHOR, or as
+// something to EXCLUDE. It is never permitted where keystrokes are delivered.
+// The self pane is an input to placement — the pane we split — and never an
+// output of resolution — the pane we type into — and a pane produced by
+// splitting is, by construction, not the pane that was split.
+//
+// Only a permitted SET is asserted, and nothing is required to be in it: every
+// function named there is a place the design already allows to ask, and which of
+// them happens to ask this month is an implementation detail. What may never
+// appear is a handler that types. A future send-keys that reaches for
+// Backend.Self, or for os.Getenv("TMUX_PANE") directly to dodge this test, fails
+// the build's test step — which is the only way a rule like this survives a year
+// of edits, because the failure it prevents is invisible from outside the
+// process: the agent's own transcript fills with its own keystrokes, and there
+// is nothing left to read the diagnosis from.
+//
+// # Rule 2: who may run a command at all
+//
+// Only backend_tmux.go may talk to the multiplexer, and os/exec is the only way
+// to talk to it, so an import of os/exec anywhere else is either a second tmux
+// call site or the start of one. screenshot.go is the one exception and it is
+// not a tmux exception: it runs headless Chrome to render a PNG, and
+// `open`/`xdg-open` to show one.
+//
+// # Rule 3: who may turn a handle back into an id
+//
+// paneRef.String() prints "<pane>", so an id cannot leak through a format verb —
+// but that redaction is only as good as the rule that the real id is reachable
+// from ONE place. target() and newPaneRef are that place, and this clause is
+// what keeps it one: the ten call sites outside the adapter that existed before
+// this contract all fed a PaneID field on a response type, and every one of them
+// vanished when those fields did. A new one appearing is a new leak, and it
+// would look perfectly ordinary in review.
+//
+// # Rule 4: every tool is registered through the rejection wrapper
+//
+// addAgenticTool wraps each handler in rejectIdArgs, and a tool registered with
+// a direct s.AddTool would silently lose the check. close-pane is why that
+// matters: it never resolves a slot, so an ignored paneId there does not type
+// into the wrong pane — it defaults to slot 1 and KILLS it.
+//
+// # The controls
+//
+// Each rule is proven against a VIOLATING FIXTURE, parsed from a source string
+// in this test. A presence check ("the permitted functions exist") proves only
+// that declarations exist; running the analyzer over code that breaks all four
+// rules proves it can see a violation at all. Without that, a walker reading the
+// wrong AST node passes silently, which is the exact failure this test exists to
+// prevent elsewhere.
 func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 	permitted := map[string]string{
-		"selfWindow":                       "the single accessor resolution and teardown share, to exclude the pane",
-		"resolveHelper":                    "§5.3 step 1, where resolution starts from the pane it must not return",
-		"resolveHelperLocked":              "the body of the same step",
-		"resolveHelperNoCreate":            "the same, for the lookup close-pane performs",
-		"placementForSlot":                 "placement, where the pane is a split anchor",
-		"closePanes":                       "teardown, which must not close the pane the request arrived through",
-		"slottedHelpersInSelfWindowLocked": "the \"all\" sweep, which excludes this server's own pane",
-		"registerSplitPane":                "split-pane's default (§4): a split delivers no keystrokes",
+		"resolveHelperLocked": "resolution starts from the pane it must not return",
+		"lookupSlot":          "the same, for the lookup close-pane and the reading tools perform",
+		"closePanes":          "teardown, which must not close the pane the request arrived through",
+		"listSlots":           "the registry read is scoped to the window this server's pane is in",
+	}
+
+	permittedExecImporters := map[string]string{
+		"backend_tmux.go": "the only file that runs tmux; every multiplexer call in the package is here",
+		"screenshot.go":   "headless Chrome and open/xdg-open, which are rendering, not multiplexer access",
 	}
 
 	files, err := filepath.Glob("*.go")
@@ -741,8 +944,7 @@ func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 		t.Fatalf("glob package files: %v", err)
 	}
 	fset := token.NewFileSet()
-	found := map[string]bool{}
-	sawDeclaration := false
+	got := newAudit()
 
 	for _, path := range files {
 		if strings.HasSuffix(path, "_test.go") {
@@ -752,56 +954,96 @@ func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok {
-				continue
-			}
-			if fn.Name.Name == "selfPane" {
-				sawDeclaration = true
-				continue // the accessor itself is where os.Getenv belongs
-			}
-			ast.Inspect(fn, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				if sel.Sel.Name == "selfPane" {
-					found[fn.Name.Name] = true
-					return true
-				}
-				// os.Getenv("TMUX_PANE") is the same knowledge by another route,
-				// and reading it directly would bypass both this test and the
-				// single accessor it protects.
-				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "os" && sel.Sel.Name == "Getenv" &&
-					len(call.Args) == 1 {
-					if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Value == `"TMUX_PANE"` {
-						found[fn.Name.Name] = true
-					}
-				}
-				return true
-			})
-		}
+		got.inspect(path, file)
 	}
 
-	if !sawDeclaration {
-		t.Fatal("selfPane is not declared in this package — the test is looking for the wrong symbol")
+	// ---- Rule 1 ----
+	if !got.sawSelfDecl {
+		t.Fatal("Self is not declared in this package — the test is looking for the wrong symbol")
 	}
-	for name := range found {
+	for name := range got.selfCallers {
 		if _, ok := permitted[name]; !ok {
 			t.Errorf("%s asks which pane this server runs in, and is not permitted to: "+
-				"selfPane may be used only as a split anchor or as something to exclude, never as a "+
-				"pane to deliver keystrokes to (permitted: %v)", name, permittedNames(permitted))
+				"Backend.Self may be used only as a split anchor or as something to exclude, never "+
+				"as a pane to deliver keystrokes to (permitted: %v)", name, permittedNames(permitted))
 		}
 	}
-	if len(found) == 0 {
+	if len(got.selfCallers) == 0 {
 		t.Errorf("nothing in this package asks which pane this server runs in, so nothing can be "+
 			"excluding it either — resolution has stopped knowing what not to hand back, and this "+
 			"test is guarding an empty set (permitted callers: %v)", permittedNames(permitted))
+	}
+
+	// ---- Rule 2 ----
+	for path := range got.execImporters {
+		if _, ok := permittedExecImporters[path]; !ok {
+			t.Errorf("%s imports os/exec, and only %v may: a file that can run a command can run "+
+				"tmux, and a second tmux call site is how a raw pane id gets back into policy "+
+				"code", path, permittedNames(permittedExecImporters))
+		}
+	}
+	if !got.execImporters["backend_tmux.go"] {
+		t.Error("backend_tmux.go does not import os/exec, so it is not the file running tmux any " +
+			"more — whichever file now is, this test is no longer looking at it")
+	}
+
+	// ---- Rule 3 ----
+	for _, where := range got.targetCallers {
+		t.Errorf("%s, outside backend_tmux.go: the real pane id must be reachable from one file "+
+			"only, or paneRef's redacting String() is a convention again and the next response "+
+			"field reintroduces the leak this release removed", where)
+	}
+	if !got.sawTargetCall {
+		t.Error("backend_tmux.go never turns a handle back into an id, so it is no longer the " +
+			"adapter — this clause is watching the wrong file and would pass over a leak anywhere else")
+	}
+
+	// ---- Rule 4 ----
+	for where := range got.addToolCallers {
+		t.Errorf("%s registers a tool directly with s.AddTool: every tool must go through "+
+			"addAgenticTool, which is where a request carrying paneId is refused. A tool registered "+
+			"here silently accepts one — and on close-pane an ignored paneId defaults to slot 1 and "+
+			"kills it", where)
+	}
+	if !got.sawAddTool {
+		t.Error("addAgenticTool does not call s.AddTool, so it is not the registration path any " +
+			"more and this clause is guarding nothing")
+	}
+
+	// ---- The controls: a fixture that breaks all four rules must be caught ----
+	const violation = `package main
+
+import "os/exec"
+
+func typesIntoAPane(p paneRef, s *server) {
+	_ = os.Getenv("TMUX_PANE")
+	_ = exec.Command("tmux", "send-keys", "-t", p.target())
+	s.AddTool(tool, handler)
+	_ = newPaneRef("%3")
+}
+`
+	fixture, err := parser.ParseFile(fset, "fixture.go", violation, 0)
+	if err != nil {
+		t.Fatalf("parse the violating fixture: %v", err)
+	}
+	control := newAudit()
+	control.inspect("fixture.go", fixture)
+
+	if _, ok := control.selfCallers["typesIntoAPane"]; !ok {
+		t.Error("the analyzer did not see os.Getenv(\"TMUX_PANE\") in the fixture, so rule 1 is " +
+			"being enforced by a walk that finds nothing")
+	}
+	if !control.execImporters["fixture.go"] {
+		t.Error("the analyzer did not see the os/exec import in the fixture, so rule 2 is " +
+			"being enforced by a walk that finds nothing")
+	}
+	if len(control.targetCallers) != 2 {
+		t.Errorf("the analyzer flagged %d of the fixture's 2 id conversions (%v); rule 3 is being "+
+			"enforced by a walk that cannot see them", len(control.targetCallers), control.targetCallers)
+	}
+	if _, ok := control.addToolCallers["fixture.go.typesIntoAPane"]; !ok {
+		t.Error("the analyzer did not see the direct s.AddTool call in the fixture, so rule 4 is " +
+			"being enforced by a walk that finds nothing")
 	}
 }
 
@@ -869,13 +1111,13 @@ func withinDeadline(t *testing.T, phase string, budget time.Duration, work func(
 // helper, singleflight, a serialised worker pool would each have failed it while
 // changing nothing a caller could observe. Run this under -race.
 func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
-	client, self := slotFixture(t)
+	sl, self := slotFixture(t)
 	ctx := context.Background()
-	window := tmuxExec(t, "display-message", "-p", "-t", self, "#{window_id}")
+	window := tmuxExec(t, "display-message", "-p", "-t", self.target(), "#{window_id}")
 
 	type resolution struct {
 		asked, got int
-		pane       string
+		pane       paneRef
 		created    bool
 		err        error
 	}
@@ -895,7 +1137,8 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 			go func(slot int) {
 				defer wg.Done()
 				<-release // so they arrive together rather than in start order
-				pane, got, created, _, err := client.resolveHelper(ctx, slot)
+				tgt14, err := sl.resolveHelper(ctx, slot, kindUnstated)
+				pane, got, created, _ := tgt14.Ref, tgt14.Slot, tgt14.Created, tgt14.Owner
 				first <- resolution{asked: slot, got: got, pane: pane, created: created, err: err}
 			}(slot)
 		}
@@ -906,7 +1149,7 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 	})
 	close(first)
 
-	panesFor := map[int]map[string]bool{}
+	panesFor := map[int]map[paneRef]bool{}
 	createdFor := map[int]int{}
 	for r := range first {
 		if r.err != nil {
@@ -921,10 +1164,11 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 			t.Errorf("a caller asking for slot %d was answered for slot %d", r.asked, r.got)
 		}
 		if r.pane == self {
-			t.Fatalf("slot %d resolved to the server's own pane %s under concurrency", r.asked, r.pane)
+			t.Fatalf("slot %d resolved to the server's own pane %s under concurrency",
+				r.asked, r.pane.target())
 		}
 		if panesFor[r.asked] == nil {
-			panesFor[r.asked] = map[string]bool{}
+			panesFor[r.asked] = map[paneRef]bool{}
 		}
 		panesFor[r.asked][r.pane] = true
 		if r.created {
@@ -932,7 +1176,7 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 		}
 	}
 
-	seen := map[string]int{}
+	seen := map[paneRef]int{}
 	for _, slot := range slots {
 		if n := len(panesFor[slot]); n != 1 {
 			t.Errorf("%d callers of slot %d were handed %d different panes (%v); a slot is the "+
@@ -946,7 +1190,7 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 		}
 		for pane := range panesFor[slot] {
 			if other, dup := seen[pane]; dup {
-				t.Errorf("slot %d and slot %d both resolved to pane %s", other, slot, pane)
+				t.Errorf("slot %d and slot %d both resolved to pane %s", other, slot, pane.target())
 			}
 			seen[pane] = slot
 		}
@@ -975,7 +1219,7 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 	go func() {
 		defer wg2.Done()
 		<-release2
-		_, err := client.closePanes(ctx, closeSelector{All: true})
+		_, err := sl.closePanes(ctx, closeSelector{All: true})
 		closeErr <- err
 	}()
 	for _, slot := range []int{1, 2} {
@@ -984,7 +1228,8 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 			go func(slot int) {
 				defer wg2.Done()
 				<-release2
-				pane, got, created, _, err := client.resolveHelper(ctx, slot)
+				tgt15, err := sl.resolveHelper(ctx, slot, kindUnstated)
+				pane, got, created, _ := tgt15.Ref, tgt15.Slot, tgt15.Created, tgt15.Owner
 				second <- resolution{asked: slot, got: got, pane: pane, created: created, err: err}
 			}(slot)
 		}
@@ -1004,11 +1249,12 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 			t.Errorf("resolveHelper(%d) concurrent with teardown: %v", r.asked, r.err)
 		}
 		if r.pane == self {
-			t.Fatalf("slot %d resolved to the server's own pane %s while teardown ran", r.asked, r.pane)
+			t.Fatalf("slot %d resolved to the server's own pane %s while teardown ran",
+				r.asked, r.pane.target())
 		}
 	}
 
-	reg, err := client.paneRegistryInWindow(ctx, window)
+	reg, err := sl.b.Records(ctx, self)
 	if err != nil {
 		t.Fatalf("read the registry back: %v", err)
 	}
@@ -1017,9 +1263,10 @@ func TestConcurrentSlotResolutionNeitherDuplicatesNorHangs(t *testing.T) {
 		if rec.Slot == 0 || rec.Dead {
 			continue
 		}
-		holders[rec.Slot] = append(holders[rec.Slot], rec.PaneID)
-		if rec.PaneID == self {
-			t.Errorf("the agent's own pane %s came out of the storm carrying slot %d", self, rec.Slot)
+		holders[rec.Slot] = append(holders[rec.Slot], rec.Ref.target())
+		if rec.Ref == self {
+			t.Errorf("the agent's own pane %s came out of the storm carrying slot %d",
+				self.target(), rec.Slot)
 		}
 	}
 	for slot, panes := range holders {
