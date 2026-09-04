@@ -438,13 +438,13 @@ func TestSlotWitnessSurvivesSessionScopedLeak(t *testing.T) {
 		t.Fatalf("a session-scoped @mcp_slot produced %d registry records; the witness must reject all of them", len(reg))
 	}
 
-	rec, found, err := sl.lookupSlot(ctx, slotDefault, kindUnstated)
+	holder, found, err := sl.lookupSlot(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("lookupSlot: %v", err)
 	}
 	if found {
 		t.Fatalf("slot 1 resolved to pane %s off a leaked option — that is one of the user's shells",
-			rec.Ref.target())
+			holder.Record.Ref.target())
 	}
 }
 

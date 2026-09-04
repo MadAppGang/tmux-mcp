@@ -194,22 +194,64 @@ func (s *slots) resolveHelper(ctx context.Context, slot int, kind kindRequest) (
 	return s.resolveHelperLocked(ctx, slot, kind)
 }
 
-// lookupSlot finds the pane occupying a slot without creating or adopting one.
+// slotHolder is what a lookup found: the record, and which registry it came
+// from. The second half is not derivable from the first — a paneRecord is the
+// same shape on either socket — and a reading tool has to report the kind of
+// pane it read.
+type slotHolder struct {
+	Record   paneRecord
+	Isolated bool
+}
+
+// missingSlotText is what a READING tool says about a slot that does not exist.
 //
-// This is the lock-taking wrapper, kept because it is the honest way to ask the
-// question from outside a lock hold. The teardown that close-pane actually
-// performs goes through closePanes, which holds slotMu across the lookup AND the
-// mutations that follow it and therefore calls the ...Locked body directly — see
+// It names both ways to make one, because the alternative is an agent that reads
+// "slot 3 does not exist", concludes the terminal is unavailable to it, and goes
+// looking for another route in — which is the incident this whole design comes
+// from. Most callers will not want open-pane at all: they want to run something,
+// and running something opens the slot on the way past.
+const missingSlotText = "slot %d does not exist; open it with open-pane or by running " +
+	"something in it"
+
+// lookupSlot finds the pane occupying a slot without creating or adopting one,
+// and is the entry point the READING tools use.
+//
+// This is the lock-taking wrapper. The teardown that close-pane performs goes
+// through closePanes, which holds slotMu across the lookup AND the mutations
+// that follow it and therefore calls the ...Locked body directly — see
 // closePanes for why the split is mandatory rather than tidy.
-func (s *slots) lookupSlot(ctx context.Context, slot int, kind kindRequest) (paneRecord, bool, error) {
+//
+// # Invariant R lives here, and only here
+//
+// The body below deliberately RETURNS this server's own pane when a stale slot
+// marker is on it, because close-pane has to refuse it by name rather than
+// report the slot empty. A reading tool must not be handed it: the pane the
+// agent is running in is its own transcript, and watch-pane or capture-pane on
+// it would feed the model its own output — the failure this design exists to
+// prevent, and the one failure that cannot be diagnosed from outside the
+// process.
+//
+// So a self record is a MISS here, and the resulting sentence is the correct
+// advice: the caller opens the slot, resolution clears the stale marker on its
+// way past (slotCandidateLocked), and a real helper pane appears. Reporting it
+// as found would have been the only other option, and there is no sentence for
+// it that leads anywhere useful.
+func (s *slots) lookupSlot(ctx context.Context, slot int, kind kindRequest) (slotHolder, bool, error) {
 	s.slotMu.Lock()
 	defer s.slotMu.Unlock()
 
 	self, err := s.b.Self(ctx)
 	if err != nil && !errors.Is(err, errNoWindow) {
-		return paneRecord{}, false, err
+		return slotHolder{}, false, err
 	}
-	return s.lookupSlotLocked(ctx, slot, kind, self)
+	holder, found, err := s.lookupSlotLocked(ctx, slot, kind, self)
+	if err != nil || !found {
+		return slotHolder{}, false, err
+	}
+	if !holder.Isolated && !self.empty() && holder.Record.Ref == self {
+		return slotHolder{}, false, nil
+	}
+	return holder, true, nil
 }
 
 // lookupSlotLocked finds the pane occupying a slot WITHOUT creating or adopting
@@ -236,11 +278,11 @@ func (s *slots) lookupSlot(ctx context.Context, slot int, kind kindRequest) (pan
 // order to release it would touch a pane the user owns for no reason at all.
 func (s *slots) lookupSlotLocked(
 	ctx context.Context, slot int, kind kindRequest, self paneRef,
-) (paneRecord, bool, error) {
+) (slotHolder, bool, error) {
 	if kind != kindIsolated && !self.empty() {
 		reg, err := s.b.Records(ctx, self)
 		if err != nil {
-			return paneRecord{}, false, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
+			return slotHolder{}, false, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
 		}
 
 		// The server's own pane is CONSIDERED here, and teardown is the only
@@ -264,22 +306,22 @@ func (s *slots) lookupSlotLocked(
 		// resolution clears it through slotCandidateLocked, which is where the
 		// healing belongs.
 		if rec, ok := reg[self]; ok && rec.Slot == slot {
-			return rec, true, nil
+			return slotHolder{Record: rec}, true, nil
 		}
 		if rec, ok := s.closeCandidateLocked(ctx, slot, self, reg, false); ok {
-			return rec, true, nil
+			return slotHolder{Record: rec}, true, nil
 		}
 	}
 
 	if kind == kindVisible {
-		return paneRecord{}, false, nil
+		return slotHolder{}, false, nil
 	}
 	iso, err := s.b.IsolatedRecords(ctx)
 	if err != nil {
-		return paneRecord{}, false, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
+		return slotHolder{}, false, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
 	}
 	rec, ok := s.closeCandidateLocked(ctx, slot, paneRef{}, iso, true)
-	return rec, ok, nil
+	return slotHolder{Record: rec, Isolated: ok}, ok, nil
 }
 
 // resolveHelperLocked is the body of resolveHelper. The caller must hold slotMu.
@@ -1171,16 +1213,18 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 		}
 		return closed, nil
 	default:
-		rec, found, err := s.lookupSlotLocked(ctx, sel.Slot, kindUnstated, self)
+		holder, found, err := s.lookupSlotLocked(ctx, sel.Slot, kindUnstated, self)
 		if err != nil {
 			return nil, err
 		}
 		if !found {
 			// A slot that holds nothing is not an error. "Close slot 2" when slot
 			// 2 was never opened is a request that has already been satisfied.
+			// This is the ONE place the two callers of that lookup differ, and it
+			// is the caller's difference: a reading tool errors here.
 			return []closedPane{{Slot: sel.Slot, Action: actionNone}}, nil
 		}
-		return []closedPane{s.closeOneLocked(ctx, rec, self)}, nil
+		return []closedPane{s.closeOneLocked(ctx, holder.Record, self)}, nil
 	}
 }
 

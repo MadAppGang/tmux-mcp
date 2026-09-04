@@ -690,9 +690,21 @@ func TestPaneState(t *testing.T) {
 	t.Logf("foregroundCmd while sleeping: %q", foregroundCmd)
 }
 
+// TestPaneStateProcessExit reads a slot whose process has DIED, through the
+// tool, and the interesting part is that it answers about the corpse.
+//
+// A read no longer creates, and this is where that pays: the pane in slot 1 is
+// exactly what the user is looking at, and "isAlive:false with an exit code" is
+// the fact the caller is asking for. While reads resolved, this call could not
+// be made at all — resolution refuses to hand back a dead pane, because one
+// accepts send-keys and silently swallows every keystroke — so the slot answered
+// about a fresh pane instead, and the death of whatever the agent had started
+// there was invisible.
 func TestPaneStateProcessExit(t *testing.T) {
 	c, self := agentPaneFixture(t)
 	pane := openSlot(t, c, self, 1)
+	window := tmuxExec(t, "display-message", "-p", "-t", self, "#{window_id}")
+	before := panesInWindow(t, window)
 
 	// Enable remain-on-exit so tmux keeps the pane alive (marked dead) after
 	// the shell exits. Without this, tmux destroys the pane immediately and
@@ -707,18 +719,23 @@ func TestPaneStateProcessExit(t *testing.T) {
 	}, &map[string]any{})
 	waitForPaneDead(t, pane)
 
-	// The state is read through the same code the tool uses, but against the
-	// CORPSE rather than through the slot — because in this release the slot
-	// cannot reach it. Resolution refuses to hand back a dead pane (it accepts
-	// keystrokes and silently swallows them, which is the worst failure this
-	// server can have), so pane-state({slot:1}) resolves to a fresh pane and
-	// answers about that instead. The commit that stops reading tools from
-	// creating is where this becomes reachable by slot again, with the corpse
-	// returned deliberately: a dead slot 1 is exactly what the user is looking at.
-	state := paneStateNow(t, pane)
-	t.Logf("pane state after exit: isAlive=%v exitCode=%d", state.IsAlive, state.ExitCode)
-	if state.IsAlive {
-		t.Errorf("expected isAlive=false after the shell exited, got true")
+	var state map[string]any
+	c.callToolJSON(t, "pane-state", map[string]any{"slot": 1}, &state)
+	t.Logf("pane-state after exit: %v", state)
+	if state["isAlive"] != false {
+		t.Errorf("pane-state reports isAlive=%v for a slot whose shell has exited", state["isAlive"])
+	}
+	if slot, _ := state["slot"].(float64); int(slot) != 1 {
+		t.Errorf("pane-state answered for slot %v, want 1", state["slot"])
+	}
+
+	// The control: it answered about the corpse rather than about a pane it made
+	// on the way past. A fresh pane would report isAlive:true, so the assertion
+	// above already implies this — but only while remain-on-exit is on, and a
+	// count is the direct statement.
+	if after := panesInWindow(t, window); len(after) != len(before) {
+		t.Errorf("reading a dead slot took the window from %d panes to %d: the read created one",
+			len(before), len(after))
 	}
 }
 
@@ -823,6 +840,11 @@ func TestStartAndWatch(t *testing.T) {
 
 func TestWatchPaneTimeout(t *testing.T) {
 	c, _ := agentPaneFixture(t)
+
+	// The slot is opened first, because watching is a READ: a slot that has not
+	// been opened is an error now, not a pane created on the way past. This test
+	// is about the timeout, so it opens the pane the way a caller would.
+	c.callToolJSON(t, "open-pane", map[string]any{}, &map[string]any{})
 
 	start := time.Now()
 	var result map[string]any

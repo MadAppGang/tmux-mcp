@@ -492,9 +492,41 @@ func (s *slots) resolveSlotOrEphemeral(
 	if !hasSlot {
 		slot = slotDefault
 	}
+	if spec.NoCreate {
+		tgt, err = s.lookupOnly(ctx, slot, kind)
+		return tgt, false, err
+	}
 	tgt, err = s.resolveHelper(ctx, slot, kind)
 	if err != nil {
 		return paneTarget{}, false, visibleError(err)
 	}
 	return tgt, false, nil
+}
+
+// lookupOnly answers a READING tool: it finds the pane occupying a slot and
+// never makes one.
+//
+// A read that creates is the defect this removes, and it was not a small one.
+// capture-pane({slot:3}) on an empty slot used to SPLIT the user's window, or
+// ADOPT one of their idle shells — writing three tmux options into a pane they
+// opened and renaming it — in order to answer a question about a pane that did
+// not exist. The answer was then a screenshot of a fresh prompt, which tells the
+// caller nothing and costs the user a pane they have to close.
+//
+// Created is false and stays false. Reading tools do not report it at all (the
+// field is nil on the wire), and a value here would be a value nothing consumes.
+func (s *slots) lookupOnly(ctx context.Context, slot int, kind kindRequest) (paneTarget, error) {
+	holder, found, err := s.lookupSlot(ctx, slot, kind)
+	if err != nil {
+		return paneTarget{}, visibleError(err)
+	}
+	if !found {
+		return paneTarget{}, fmt.Errorf(missingSlotText, slot)
+	}
+	return paneTarget{
+		Ref:      holder.Record.Ref,
+		Slot:     slot,
+		Owner:    holder.Record.Owner,
+		Isolated: holder.Isolated,
+	}, nil
 }

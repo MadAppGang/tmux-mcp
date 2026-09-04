@@ -705,7 +705,8 @@ func registerCapturePane(s *server.MCPServer, sl *slots) {
 		mcp.WithDescription("Capture terminal text content from a helper pane as plain text. "+
 			"Preferred tool for reading command output, logs, and text-based terminal content. Use "+
 			"screenshot-pane only when visual rendering (colors, layout, TUI graphics) matters. "+
-			"With no slot it reads helper slot 1, the pane this agent runs commands in."),
+			"With no slot it reads helper slot 1, the pane this agent runs commands in. Reading a "+
+			"slot that has not been opened is an error, not an empty pane."),
 		mcp.WithNumber("lines",
 			mcp.Description("Number of lines of history to include (default: pane height)"),
 		),
@@ -717,14 +718,17 @@ func registerCapturePane(s *server.MCPServer, sl *slots) {
 		// written out in full — screenshot-pane, pane-state, watch-pane and
 		// list-slots point here.
 		//
-		// The annotation was correct while paneId was required: the tool read a
-		// pane the caller named and changed nothing. Resolving a slot SPLITS the
-		// user's window, may adopt one of their idle shells (writing three tmux
-		// options into it), and renames the pane it settles on. readOnlyHint is a
-		// licence for a client to skip confirmation, to prefetch, or to batch —
-		// so an auto-approving client would silently rearrange the user's
-		// terminal in order to answer a question about it, which is the one thing
-		// the hint promises cannot happen.
+		// The old reason is gone: a read no longer splits the user's window or
+		// adopts one of their shells, because a missing slot is an error now. The
+		// annotation still cannot go on, and what remains is smaller and sharper.
+		// A lookup REPAIRS the registry on its way past, exactly as resolution
+		// does: it clears a stale slot marker off this server's own pane
+		// (set-option), and duplicate healing can RELEASE an adopted loser, which
+		// sends C-c into a pane the user opened.
+		//
+		// readOnlyHint is a licence for a client to skip confirmation, to
+		// prefetch, or to batch. None of those may sit on a call that can
+		// interrupt something the user is running, however rare the path.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{NoCreate: true})
 		if err != nil {
@@ -760,7 +764,7 @@ func registerScreenshotPane(s *server.MCPServer, sl *slots) {
 			"colors, styles, and layout via xterm.js. Returns an image the model can see. Use ONLY "+
 			"when visual appearance matters (TUI layouts, color-coded output, ANSI art). For "+
 			"reading text content, prefer capture-pane instead. With no slot it renders helper "+
-			"slot 1."),
+			"slot 1. Rendering a slot that has not been opened is an error, not a blank image."),
 		mcp.WithString("theme",
 			mcp.Description(`Color theme: "dark" (default) or "light"`),
 			mcp.Enum("dark", "light"),
@@ -800,7 +804,8 @@ func registerPaneState(s *server.MCPServer, sl *slots) {
 		mcp.WithDescription("Get native OS-level process state for a helper pane. Returns whether "+
 			"the foreground process is alive and whether it is waiting for user input (detected "+
 			"via OS-level process inspection, not regex). The pids are OS pids. With no slot it "+
-			"inspects helper slot 1."),
+			"inspects helper slot 1. Asking about a slot that has not been opened is an error, "+
+			"and a slot whose process has exited answers isAlive:false rather than erroring."),
 		slotProperty(),
 		// No readOnlyHint: see capture-pane.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -830,7 +835,8 @@ func registerWatchPane(s *server.MCPServer, sl *slots, emitter *ChannelEmitter) 
 	addAgenticTool(s, mcp.NewTool("watch-pane",
 		mcp.WithDescription("Monitor a helper pane using smart triggers. Blocks until a trigger "+
 			"fires or the timeout expires. With no slot it watches helper slot 1, which is where "+
-			"start-and-watch and execute-command run by default."),
+			"start-and-watch and execute-command run by default. Watching a slot that has not been "+
+			"opened is an error: use start-and-watch to open one and watch it in a single call."),
 		mcp.WithString("mode",
 			mcp.Description("Notification preset: quick (0.5s poll/1s or 10 lines), medium (1s poll/5s or 40 lines), slow (2s poll/30s or 100 lines), line (200ms poll/1 line), bunch (500ms poll/10 lines), screen (1s poll/40 lines). Default: medium"),
 			mcp.Enum("quick", "medium", "slow", "line", "bunch", "screen"),
