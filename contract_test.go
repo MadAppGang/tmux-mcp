@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -251,9 +252,15 @@ func TestNoResponseCarriesAnId(t *testing.T) {
 // argument proves nothing about rejection, and a call that would hang for a
 // minute if rejection broke turns a failure into a timeout — so every required
 // field is present and every wait is short.
+//
+// "keys" carries the sentinel the ignored-and-defaulted control looks for. It
+// used to be "echo hi", which made that control vacuous: it searched slot 1 for
+// "LEAK", and no request in this test could ever have put the word there, so it
+// passed whatever the server did. A control that cannot fail is worse than no
+// control — it advertises a rigour that is not there.
 func argsFor(tool string, retired string) map[string]any {
 	args := map[string]any{
-		"keys":          "echo hi",
+		"keys":          "echo LEAK",
 		"command":       "true",
 		"pattern":       "never-matches-anything",
 		"input":         "1+1",
@@ -322,7 +329,10 @@ func TestRetiredArgumentsAreRejected(t *testing.T) {
 	}
 
 	// Control (a): rejected, not ignored-and-defaulted. If the argument were
-	// dropped, send-keys would have resolved to slot 1 and typed there.
+	// dropped, send-keys would have resolved to slot 1 and typed there — and
+	// what it would have typed is argsFor's sentinel, which is why that value is
+	// "echo LEAK" and not something innocuous. Slot 1 is running cat, so the
+	// text would be echoed back onto the screen even without an Enter.
 	if captured := c.callToolText(t, "capture-pane", map[string]any{}); strings.Contains(captured, "LEAK") {
 		t.Errorf("a rejected call still reached slot 1; the pane holds:\n%s", captured)
 	}
@@ -567,14 +577,44 @@ func TestVisibleCallsNeverReachTheIsolatedSocket(t *testing.T) {
 	c, _ := agentPaneFixture(t)
 	_ = exec.Command("tmux", "-L", headlessSocket, "kill-server").Run()
 
+	// probe answers "what is on the isolated socket right now". An error means no
+	// server at all, which is the same answer as an empty list here.
+	probe := func() string {
+		t.Helper()
+		out, err := exec.Command("tmux", append(socketArgs(headlessSocket), "list-sessions")...).Output()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(out))
+	}
+
 	c.callToolJSON(t, "execute-command", map[string]any{"command": "echo visible-only"},
 		&map[string]any{})
 	c.callToolJSON(t, "list-slots", map[string]any{}, &[]map[string]any{})
 
-	out, err := exec.Command("tmux", append(socketArgs(headlessSocket), "list-sessions")...).Output()
-	if err == nil && strings.TrimSpace(string(out)) != "" {
+	if sessions := probe(); sessions != "" {
 		t.Errorf("a call that asked for nothing invisible started a session on the isolated "+
-			"socket:\n%s", out)
+			"socket:\n%s", sessions)
+	}
+
+	// The positive control, and without it the assertion above is untestable: a
+	// probe that can never see anything reports "never reached" for a server that
+	// reaches that socket on every call. So make one call that MUST touch it and
+	// require the same probe, run the same way, to see the result.
+	//
+	// The isolated pane is a slotted one rather than an ephemeral one on purpose.
+	// An ephemeral pane is destroyed inside its own call and tmux exits the
+	// server with its last pane, so the probe would find nothing afterwards and
+	// the control would be as blind as the thing it is controlling.
+	c.callToolJSON(t, "execute-command", map[string]any{
+		"command": "echo invisible", "isolated": true, "slot": 6,
+	}, &map[string]any{})
+	t.Cleanup(func() { c.callToolJSON(t, "close-pane", map[string]any{"slot": "all"}, &[]map[string]any{}) })
+
+	if probe() == "" {
+		t.Fatal("a call that explicitly asked for an isolated pane left nothing on the isolated " +
+			"socket either, so the probe cannot see that socket at all and the assertion above " +
+			"passes for every possible server")
 	}
 }
 
@@ -660,5 +700,223 @@ func TestScrubIDsKeepsTheSentence(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "<pane>") {
 		t.Logf("note: tmux phrased this failure without an id at all: %q", err)
+	}
+}
+
+// ---- Nothing an id can ride out on ----
+
+// TestNoIdReachesAnyContentBlock is the other half of TestNoResponseCarriesAnId,
+// and it is the half that can see where the leaks actually were.
+//
+// That test marshals response STRUCTS. Three of the four confirmed leaks were
+// not in a struct: an image caption, a channel notification line and an error
+// sentence built with %v. All three travel as CallToolResult CONTENT — text
+// blocks, captions, notification payloads — which a struct-marshalling test is
+// structurally blind to. It would have passed through every one of them.
+//
+// So this drives real calls against real tmux and scans what actually goes on
+// the wire: every content block, the structuredContent, and every channel
+// notification the calls emitted. The calls are chosen to cover the paths where
+// a raw id could plausibly still be formatted — a creation, a read, a render, a
+// dead pane, a refusal that names a pane, and a teardown that reports per-pane
+// details — rather than to be an exhaustive tour of the surface.
+//
+// Two paths it deliberately does not reach, so the coverage is not overstated:
+// the PNG caption (screenshot-pane's default output needs headless Chrome; the
+// html branch is driven here instead), and tmux's own stderr, whose scrub is
+// driven end to end by TestScrubIDsKeepsTheSentence's live control.
+func TestNoIdReachesAnyContentBlock(t *testing.T) {
+	c, self := agentPaneFixture(t, "--channel")
+
+	scanned := 0
+	scan := func(label string, raw json.RawMessage) {
+		t.Helper()
+		scanned++
+		if m := idInText.FindString(string(raw)); m != "" {
+			t.Errorf("%s emitted something shaped like a multiplexer id (%q) in its result; "+
+				"a content block reaches the model verbatim:\n%s", label, m, raw)
+		}
+	}
+
+	// The control comes FIRST, because a scanner that cannot see a planted id is
+	// a test that passes for the wrong reason for the rest of its body. This is
+	// the shape every leak had: an id inside a sentence inside a text block.
+	planted := json.RawMessage(
+		`{"content":[{"type":"text","text":"could not open a pane for slot 1: %3"}],"isError":true}`)
+	if m := idInText.FindString(string(planted)); m == "" {
+		t.Fatalf("the scanner cannot see an id planted in a content block, so nothing below "+
+			"this line proves anything: %s", planted)
+	}
+
+	// A creation and a write: the response carries created/slot, and the error
+	// texts behind them are the ones that used to name a pane.
+	scan("open-pane", c.callToolRaw(t, "open-pane", map[string]any{"slot": 1}))
+	scan("send-keys", c.callToolRaw(t, "send-keys", map[string]any{
+		"slot": 1, "keys": "echo scan-probe", "enter": true,
+	}))
+
+	// The three reads, including the renderer. screenshot-pane goes through the
+	// html branch, which is the one that runs without Chrome.
+	scan("capture-pane", c.callToolRaw(t, "capture-pane", map[string]any{"slot": 1}))
+	scan("pane-state", c.callToolRaw(t, "pane-state", map[string]any{"slot": 1}))
+	scan("screenshot-pane", c.callToolRaw(t, "screenshot-pane", map[string]any{
+		"slot": 1, "output": "html",
+	}))
+	scan("list-slots", c.callToolRaw(t, "list-slots", map[string]any{}))
+
+	// The invisible half. An ephemeral one-shot leaves no pane; a slotted
+	// isolated pane leaves one, and both answer about a pane with no window.
+	scan("execute-command (ephemeral)", c.callToolRaw(t, "execute-command", map[string]any{
+		"command": "echo scan-probe", "isolated": true,
+	}))
+	scan("open-pane (isolated)", c.callToolRaw(t, "open-pane", map[string]any{
+		"slot": 4, "isolated": true,
+	}))
+
+	// Refusals, which is where an id is likeliest to be formatted into a
+	// sentence: a slot that holds nothing, and a slot whose kind disagrees.
+	scan("capture-pane (no such slot)", c.callToolRaw(t, "capture-pane", map[string]any{"slot": 9}))
+	scan("open-pane (kind conflict)", c.callToolRaw(t, "open-pane", map[string]any{
+		"slot": 1, "isolated": true,
+	}))
+
+	// A dead pane, which is a pane tmux still knows about and no process is
+	// behind — the state pane-state reports through a different branch.
+	dead := openSlot(t, c, self, 2)
+	tmuxExec(t, "set-option", "-t", dead, "remain-on-exit", "on")
+	tmuxExec(t, "send-keys", "-t", dead, "exit", "Enter")
+	waitForPaneDead(t, dead)
+	scan("pane-state (dead pane)", c.callToolRaw(t, "pane-state", map[string]any{"slot": 2}))
+
+	// A channel notification, which is not a tool result at all and is the one
+	// emission no response type covers.
+	drainNotifications(c)
+	scan("start-and-watch", c.callToolRaw(t, "start-and-watch", map[string]any{
+		"slot": 5, "command": "echo scan-probe", "pattern": "scan-probe", "timeout": 15,
+	}))
+	notif := waitNotification(t, c, 5*time.Second)
+	payload, err := json.Marshal(notif)
+	if err != nil {
+		t.Fatalf("marshal the channel notification: %v", err)
+	}
+	scan("notifications/claude/channel", payload)
+
+	// Teardown, whose per-pane detail strings are the closest thing this surface
+	// has to a free-text field. The self pane is marked into slot 3 first, so the
+	// refusal that names it is scanned too — it is the one refusal that has a
+	// real pane in hand while it writes its sentence.
+	tmuxExec(t, "set-option", "-p", "-t", self, paneOptWitness, self)
+	tmuxExec(t, "set-option", "-p", "-t", self, paneOptOwner, ownerAgent)
+	tmuxExec(t, "set-option", "-p", "-t", self, paneOptSlot, "3")
+	scan("close-pane (self)", c.callToolRaw(t, "close-pane", map[string]any{"slot": 3}))
+	scan("close-pane (all)", c.callToolRaw(t, "close-pane", map[string]any{"slot": "all"}))
+
+	// Anything that arrived while the calls above ran.
+	for {
+		select {
+		case n := <-c.channelNotifications:
+			extra, err := json.Marshal(n)
+			if err != nil {
+				t.Fatalf("marshal a trailing channel notification: %v", err)
+			}
+			scan("notifications/claude/channel (trailing)", extra)
+			continue
+		default:
+		}
+		break
+	}
+
+	if scanned < 15 {
+		t.Errorf("only %d results were scanned; the test lost calls somewhere and its silence "+
+			"means less than it looks", scanned)
+	}
+}
+
+// ---- The two tools that never resolve a slot ----
+
+// TestClosePaneRefusesAStatedKind is the rejection rule reaching the one tool it
+// stopped short of.
+//
+// close-pane parses its own slot argument and never calls resolveSlot, so the
+// isolated refusal in parseKindArg was unreachable from it: close-pane({slot:2,
+// isolated:true}) on a VISIBLE slot 2 killed the pane beside the user, left the
+// invisible one running, and reported success. That is the failure D5 refuses
+// headless for — the caller stated which pane it meant and the server acted on
+// the other one — on the most destructive tool on the surface.
+//
+// Both spellings are refused. isolated:false is as much a claim about the kind
+// as isolated:true is, and close-pane honours neither.
+func TestClosePaneRefusesAStatedKind(t *testing.T) {
+	c, self := agentPaneFixture(t)
+	pane := openSlot(t, c, self, 2)
+
+	for _, stated := range []any{true, false} {
+		res := callTool(t, c, "close-pane", map[string]any{"slot": 2, "isolated": stated})
+		if !res.IsError {
+			t.Fatalf("close-pane accepted isolated:%v; an ignored kind closes whichever pane the "+
+				"registry happens to prefer and calls it success: %v", stated, res)
+		}
+		if got := res.text(t, "close-pane"); got != closeKindNotAcceptedText {
+			t.Errorf("close-pane refused isolated:%v with %q, want exactly %q — the refusal has "+
+				"to name the way out, or the agent sends the argument again in another shape",
+				stated, got, closeKindNotAcceptedText)
+		}
+	}
+
+	// The refusal is not a no-op dressed as one: the pane it would have killed
+	// is still there.
+	if !paneExists(t, pane) {
+		t.Fatal("close-pane refused the call and closed the pane anyway")
+	}
+
+	// Control: the refusal comes from the ARGUMENT, not from the slot. The same
+	// call with isolated omitted closes the same pane.
+	entries := closedEntries(t, c, map[string]any{"slot": 2})
+	if len(entries) != 1 || entries[0]["action"] != actionKilled {
+		t.Fatalf("close-pane({slot:2}) answered %v, want a single action:%q entry — if this "+
+			"fails, the refusals above prove nothing about isolated", entries, actionKilled)
+	}
+	if paneExists(t, pane) {
+		t.Error("close-pane reported the pane killed and it is still there")
+	}
+}
+
+// TestPaneArgumentsAreRefusedWhereThereIsNoPane covers the other two tools that
+// never resolve a slot.
+//
+// Neither list-slots nor notify has a pane to address — one answers for every
+// slot, the other writes to the user's status line — so a slot or isolated
+// argument is a caller belief neither can honour. Silence there is milder than
+// close-pane's (nothing is destroyed) but it is the same shape: notify({slot:2})
+// would put the message exactly where notify always puts it and report success
+// to a caller who thought it had addressed a pane.
+func TestPaneArgumentsAreRefusedWhereThereIsNoPane(t *testing.T) {
+	c, _ := agentPaneFixture(t)
+
+	for _, tool := range []string{"list-slots", "notify"} {
+		for _, arg := range []any{"slot", "isolated"} {
+			name, _ := arg.(string)
+			args := map[string]any{"message": "hello"}
+			if name == "slot" {
+				args[name] = 2
+			} else {
+				args[name] = true
+			}
+			res := callTool(t, c, tool, args)
+			if !res.IsError {
+				t.Errorf("%s accepted %s: %v", tool, name, res)
+				continue
+			}
+			if got, want := res.text(t, tool), fmt.Sprintf(noPaneArgumentText, name); got != want {
+				t.Errorf("%s refused %s with %q, want exactly %q", tool, name, got, want)
+			}
+		}
+
+		// Control: the refusal is about the argument. Without it the same call
+		// succeeds, so "everything errors" cannot be what the loop measured.
+		if res := callTool(t, c, tool, map[string]any{"message": "hello"}); res.IsError {
+			t.Errorf("%s failed with no pane argument at all (%v); the refusals above prove "+
+				"nothing", tool, res)
+		}
 	}
 }

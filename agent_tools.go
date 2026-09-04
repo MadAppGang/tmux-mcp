@@ -356,6 +356,26 @@ const oneShotCleanupTimeout = 5 * time.Second
 // function could produce is caught by probing the isolated socket directly
 // rather than by listing slots.
 //
+// # The pane is unclaimed, not invisible to teardown
+//
+// Being unclaimed does not put it out of reach of close-pane({slot:"all"}).
+// sweepNamespaceLocked is namespace-scoped, not slot-scoped, precisely so that a
+// pane left behind by a process that died before claiming one can still be
+// reclaimed — and this pane is indistinguishable from that one while the command
+// runs. mcp-go dispatches tool calls onto a worker pool, so a sweep on one worker
+// kills an in-flight one-shot on another: the command is interrupted and this
+// function reports "failed to execute command" for a command that was fine.
+//
+// It is a correctness wrinkle rather than a safety defect — the pane is ours
+// either way, and tmux does not reuse pane ids within a server's lifetime, so
+// the deferred Close cannot reach a stranger's pane. It is left open rather than
+// locked shut because the alternatives are worse: holding slotMu across the Exec
+// would block every other slot for the length of an arbitrary command, and
+// claiming the pane to protect it would make it addressable, which is the one
+// property this call must not have. What was fixed is the report — the sweep no
+// longer describes this pane as one that "never finished claiming", which
+// described a deliberate design as a crash.
+//
 // waitForShellReady is not optional. OpenIsolated takes no initial command, so
 // Exec would otherwise send into a shell that may still be sourcing its rc
 // files — keystrokes delivered then can be mangled or dropped outright, which
@@ -936,7 +956,12 @@ func registerListSlots(s *server.MCPServer, sl *slots) {
 		// slot marker off this server's own pane and heals duplicate claims,
 		// which can send C-c into an adopted pane it is releasing. See
 		// listSlotsLocked.
-	), func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// list-slots answers for every slot, so a slot argument is a caller
+		// belief this tool cannot honour — see rejectPaneArgs.
+		if err := rejectPaneArgs(req); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		listings, err := sl.listSlots(ctx)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -967,6 +992,11 @@ func registerNotify(s *server.MCPServer, sl *slots) {
 			mcp.Description("How long the message stays up, in seconds (default 3)"),
 		),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// The message goes to the user's status line, never to a pane, so a
+		// slot argument is a belief this tool cannot honour — see rejectPaneArgs.
+		if err := rejectPaneArgs(req); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		message, err := req.RequireString("message")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil

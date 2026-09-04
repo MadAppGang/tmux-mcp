@@ -29,6 +29,11 @@ quietly redirected to slot 1.
   so a caller that sent an identifier would get keystrokes in a pane it did not name. The
   retired `headless` argument is refused the same way, and for the same reason — a caller
   asking for an invisible pane must not silently be given a visible one beside the user.
+- **The three tools that resolve no slot refuse a pane argument too.** `close-pane` closes
+  whichever kind of pane the slot holds, so a stated `isolated` is refused rather than
+  ignored — ignoring it would kill the visible pane for a caller who said it meant the
+  invisible one, and report success. `list-slots` and `notify` address no pane at all, and
+  refuse `slot` and `isolated` for the same reason.
 - **`open-pane`** — renamed from `split-pane`. It no longer splits a pane you name; it
   returns the pane for a slot, opening it if the slot is empty.
 - **`notify`** — renamed from `display-message`.

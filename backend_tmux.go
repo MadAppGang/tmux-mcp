@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -142,15 +141,15 @@ const (
 var markOrder = []string{paneOptWitness, paneOptOwner, paneOptSlot}
 
 // tmuxClient wraps tmux CLI interactions.
+//
+// It holds no lock. Slot resolution is serialised by slots.slotMu, in
+// helper_panes.go, where the rules it protects live — and this struct carried a
+// second, never-locked mutex of the same name until this release. A dead lock
+// with a live rationale beside it is worse than no lock: the next edit that
+// needs serialising here would take it, compile, read exactly like the design
+// document and protect nothing.
 type tmuxClient struct {
 	shellType string
-
-	// slotMu serialises helper-pane slot resolution inside this process. It
-	// lives on the client rather than in a package-level var because the server
-	// builds exactly one client (main.go) and the tests that construct their own
-	// are single-threaded; see resolveHelper for what the lock does and does not
-	// protect against.
-	slotMu sync.Mutex
 }
 
 func newTmuxClient(shellType string) *tmuxClient {
@@ -520,7 +519,14 @@ func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, si
 	}
 	parts := strings.Split(out, "\t")
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("unexpected tmux output: %q", out)
+		// Scrubbed, because this is tmux's STDOUT and the scrub in runWithSocket
+		// only reaches its stderr. The value being quoted here is the output of
+		// -F "#{pane_id}\t#{window_id}", so it is a pane id and a window id by
+		// construction, and this error travels to the model verbatim: OpenBeside
+		// → resolveHelperLocked → "could not open a pane for slot %d". It needs
+		// tmux to violate its own format to fire at all, which is exactly why it
+		// would never have been noticed leaking.
+		return nil, fmt.Errorf("unexpected tmux output: %q", scrubIDs(out))
 	}
 	// The mark's error is deliberately dropped: a split that worked must not be
 	// reported as a failure because its registry markers did not stick. The pane
@@ -1076,6 +1082,41 @@ func isolatedFormat() string {
 	return "#{session_name}\t" + registryFormat()
 }
 
+// noIsolatedServer reports whether a failed read of the isolated socket means
+// there is no server on it — "this agent has opened no invisible panes", the
+// state every machine starts in — rather than a read that failed.
+//
+// The distinction has to be made because tmux does not make it: both are an
+// ordinary non-zero exit, and the whole difference is in the sentence. So the
+// sentence is what is matched, which is unlovely and is the only signal there
+// is. tmux has phrased the missing-server case as "no server running on <path>"
+// since 2.x and as "error connecting to <path> (No such file or directory)"
+// before that; both spellings are accepted, and the socket path in them is a
+// filesystem path rather than an id, so the scrub in runWithSocket has not
+// eaten anything this needs.
+//
+// Anything UNRECOGNISED is a failure, which is the safe direction on both
+// paths: on resolution a false "it failed" is swallowed again by
+// IsolatedRecords, and on teardown a false "it failed" produces an error entry
+// the agent can act on, where the opposite mistake produces a live shell nobody
+// can see and a response saying it is gone.
+func noIsolatedServer(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, phrase := range []string{
+		"no server running on",
+		"error connecting to",
+		"no such file or directory",
+	} {
+		if strings.Contains(msg, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 // scanNamespace reads every pane in this server's namespace in ONE tmux call,
 // and returns both views of it.
 //
@@ -1090,26 +1131,20 @@ func isolatedFormat() string {
 // line whose witness is not the pane's own id. There is one format expression in
 // this file naming the three options, which is what makes the witness impossible
 // to drop from one reader and not the other.
+// It reports its failures, and that is a change from the version that read every
+// one of them as "empty". "No server running on that socket" genuinely IS empty —
+// it is the state every machine starts in — but a read that FAILED is not, and
+// collapsing the two here made close-pane({slot:"all"}) answer "nothing to
+// close, no error" for a namespace it could not see. The discrimination is
+// noIsolatedServer's; the two callers below then choose what to do with a real
+// failure, because they want different things from it.
 func (b *tmuxBackend) scanNamespace(ctx context.Context) ([]paneRef, map[paneRef]paneRecord, error) {
 	out, err := b.c.runWithSocket(ctx, headlessSocket, "list-panes", "-a", "-F", isolatedFormat())
 	if err != nil {
-		// "No server running on that socket" is not a failure: it is what "this
-		// agent has opened no invisible panes" looks like, and it is the state
-		// every machine starts in. tmux reports it as an ordinary command
-		// failure, indistinguishable at this layer from a transient one.
-		//
-		// So EVERY failure is read as "empty", and the alternative is worse in a
-		// way that is easy to miss: an unstated kind consults this registry on
-		// its way past, so returning an error here would fail a plain
-		// send-keys — the most common call this server serves — on any machine
-		// that has never used an isolated slot.
-		//
-		// Reading a transient failure as "empty" costs a duplicate pane and
-		// nothing else, and the duplicate repairs itself: the next successful
-		// read finds two panes claiming one slot, keeps the oldest and CLOSES the
-		// other, and close-pane({slot:"all"}) sweeps the namespace whatever its
-		// marks say.
-		return nil, map[paneRef]paneRecord{}, nil
+		if noIsolatedServer(err) {
+			return nil, map[paneRef]paneRecord{}, nil
+		}
+		return nil, nil, err
 	}
 	prefix := b.namespacePrefix()
 	var panes []paneRef
@@ -1343,7 +1378,9 @@ type Backend interface {
 
 	// IsolatedRecords is the witnessed registry of this server's isolated
 	// namespace — the same question Records answers, asked of the panes nobody
-	// can see.
+	// can see. It DEGRADES: an unreadable namespace answers "empty", because
+	// resolution consults it on the way past and its caller is about to create
+	// a pane either way.
 	IsolatedRecords(ctx context.Context) (map[paneRef]paneRecord, error)
 
 	// IsolatedPanes returns EVERY pane in this server's namespace, marked or
@@ -1351,6 +1388,10 @@ type Backend interface {
 	// namespace is ours by construction, so a pane whose marks are missing or
 	// partial is still ours to close. Without it, a process that died between
 	// creating a pane and claiming it leaves a live shell no tool can reach.
+	//
+	// It PROPAGATES, where its sibling degrades, and the asymmetry is the
+	// contract rather than an oversight: its caller is teardown, for which
+	// "empty" and "I could not look" are opposite answers.
 	IsolatedPanes(ctx context.Context) ([]paneRef, error)
 
 	// OwnerMark asks the OPPOSITE question from Records and is deliberately not
@@ -1502,11 +1543,34 @@ func (b *tmuxBackend) Records(ctx context.Context, of paneRef) (map[paneRef]pane
 	return b.c.paneRegistryAround(ctx, of.target())
 }
 
+// IsolatedRecords is the RESOLUTION view, and it is forgiving on purpose.
+//
+// An unstated kind consults this registry on its way past, so propagating a
+// transient failure would fail a plain send-keys — the most common call this
+// server serves — on any machine whose isolated socket hiccupped. Reading the
+// failure as "empty" costs a duplicate pane and nothing else, and the duplicate
+// repairs itself: the next successful read finds two panes claiming one slot,
+// keeps the oldest and closes the other.
+//
+// That argument is about a caller who is about to CREATE. It does not transfer
+// to a caller who is about to report that it cleaned up — see IsolatedPanes,
+// which is why these two methods no longer share an error policy.
 func (b *tmuxBackend) IsolatedRecords(ctx context.Context) (map[paneRef]paneRecord, error) {
 	_, records, err := b.scanNamespace(ctx)
-	return records, err
+	if err != nil {
+		return map[paneRef]paneRecord{}, nil
+	}
+	return records, nil
 }
 
+// IsolatedPanes is the RECLAMATION view, and it propagates.
+//
+// Its only production caller is sweepNamespaceLocked, whose entire contract is
+// "leave nothing invisible behind". A failure read as "empty" there makes
+// close-pane({slot:"all"}) answer that the sweep found nothing — no entry, no
+// error — while the shells are still running, unreachable by any tool until this
+// process exits and the next server's reaper collects them. A cancelled caller
+// context is enough to trigger it, because runWithSocket uses CommandContext.
 func (b *tmuxBackend) IsolatedPanes(ctx context.Context) ([]paneRef, error) {
 	panes, _, err := b.scanNamespace(ctx)
 	return panes, err

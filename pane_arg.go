@@ -411,7 +411,8 @@ func closeSlotProperty() mcp.ToolOption {
 		// invisible ones survive, and then leaves live shells behind on a server
 		// nobody can see. It also takes no isolated argument, deliberately —
 		// there is no version of "close everything" that should leave some of it
-		// open.
+		// open — and one sent anyway is REFUSED rather than ignored, which is the
+		// half that was missing: see parseCloseSlotArg.
 		mcp.Description(`Which helper slot to close: 1 (the default), 2, 3, … or "all" to close `+
 			`every helper pane this server opened, visible and isolated alike. Panes the server `+
 			`created are killed; panes it adopted from the user are interrupted and released, `+
@@ -419,10 +420,58 @@ func closeSlotProperty() mcp.ToolOption {
 	)
 }
 
+// closeKindNotAcceptedText is close-pane's refusal for an isolated argument.
+//
+// It names the way out, because the request behind it is a real one: an agent
+// that opened an invisible pane and wants it gone has to be told how, or it will
+// send the argument again in another shape.
+const closeKindNotAcceptedText = "isolated is not accepted here; close-pane closes whichever " +
+	"kind of pane the slot holds, and slot: \"all\" closes both kinds"
+
+// noPaneArgumentText is the refusal for a pane-selecting argument on the two
+// tools that select no pane.
+const noPaneArgumentText = "%s is not accepted here; this tool takes no pane argument"
+
+// rejectPaneArgs refuses slot and isolated on list-slots and notify.
+//
+// Neither tool declares either argument, and neither resolves a slot, so without
+// this the rule stops one short again: notify({slot:2}) would put the message on
+// the user's status line — which is where notify ALWAYS puts it — and report
+// success to a caller who believed it had addressed a pane.
+//
+// It is deliberately narrow. Only the two argument names that mean "I am
+// naming a pane" are refused; an unknown property is left alone, because
+// refusing every extra key is a different and much larger promise than the one
+// this contract makes.
+func rejectPaneArgs(req mcp.CallToolRequest) error {
+	args := req.GetArguments()
+	for _, name := range []string{"slot", "isolated"} {
+		if _, ok := args[name]; ok {
+			return fmt.Errorf(noPaneArgumentText, name)
+		}
+	}
+	return nil
+}
+
 // parseCloseSlotArg reads close-pane's slot argument. all reports slot:"all";
 // present is false when the caller omitted the argument entirely, which
 // close-pane reads as slot 1.
+//
+// It also refuses isolated, and that refusal has to live here because close-pane
+// never reaches parseKindArg: it does not resolve a slot, it tears one down. An
+// ignored isolated is the destructive version of the failure the whole rejection
+// rule exists for — close-pane({slot:2, isolated:true}) on a VISIBLE slot 2 kills
+// the pane beside the user, leaves the invisible one running, and reports
+// success. The caller stated a belief about which pane it meant and the server
+// acted on the other one.
+//
+// Any present value is refused, false included. isolated:false is as much a
+// claim about the kind as isolated:true, and close-pane honours neither: it
+// closes what the slot holds.
 func parseCloseSlotArg(req mcp.CallToolRequest) (slot int, all bool, present bool, err error) {
+	if _, stated := req.GetArguments()["isolated"]; stated {
+		return 0, false, false, errors.New(closeKindNotAcceptedText)
+	}
 	if raw, ok := req.GetArguments()["slot"]; ok {
 		if s, isString := raw.(string); isString && strings.EqualFold(strings.TrimSpace(s), "all") {
 			return 0, true, true, nil

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -1108,5 +1109,144 @@ func TestPaneSeqOrdersNumerically(t *testing.T) {
 	if lexical[0] != "%10" || numeric[0] != "%9" {
 		t.Errorf("lexical order gives %v and numeric order gives %v; the two must disagree here, "+
 			"or this pair is not the inversion the ordinal exists to fix", lexical, numeric)
+	}
+}
+
+// ---- "Empty" and "I could not look" are different answers ----
+
+// TestIsolatedPanesTellsEmptyFromUnreadable pins the discrimination the sweep
+// depends on.
+//
+// The namespace read used to answer "empty, no error" for EVERY failure. The
+// rationale was written for resolution, where it holds: an unstated kind
+// consults that registry on its way past, so an error there would fail a plain
+// send-keys on any machine that has never opened an invisible pane, and reading
+// a hiccup as "empty" costs one duplicate pane that heals itself.
+//
+// It does not hold for the other caller. To teardown, "empty" means "there was
+// nothing to clean up" — so a namespace it could not read was reported as a
+// completed sweep, with no entry and no error, while the shells were still
+// running. A cancelled caller context is enough to produce it, because
+// runWithSocket runs tmux under CommandContext.
+//
+// So the two views now differ, and both halves are asserted here: the
+// reclamation view propagates, the resolution view still degrades.
+func TestIsolatedPanesTellsEmptyFromUnreadable(t *testing.T) {
+	sl, b := isolatedFixture(t)
+	ctx := context.Background()
+
+	// Control: a real pane, read normally. Without it, an error below could come
+	// from a namespace that was never readable in the first place.
+	tgt, err := sl.resolveHelper(ctx, 1, kindIsolated)
+	if err != nil {
+		t.Fatalf("resolve isolated slot 1: %v", err)
+	}
+	panes, err := b.IsolatedPanes(ctx)
+	if err != nil {
+		t.Fatalf("read this namespace's panes: %v", err)
+	}
+	if !slices.Contains(panes, tgt.Ref) {
+		t.Fatalf("the pane just opened is not in its own namespace (%v); nothing below this line "+
+			"is about the error path", panes)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	if got, err := b.IsolatedPanes(cancelled); err == nil {
+		t.Errorf("a read that could not run answered %d panes and no error. The sweep above it "+
+			"then reports a complete teardown for a namespace it never saw, and the live shells "+
+			"are unreachable by any tool until this process exits", len(got))
+	}
+
+	// The other half, and it is a decision rather than an oversight: resolution
+	// keeps the forgiving read. If this ever starts failing, a transient hiccup
+	// on the isolated socket has begun failing ordinary visible calls.
+	records, err := b.IsolatedRecords(cancelled)
+	if err != nil {
+		t.Errorf("the resolution view propagated a failed namespace read (%v); a plain send-keys "+
+			"now fails whenever that socket hiccups", err)
+	}
+	if len(records) != 0 {
+		t.Errorf("the degraded read answered %d records, want none", len(records))
+	}
+}
+
+// failingIsolatedPanes is a real Backend with one method broken, which is the
+// whole of the fake: everything else is delegated, so the test drives the same
+// tmux the product does and differs from it in exactly one place.
+type failingIsolatedPanes struct {
+	Backend
+	err error
+}
+
+func (f failingIsolatedPanes) IsolatedPanes(context.Context) ([]paneRef, error) {
+	return nil, f.err
+}
+
+// TestSweepReportsTheNamespaceItCouldNotRead is the response half of the same
+// defect.
+//
+// close-pane({slot:"all"}) is the one call whose entire contract is "leave
+// nothing invisible behind". When the namespace read fails it has exactly two
+// honest answers — what it closed, and what it could not see — and it used to
+// give neither: it returned (nil, err), which threw away the visible panes it
+// had ALREADY closed, and before that it did not even get an error to return.
+func TestSweepReportsTheNamespaceItCouldNotRead(t *testing.T) {
+	sl, b := isolatedFixture(t)
+	ctx := context.Background()
+
+	if _, err := sl.resolveHelper(ctx, 2, kindIsolated); err != nil {
+		t.Fatalf("resolve isolated slot 2: %v", err)
+	}
+
+	broken := newSlots(failingIsolatedPanes{
+		Backend: b,
+		err:     errors.New("tmux list-panes: connection refused"),
+	})
+	entries, err := broken.closePanes(ctx, closeSelector{All: true})
+	if err != nil {
+		t.Fatalf("close-pane({slot:\"all\"}) failed the whole call with %v instead of reporting; "+
+			"any visible panes it had already closed would be invisible to the caller", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("close-pane({slot:\"all\"}) answered an empty array and no error for a namespace " +
+			"it could not read: the agent is told its invisible panes are gone while they are " +
+			"still running")
+	}
+	reported := false
+	for _, entry := range entries {
+		if entry.Action == actionError && strings.Contains(entry.Detail, "still open") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Errorf("the sweep answered %v, with no action:%q entry saying the namespace could not "+
+			"be read", entries, actionError)
+	}
+
+	// Control (a): the report is TRUE — the pane really is still open.
+	panes, err := b.IsolatedPanes(ctx)
+	if err != nil {
+		t.Fatalf("read this namespace's panes: %v", err)
+	}
+	if len(panes) == 0 {
+		t.Fatal("the pane was closed after all, so the error entry is a false alarm rather than " +
+			"the honest answer this test is asserting")
+	}
+
+	// Control (b): the same call on the same state, with nothing broken, closes
+	// it and says so. Without this, "an error entry" could be what this path
+	// always answers.
+	entries, err = sl.closePanes(ctx, closeSelector{All: true})
+	if err != nil {
+		t.Fatalf("close-pane({slot:\"all\"}) with a working backend: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Action != actionKilled {
+		t.Fatalf("the working sweep answered %v, want one action:%q entry", entries, actionKilled)
+	}
+	if panes, err := b.IsolatedPanes(ctx); err != nil || len(panes) != 0 {
+		t.Errorf("the namespace still holds %v (err %v) after a sweep that reported success",
+			panes, err)
 	}
 }

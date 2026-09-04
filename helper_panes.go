@@ -1144,11 +1144,23 @@ type closeSelector struct {
 // calls onto (5 workers by default, server/stdio.go). The concrete failure:
 // close-pane releases the slot-1 pane — C-c, then clearPaneRegistration — while a
 // concurrent bare send-keys takes slotMu, still sees the un-cleared record,
-// resolves to that same pane and types into it mid-release. The mirror ordering
-// kills a pane between a resolver's return and its SendKeys, so the keystrokes
-// land in a pane that no longer exists (or, under remain-on-exit, in one that
-// swallows them silently). That is exactly the race the mutex was built for, and
-// it was eluded on the one path that destroys things.
+// resolves to that same pane and types into it mid-release. That interleaving
+// the lock does eliminate: the read and the mutations are one hold.
+//
+// The MIRROR ordering it does not. A close that kills a pane between a
+// resolver's RETURN and the handler's SendKeys still lands the keystrokes in a
+// pane that no longer exists (or, under remain-on-exit, in one that swallows
+// them silently) — resolveSlot releases slotMu before the handler sends, so the
+// window is narrowed from "the whole of resolution" to "return to send", not
+// closed. Saying otherwise here would be the more dangerous kind of comment: one
+// that stops the next reader looking.
+//
+// The stronger fix, if the residual window ever matters, is the one
+// clearForDisplay already uses: carry the owner captured under the lock and
+// re-check the mark before acting, so a send into a pane that was released
+// underneath it refuses instead of typing. It is not done here because it
+// touches every sending handler, and the exposure needs a concurrent close and
+// send on the SAME slot from one agent's own worker pool.
 //
 // The lock is taken HERE and nowhere below it, because sync.Mutex is not
 // reentrant: everything this calls is a ...Locked variant, and reaching for the
@@ -1200,11 +1212,23 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 				closed = append(closed, s.closeOneLocked(ctx, rec, self))
 			}
 		}
+		// A failed sweep is an ENTRY, not a returned error, for the same reason
+		// the loop above does not stop at its first failure — and for one more:
+		// returning (nil, err) here throws away the visible panes this call has
+		// ALREADY closed, so the agent is told nothing about work that really
+		// happened. It also cannot be silence. The namespace read no longer
+		// reports an unreadable socket as an empty one (see IsolatedPanes), so
+		// the one answer left to give is "I could not look", said out loud.
 		swept, err := s.sweepNamespaceLocked(ctx)
-		if err != nil {
-			return nil, err
-		}
 		closed = append(closed, swept...)
+		if err != nil {
+			closed = append(closed, closedPane{
+				Slot:   0,
+				Action: actionError,
+				Detail: "could not read the isolated panes, so any that exist are still " +
+					"open: " + err.Error(),
+			})
+		}
 		if closed == nil {
 			// A bare array, never null. "There was nothing to close" is a
 			// perfectly ordinary answer, and a caller that gets null for it has
@@ -1246,6 +1270,13 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 // pane dies, so closing our panes reclaims the server by itself — and a
 // kill-server on this socket would be a cross-namespace kill, taking the panes
 // of every other agent on the machine with it.
+//
+// The pane list is the authority and its failure is FATAL to the sweep: a
+// namespace we could not read is not an empty one, and answering "nothing to
+// close" for it is the one lie this function must never tell. The registry read
+// that follows is decoration by comparison — it supplies slot numbers — and its
+// own failure degrades to "empty" inside the port, which costs an accurate slot
+// number in the report and closes every pane regardless.
 func (s *slots) sweepNamespaceLocked(ctx context.Context) ([]closedPane, error) {
 	panes, err := s.b.IsolatedPanes(ctx)
 	if err != nil {
@@ -1265,10 +1296,17 @@ func (s *slots) sweepNamespaceLocked(ctx context.Context) ([]closedPane, error) 
 		entry := closedPane{Slot: rec.Slot, Action: actionKilled}
 		if !claimed || rec.Slot < slotDefault {
 			// Slot 0 is not a slot, and saying so is better than inventing one:
-			// this pane never finished being claimed, so no number ever named it.
-			// The detail is what stops that entry reading as a bug.
+			// no number ever named this pane. The detail is what stops that entry
+			// reading as a bug — and it names BOTH ways a pane gets here, because
+			// the second one is not a fault at all: an execute-command running
+			// isolated with no slot deliberately never claims its pane, so a
+			// concurrent close-pane({slot:"all"}) sweeps it mid-command. Calling
+			// that "never finished claiming" reported a deliberate design as a
+			// crash. See runOneShot.
 			entry.Slot = 0
-			entry.Detail = "an isolated pane this server opened but never finished claiming"
+			entry.Detail = "an isolated pane this server opened and did not claim: a one-shot " +
+				"execute-command still running, or a pane left behind by a process that died " +
+				"before it could claim one"
 		}
 		if err := s.b.Close(ctx, pane); err != nil {
 			entry.Action = actionError
