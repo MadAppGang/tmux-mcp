@@ -20,7 +20,7 @@ var version = "dev"
 
 // resolveVersion returns the build's version. GoReleaser's injected tag wins.
 // Failing that — the case that matters for the terminal plugin, which installs
-// this via `go install github.com/MadAppGang/tmux-mcp@latest` (its setup.go
+// this via `go install github.com/MadAppGang/tmux-mcp/v2@latest` (its setup.go
 // dependency) — the resolved tag is carried in the binary's build info. That is
 // accepted only when it is a clean release tag: never the "(devel)" placeholder
 // and never a build with metadata such as the "+dirty" suffix a modified working

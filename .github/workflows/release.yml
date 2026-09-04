@@ -31,14 +31,18 @@ jobs:
   # Tell magus-src (the source of the marketplace; MadAppGang/magus is its
   # published output) that a new tmux-mcp binary shipped, so it can patch-bump
   # the terminal plugin that installs this binary via its setup.go dependency
-  # (github.com/MadAppGang/tmux-mcp@latest). claudeup notices the plugin version
-  # change and re-runs `go install @latest`, pulling the new binary — that is
-  # what keeps the plugin and the binary in lockstep.
+  # (github.com/MadAppGang/tmux-mcp/v2@latest). claudeup notices the plugin
+  # version change and re-runs `go install @latest`, pulling the new binary —
+  # that is what keeps the plugin and the binary in lockstep.
   #
   # Requires a MAGUS_DISPATCH_TOKEN secret: a PAT with permission to send a
   # repository_dispatch to MadAppGang/magus-src (the built-in GITHUB_TOKEN is
   # scoped to this repo only). Without it, this job logs and skips, so releases
   # are unaffected until the magus-src side is wired up.
+  #
+  # A MAJOR-version tag does NOT dispatch. See the gate in the step below: the
+  # receiver PATCH-bumps the plugin, and a patch bump is a promise that nothing
+  # broke.
   notify-plugin:
     needs: release
     runs-on: ubuntu-latest
@@ -47,11 +51,44 @@ jobs:
         env:
           TOKEN: ${{ secrets.MAGUS_DISPATCH_TOKEN }}
         run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+
+          # Gate: a MAJOR-version tag (vX.0.0) must not auto-publish.
+          #
+          # The dispatch patch-bumps the terminal plugin and force-pushes the
+          # marketplace to the PUBLIC MadAppGang/magus. On a major release that
+          # would ship a binary whose tool surface the already-published plugin's
+          # skills still document the old way — every installed user breaks, with
+          # no version signal that anything changed. The matching plugin major is
+          # written and released by hand, after the tag; automatic bumps resume on
+          # the next minor or patch tag, which are backwards compatible by
+          # definition and dispatch exactly as they always have.
+          #
+          # Anything that is not a clean MAJOR.MINOR.PATCH also skips: an
+          # unparseable tag must not be assumed compatible.
+          CORE="${VERSION%%-*}"   # drop a -rc.1 / -beta prerelease suffix
+          CORE="${CORE%%+*}"      # drop +build metadata
+          if ! printf '%s' "$CORE" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Tag v${VERSION} is not a plain MAJOR.MINOR.PATCH version — skipping the terminal-plugin bump dispatch."
+            echo "The dispatch patch-bumps the plugin, which promises compatibility this tag does not establish."
+            exit 0
+          fi
+          REST="${CORE#*.}"
+          MINOR="${REST%%.*}"
+          PATCH="${REST##*.}"
+          if [ "$MINOR" -eq 0 ] && [ "$PATCH" -eq 0 ]; then
+            echo "Tag v${VERSION} is a MAJOR-version release — skipping the terminal-plugin bump dispatch."
+            echo "A major release is breaking. Dispatching would patch-bump the terminal plugin and"
+            echo "force-push the public marketplace, handing every installed user a binary the shipped"
+            echo "plugin's skills do not describe. Release the matching plugin major by hand; automatic"
+            echo "bumps resume on the next minor or patch tag."
+            exit 0
+          fi
+
           if [ -z "$TOKEN" ]; then
             echo "MAGUS_DISPATCH_TOKEN not set — skipping the terminal-plugin bump dispatch."
             exit 0
           fi
-          VERSION="${GITHUB_REF#refs/tags/v}"
           code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github+json" \
