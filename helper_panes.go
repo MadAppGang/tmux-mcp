@@ -2144,10 +2144,21 @@ func wrapperShell(real, flag string) string {
 // whatever their pipeline-status arrays are called. The command runs through
 // eval, quoted as one word, so that one ending in a comment or in & still
 // leaves the status write as a command of its own, and the whole wrapper stays
-// one line. The eval runs in a subshell, as the condition of an if: a command
-// that calls exit ends only that subshell, and errexit never fires in a
-// condition, so the status is written either way. Each branch redirects only
-// its own echo, so the command's output still goes to tee.
+// one line.
+//
+// The eval runs in a subshell of its own, with an EXIT trap there that writes
+// the subshell's status. It runs as a plain command, not as the condition of
+// an if or one side of || or &&, because errexit is switched off in those
+// places, subshells included, and a command under errexit has to stop where it
+// would stop typed directly. However the subshell ends — the command's last
+// status, exit, or errexit — the trap records it. A command that installs its
+// own EXIT trap replaces ours, so the status is also taken after the subshell
+// and written if the trap did not write it. The one case left without a status
+// is that command failing under errexit, which ends the group before the
+// fallback runs; it finishes as an unreadable status rather than a wait. The
+// move is allowed to fail quietly: with no status to move, an interactive
+// shell under errexit would otherwise exit on the failed mv, and with it the
+// prompt the unreadable-status wait looks for.
 //
 // exitFile appears only after tee has exited, which is after everything that
 // held the pipe open — a background job the command started included — is
@@ -2167,7 +2178,7 @@ func wrapCommand(shell, command, startFile, outFile, statusFile, exitFile string
 		)
 	}
 	return fmt.Sprintf(
-		`printf '' > %s; { if (eval %s); then echo 0 > %s; else echo $? > %s; fi; } 2>&1 | tee %s; command \mv %s %s`,
-		startFile, shellQuote(command), statusFile, statusFile, outFile, statusFile, exitFile,
+		`printf '' > %s; { ( trap 'echo $? > %s' EXIT; eval %s ); _s=$?; [ -f %s ] || echo $_s > %s; } 2>&1 | tee %s; command \mv %s %s 2>/dev/null || :`,
+		startFile, statusFile, shellQuote(command), statusFile, statusFile, outFile, statusFile, exitFile,
 	)
 }

@@ -17,9 +17,10 @@ Same tools, same arguments, same result shapes.
   under `--shell-type zsh` never closed its `{ }` group, and the call waited forever.
   Neither tmux nor herdr lets the server choose a pane's shell. The wrapper now follows
   the pane's real shell, read from the pane's own process: one POSIX form for bash, zsh,
-  sh, dash and ksh, and a fish form for fish. The command runs as the condition of an
-  `if`, so neither `exit` nor errexit (`bash -e`, `setopt errexit`) can skip the status
-  write, and the status is moved into place only after `tee` has exited, so output a
+  sh, dash and ksh, and a fish form for fish. The command runs in a subshell whose EXIT
+  trap records its status, so `exit` and errexit (`bash -e`, `setopt errexit`) cannot
+  skip the status write, and errexit still stops the command where it would stop it
+  typed directly. The status is moved into place only after `tee` has exited, so output a
   background job prints after the command returns is still in the result.
   `--shell-type` is still accepted, and is now only the fallback for a pane whose shell
   cannot be identified.

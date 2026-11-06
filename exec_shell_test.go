@@ -160,10 +160,12 @@ func TestBackgroundOutputIsKept(t *testing.T) {
 	}
 }
 
-// TestErrexitShellReportsTheStatus runs a failing command in shells with
-// errexit set. errexit must not take the status write down with the command.
+// TestErrexitShellReportsTheStatus runs failing commands in shells with
+// errexit set. errexit must not take the status write down with the command,
+// and it must still stop the command where it would stop it typed directly.
 //
 // REGRESSION: under errexit a failing command ended the wrapper before it wrote its status, so false was reported as an unreadable -1
+// REGRESSION: the command ran as an if condition, where errexit never fires, so false; printf ran the printf and returned 0
 func TestErrexitShellReportsTheStatus(t *testing.T) {
 	bash, err := lookBash()
 	if err != nil {
@@ -184,10 +186,18 @@ func TestErrexitShellReportsTheStatus(t *testing.T) {
 			for _, want := range []struct {
 				command string
 				code    int
-			}{{"false", 1}, {"exit 42", 42}, {"true", 0}} {
+			}{
+				{"false", 1},
+				{"exit 42", 42},
+				{"true", 0},
+				{"false; printf 'should-not-run\\n'", 1},
+			} {
 				out, texts := runExec(t, c, map[string]any{"command": want.command})
 				if out.ExitCode != want.code {
 					t.Errorf("%s returned exit code %d, want %d", want.command, out.ExitCode, want.code)
+				}
+				if strings.Contains(out.Output, "should-not-run") {
+					t.Errorf("%s kept running after false under errexit: %q", want.command, out.Output)
 				}
 				if len(texts) > 1 {
 					t.Errorf("%s carried a note: %q", want.command, texts[1:])
@@ -195,6 +205,44 @@ func TestErrexitShellReportsTheStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCommandWithItsOwnExitTrap runs commands that install an EXIT trap of
+// their own, which replaces the one the wrapper records the status with. The
+// status must still come back where the shell keeps running after the
+// command, and the call must end within its bound where it cannot.
+//
+// REGRESSION: a command that set its own EXIT trap left no status for the wrapper to read
+func TestCommandWithItsOwnExitTrap(t *testing.T) {
+	bash, err := lookBash()
+	if err != nil {
+		t.Skip(err)
+	}
+	t.Run("zsh", func(t *testing.T) {
+		c, _ := agentPaneFixture(t)
+		requireZshPanes(t)
+		for _, want := range []struct {
+			command string
+			code    int
+		}{{"trap 'echo mine' EXIT; true", 0}, {"trap 'echo mine' EXIT; false", 1}} {
+			out, texts := runExec(t, c, map[string]any{"command": want.command})
+			if out.ExitCode != want.code || len(texts) > 1 {
+				t.Errorf("%s returned exit code %d (%q), want %d", want.command, out.ExitCode, texts, want.code)
+			}
+			if !strings.Contains(out.Output, "mine") {
+				t.Errorf("%s: the command's own trap did not run: %q", want.command, out.Output)
+			}
+		}
+	})
+	t.Run("bash -e, failing", func(t *testing.T) {
+		c, _ := agentPaneFixture(t)
+		useDefaultCommand(t, "exec "+bash+" --noprofile --norc -e")
+		out, texts := runExec(t, c, map[string]any{"command": "trap 'echo mine' EXIT; false"})
+		note := len(texts) > 1 && strings.Contains(texts[1], "exit status could not be read")
+		if out.ExitCode != 1 && !(out.ExitCode == -1 && note) {
+			t.Errorf("exit code %d (%q), want 1, or -1 with the unreadable note", out.ExitCode, texts)
+		}
+	})
 }
 
 // ---- A status that cannot be read ends the wait ----
