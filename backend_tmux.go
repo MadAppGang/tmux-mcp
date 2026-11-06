@@ -1272,6 +1272,9 @@ type execOutcome struct {
 	Output   string
 	ExitCode int
 	TimedOut bool
+	// StatusUnreadable is set when the command finished but left no exit
+	// status that could be read; ExitCode is then -1.
+	StatusUnreadable bool
 }
 
 // Backend is the port. Policy calls only this; only this file implements it.

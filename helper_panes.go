@@ -42,8 +42,9 @@ import (
 // window, which is why the duplicate healing in slotCandidateLocked is the
 // second half of this lock rather than defensive decoration.
 //
-// shell is the -shell-type flag, which execInPane needs to spell the exit
-// status of a pipeline. It defaults to bash, the flag's own default.
+// shell is the -shell-type flag. execInPane spells its exit-status wrapper for
+// the pane's real shell, and uses this only when that shell cannot be named.
+// It defaults to bash, the flag's own default.
 //
 // cwd is this server's working directory, which is the agent's. A new pane
 // starts there, and a reclaimed one is put back there before it is handed out.
@@ -1907,10 +1908,14 @@ func (s *slots) awaitConsumed(ctx context.Context, pane paneRef, stillEditing bo
 
 // Timing for execInPane. execStartTimeout is how long a command typed into a
 // ready shell is given to begin before the shell is looked at again;
-// execPollInterval is how often the exit file is checked.
+// execPollInterval is how often the exit file is checked. exitStatusGrace is
+// how long a shell back at its prompt is given to have written a status, and
+// outputSettleTimeout bounds the wait for tee to finish after it has.
 const (
-	execStartTimeout = 3 * time.Second
-	execPollInterval = 50 * time.Millisecond
+	execStartTimeout    = 3 * time.Second
+	execPollInterval    = 50 * time.Millisecond
+	exitStatusGrace     = 2 * time.Second
+	outputSettleTimeout = 2 * time.Second
 )
 
 // execInPane runs one shell command in a pane and waits for it to finish.
@@ -1956,19 +1961,37 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 			return nil, err
 		}
 	}
-	wrapped := wrapCommand(s.shell, command, startFile, outFile, exitFile)
+	shell := wrapperShell(s.paneShell(ctx, pane), s.shell)
+	wrapped := wrapCommand(shell, command, startFile, outFile, exitFile)
 	if err := s.sendValidated(ctx, pane, wrapped, true, true); err != nil {
 		return nil, fmt.Errorf("send command: %w", err)
 	}
 
 	startBy := time.Now().Add(execStartTimeout)
+	var promptSince time.Time
 	for {
-		if code, ok := readExitFile(exitFile); ok {
+		switch code, state := readExitFile(exitFile); state {
+		case exitWritten:
+			s.awaitPipelineEnd(ctx, pane)
 			out, err := os.ReadFile(outFile)
 			if err != nil {
 				return nil, fmt.Errorf("read output file: %w", err)
 			}
 			return &execOutcome{Output: strings.TrimRight(string(out), "\n"), ExitCode: code}, nil
+		case exitUnreadable:
+			s.awaitPipelineEnd(ctx, pane)
+			return unreadableOutcome(outFile), nil
+		}
+		// A command that started and whose shell is back at its prompt has
+		// finished; a status it has not written by now will not come.
+		if s.finishedAtPrompt(ctx, pane, startFile) {
+			if promptSince.IsZero() {
+				promptSince = time.Now()
+			} else if time.Since(promptSince) >= exitStatusGrace {
+				return unreadableOutcome(outFile), nil
+			}
+		} else {
+			promptSince = time.Time{}
 		}
 		if time.Now().After(startBy) && s.neverStarted(ctx, pane, startFile) {
 			return nil, errNotStarted
@@ -1979,6 +2002,52 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 				partial = strings.TrimRight(string(data), "\n")
 			}
 			return &execOutcome{Output: partial, ExitCode: -1, TimedOut: true}, nil
+		}
+	}
+}
+
+// unreadableOutcome is the result for a command that finished without a status
+// that can be read: exit code -1, whatever output it left, and the reason.
+func unreadableOutcome(outFile string) *execOutcome {
+	partial := ""
+	if data, err := os.ReadFile(outFile); err == nil {
+		partial = strings.TrimRight(string(data), "\n")
+	}
+	return &execOutcome{Output: partial, ExitCode: -1, StatusUnreadable: true}
+}
+
+// statusUnreadableNote is the text a result with StatusUnreadable carries.
+const statusUnreadableNote = "the command finished, but its exit status could not be read; " +
+	"exitCode -1 does not say whether it failed"
+
+// finishedAtPrompt reports whether a command has started and its shell is
+// reading at a prompt again, which is the shell's word that the pipeline is
+// over. Only a positive or quiet reading counts: a pane the probe cannot read
+// never reports this, and its wait ends on the status or on its timeout.
+func (s *slots) finishedAtPrompt(ctx context.Context, pane paneRef, startFile string) bool {
+	if _, err := os.Stat(startFile); err != nil {
+		return false
+	}
+	state, err := s.b.Foreground(ctx, pane)
+	if err != nil {
+		return false
+	}
+	switch readPrompt(state) {
+	case promptEditing, promptCanonical, promptQuiet:
+		return true
+	}
+	return false
+}
+
+// awaitPipelineEnd waits, for at most outputSettleTimeout, until the pane's
+// own process owns the tty again. The status is written inside the pipeline,
+// while tee may still be copying the last of the output, and tee has written
+// everything once the pipeline has handed the tty back.
+func (s *slots) awaitPipelineEnd(ctx context.Context, pane paneRef) {
+	deadline := time.Now().Add(outputSettleTimeout)
+	for !s.shellOwnsTTY(ctx, pane) && time.Now().Before(deadline) {
+		if !sleepCtx(ctx, execPollInterval) {
+			return
 		}
 	}
 }
@@ -2010,46 +2079,99 @@ func (s *slots) neverStarted(ctx context.Context, pane paneRef, startFile string
 	return errors.Is(err, os.ErrNotExist)
 }
 
-// readExitFile reads the exit status a wrapped command wrote. ok is false until
-// the file holds a number: the shell creates the file before it writes to it,
-// so an empty read is a write still in progress, not a status.
-func readExitFile(path string) (code int, ok bool) {
+// exitRead is what the status file says so far.
+type exitRead int
+
+const (
+	// exitPending: no file, or a line still being written.
+	exitPending exitRead = iota
+	// exitWritten: a whole line holding a number.
+	exitWritten
+	// exitUnreadable: a whole line that is not a number.
+	exitUnreadable
+)
+
+// readExitFile reads the exit status a wrapped command wrote. A line counts as
+// written once it ends in a newline, which echo always writes last: before
+// that the shell may have created the file and not yet filled it. A written
+// line that is not a number will never become one.
+func readExitFile(path string) (code int, state exitRead) {
 	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
+	if err != nil || len(data) == 0 || data[len(data)-1] != '\n' {
+		return 0, exitPending
 	}
 	code, err = strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
-		return 0, false
+		return 0, exitUnreadable
 	}
-	return code, true
+	return code, exitWritten
+}
+
+// paneShell names the shell a pane runs, read from the pane's own process: its
+// command line where the platform gives it, otherwise its command name while it
+// is in the foreground. It is empty when the process cannot be read or is not
+// a shell the wrapper can be spelled for.
+func (s *slots) paneShell(ctx context.Context, pane paneRef) string {
+	state, err := s.b.Foreground(ctx, pane)
+	if err != nil || state == nil || state.PanePID <= 0 {
+		return ""
+	}
+	if argv, err := processArgs(state.PanePID); err == nil {
+		return shellFromArgv(argv)
+	}
+	if state.ForegroundPID == state.PanePID {
+		return shellFromArgv([]string{state.ForegroundCmd})
+	}
+	return ""
+}
+
+// shellFromArgv names the shell a command line runs: the base of argv[0],
+// without the dash a login shell carries. A program that is not a shell, and
+// csh or tcsh, whose syntax neither wrapper fits, name none.
+func shellFromArgv(argv []string) string {
+	if len(argv) == 0 {
+		return ""
+	}
+	name := strings.TrimPrefix(filepath.Base(argv[0]), "-")
+	switch name {
+	case "bash", "zsh", "fish", "sh", "dash", "ksh":
+		return name
+	}
+	return ""
+}
+
+// wrapperShell is the shell the wrapper is spelled for: the pane's real one
+// when it could be named, and the -shell-type flag only when it could not.
+func wrapperShell(real, flag string) string {
+	if real != "" {
+		return real
+	}
+	return flag
 }
 
 // wrapCommand builds the line execInPane types: mark the start, run the command
 // with stdout and stderr through tee into outFile (so it also shows in the
 // pane), and write the command's own exit status, not tee's, into exitFile.
 //
-// The status idiom is the shell's own, which is why the shell type is a server
-// flag: zsh's $pipestatus is 1-indexed, bash's $PIPESTATUS 0-indexed, and fish
-// only sets $pipestatus inside a pipeline, so there the status is captured
-// before the pipe instead. printf with an empty format is the one way to create
-// an empty file that all three accept.
+// The status is taken inside the group, before the pipe, so the form needs
+// nothing but $? and works in every POSIX shell — bash, zsh, sh, dash, ksh —
+// whatever their pipeline-status arrays are called. The command runs through
+// eval, quoted as one word, so that one ending in a comment or in & still
+// leaves the status write as a command of its own, and the whole wrapper stays
+// one line. The eval runs in a subshell of its own, so a command that calls
+// exit ends that subshell and its status is still written; the group is a
+// pipeline's subshell already, so nothing else about the command changes. fish has neither $? nor { }, so it gets begin/end and $status.
+// printf with an empty format is the one way to create an empty file that all
+// of them accept.
 func wrapCommand(shell, command, startFile, outFile, exitFile string) string {
-	switch shell {
-	case "fish":
+	if shell == "fish" {
 		return fmt.Sprintf(
-			`printf '' > %s; begin; %s; set _exit $status; end 2>&1 | tee %s; echo $_exit > %s`,
-			startFile, command, outFile, exitFile,
-		)
-	case "zsh":
-		return fmt.Sprintf(
-			`printf '' > %s; { %s } 2>&1 | tee %s; echo ${pipestatus[1]} > %s`,
-			startFile, command, outFile, exitFile,
-		)
-	default: // bash
-		return fmt.Sprintf(
-			`printf '' > %s; { %s; } 2>&1 | tee %s; echo ${PIPESTATUS[0]} > %s`,
-			startFile, command, outFile, exitFile,
+			`printf '' > %s; begin; %s; echo $status > %s; end 2>&1 | tee %s`,
+			startFile, command, exitFile, outFile,
 		)
 	}
+	return fmt.Sprintf(
+		`printf '' > %s; { (eval %s); echo $? > %s; } 2>&1 | tee %s`,
+		startFile, shellQuote(command), exitFile, outFile,
+	)
 }

@@ -523,16 +523,22 @@ single call.
 tmux-mcp [--shell-type bash|zsh|fish] [--backend auto|tmux|herdr] [--channel] [--version]
 ```
 
-`--shell-type` controls how `execute-command` captures exit codes from a pipeline:
+`execute-command` captures a command's exit status with a wrapper spelled for the shell
+the pane really runs, read from the pane's own process: one POSIX form, `$?` taken
+before the pipe to `tee`, for bash, zsh, sh, dash and ksh, and `$status` for fish. The
+flag does not have to match your panes.
 
-| Shell | Exit code expression |
+`--shell-type` is the fallback, used only when a pane's shell cannot be identified — the
+process cannot be read, or the program is not one of those shells:
+
+| `--shell-type` | Wrapper |
 |---|---|
-| `bash` (default) | `${PIPESTATUS[0]}` |
-| `zsh` | `${pipestatus[1]}` |
-| `fish` | `$status` captured before the pipe |
+| `bash` (default), `zsh` | the POSIX form |
+| `fish` | the fish form |
 
-Match this to the shell running inside your tmux panes. A mismatch causes
-`execute-command` to report exit code `0` for every command.
+When a command finishes without a status that can be read, `execute-command` returns
+`exitCode: -1` with `timedOut: false`, and a second text item in the result says the exit
+status could not be read.
 
 `--backend` selects the multiplexer. The default, `auto`, detects it at startup (see
 [Running under herdr](#running-under-herdr)); `tmux` or `herdr` forces one. The tools are
@@ -673,6 +679,7 @@ go test ./...          # full suite (tmux must be running)
 | `reclaim_test.go` | An unmarked user shell is never taken; a busy or TUI pane is never reclaimed; slot 1 survives a server restart |
 | `placement_test.go` | The placement table, slot by slot |
 | `shell_input_test.go` | Shells without a line editor or with an unknown name, C-c into a busy shell, named keys and multi-line text never reported as unsent, a reclaimed pane's directory, a new pane with no record |
+| `exec_shell_test.go` | The exit status follows the pane's real shell under tmux and herdr, whatever `--shell-type` says; an unreadable status ends the wait with -1 |
 | `strict_readiness_test.go` | A banner then a quiet rc is not a prompt; a slow rc never loses a retried command; a pane that never gets ready is closed; a failed reclaim is unslotted; an unstarted command is never typed twice; an editor switched back on still waits; canonical shells are never reclaimed |
 | `detect_test.go`, `detect_probe_test.go` | The detection rule: both claims present, and a lone claim the ancestry check disproves or cannot run |
 | `backend_herdr_test.go`, `herdr_send_test.go` | The same scenarios against a private herdr session (skipped without herdr); text starting with a dash |
@@ -683,14 +690,12 @@ go test ./...          # full suite (tmux must be running)
 
 ## Troubleshooting
 
-### execute-command always returns exit code 0
+### execute-command returns exit code -1 with timedOut false
 
-`--shell-type` does not match the shell in the pane.
-
-```bash
-tmux-mcp --shell-type=zsh    # for zsh panes
-tmux-mcp --shell-type=fish   # for fish panes
-```
+The command finished, but its exit status could not be read; the result's second text
+says so. The pane's shell could not be identified and `--shell-type` names the wrong
+wrapper for it (`--shell-type=fish` for a fish pane, `bash` or `zsh` for any other), or
+something removed or overwrote the status file under `/tmp` while the command ran.
 
 ### A tool says "slot N does not exist"
 

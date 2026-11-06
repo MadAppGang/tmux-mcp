@@ -58,10 +58,20 @@ func skipWithoutHerdr(t *testing.T) {
 // Cleanup stops that server and deletes that session, and nothing else.
 func startHerdrSession(t *testing.T) *herdrSession {
 	t.Helper()
+	return startHerdrSessionEnv(t, nil)
+}
+
+// startHerdrSessionEnv is startHerdrSession with extra environment for the
+// herdr server, such as the SHELL its panes run.
+func startHerdrSessionEnv(t *testing.T, extraEnv []string) *herdrSession {
+	t.Helper()
 	skipWithoutHerdr(t)
 
 	h := &herdrSession{name: fmt.Sprintf("tmuxmcp-test-%d-%d", os.Getpid(), herdrSessionSeq.Add(1))}
 	server := exec.Command("herdr", "--session", h.name, "server")
+	if len(extraEnv) > 0 {
+		server.Env = append(os.Environ(), extraEnv...)
+	}
 	var serverLog bytes.Buffer
 	server.Stdout, server.Stderr = &serverLog, &serverLog
 	if err := server.Start(); err != nil {

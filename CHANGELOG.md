@@ -5,6 +5,27 @@ All notable changes to tmux-mcp are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] — 2026-11-06
+
+Same tools, same arguments, same result shapes.
+
+### Fixed
+
+- **`execute-command` no longer hangs when the pane's shell is not the one
+  `--shell-type` names.** The exit-status wrapper was spelled for the flag, so a zsh pane
+  under `--shell-type bash` wrote an empty status (zsh has no `PIPESTATUS`), a bash pane
+  under `--shell-type zsh` never closed its `{ }` group, and the call waited forever.
+  Neither tmux nor herdr lets the server choose a pane's shell. The wrapper now follows
+  the pane's real shell, read from the pane's own process: one POSIX form that takes `$?`
+  before the pipe, for bash, zsh, sh, dash and ksh, and a fish form for fish.
+  `--shell-type` is still accepted, and is now only the fallback for a pane whose shell
+  cannot be identified.
+- **A status that cannot be read ends the wait.** A status line that is not a number,
+  or no status line at all once the command is over and its shell is back at the prompt,
+  now ends the call with `exitCode: -1` and `timedOut: false`, and a second text item says
+  the exit status could not be read. A long-running command still runs as long as it
+  runs.
+
 ## [2.1.0] — 2026-11-06
 
 Same tools, same arguments, same result shapes. Three slot defects are fixed, and the

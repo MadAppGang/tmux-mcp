@@ -1,0 +1,281 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// ---- The exit status follows the pane's real shell ----
+
+// execCallBudget bounds every execute-command call these tests make. A call
+// that hangs fails on the bound instead of hanging the suite.
+const execCallBudget = 15
+
+// execOutcomeJSON is the part of execute-command's result these tests read.
+type execOutcomeJSON struct {
+	Output   string `json:"output"`
+	ExitCode int    `json:"exitCode"`
+	TimedOut bool   `json:"timedOut"`
+}
+
+// runExec calls execute-command with a bound and decodes its result. It
+// returns the decoded JSON and every text the call returned.
+func runExec(t *testing.T, c *mcpClient, args map[string]any) (execOutcomeJSON, []string) {
+	t.Helper()
+	args["timeoutSeconds"] = execCallBudget
+	started := time.Now()
+	res := callTool(t, c, "execute-command", args)
+	took := time.Since(started)
+	var texts []string
+	for _, item := range res.Content {
+		texts = append(texts, item.Text)
+	}
+	if res.IsError {
+		t.Fatalf("execute-command %q failed after %v: %s", args["command"], took.Round(time.Millisecond),
+			strings.Join(texts, "\n"))
+	}
+	var out execOutcomeJSON
+	if err := json.Unmarshal([]byte(texts[0]), &out); err != nil {
+		t.Fatalf("decode %s: %v", texts[0], err)
+	}
+	if out.TimedOut {
+		t.Fatalf("execute-command %q did not finish within %ds: %s", args["command"], execCallBudget, texts[0])
+	}
+	return out, texts
+}
+
+// requireExitCodes runs a failing and a succeeding command in a slot and checks
+// both exit codes and the output.
+func requireExitCodes(t *testing.T, c *mcpClient, slot int) {
+	t.Helper()
+	out, _ := runExec(t, c, map[string]any{"slot": slot, "command": "false"})
+	if out.ExitCode != 1 {
+		t.Errorf("false returned exit code %d, want 1", out.ExitCode)
+	}
+	out, _ = runExec(t, c, map[string]any{"slot": slot, "command": "exit 3"})
+	if out.ExitCode != 3 {
+		t.Errorf("exit 3 returned exit code %d, want 3", out.ExitCode)
+	}
+	out, _ = runExec(t, c, map[string]any{"slot": slot, "command": "echo hi"})
+	if out.ExitCode != 0 || strings.TrimSpace(out.Output) != "hi" {
+		t.Errorf("echo hi returned exit code %d and output %q, want 0 and \"hi\"", out.ExitCode, out.Output)
+	}
+}
+
+// TestExitStatusFollowsThePanesShell runs execute-command in a pane whose shell
+// is not the one -shell-type names, both ways round, and in dash, which the
+// flag cannot name at all. Each must report the command's real exit status.
+//
+// REGRESSION: the exit-status wrapper was spelled for -shell-type, not the pane's shell, so a mismatch wrote an empty status and execute-command waited forever
+func TestExitStatusFollowsThePanesShell(t *testing.T) {
+	bash, err := lookBash()
+	if err != nil {
+		t.Skip(err)
+	}
+	cases := []struct{ name, flag, command string }{
+		{"a bash pane under -shell-type zsh", "zsh", "exec " + bash + " --norc --noprofile"},
+		{"a zsh pane under -shell-type bash", "bash", ""},
+		{"a dash pane under -shell-type zsh", "zsh", "exec /bin/dash"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if strings.Contains(tc.command, "dash") {
+				if _, err := os.Stat("/bin/dash"); err != nil {
+					t.Skip("dash is not installed")
+				}
+			}
+			c, _ := agentPaneFixture(t, "--shell-type="+tc.flag)
+			if tc.command != "" {
+				useDefaultCommand(t, tc.command)
+			} else {
+				requireZshPanes(t)
+			}
+			requireExitCodes(t, c, 1)
+		})
+	}
+}
+
+// TestHerdrExitStatusFollowsThePanesShell is the same mismatch under herdr: its
+// panes run the server's $SHELL, here bash, while -shell-type says zsh.
+//
+// REGRESSION: under herdr a bash pane with -shell-type zsh wrote an empty status and execute-command waited forever
+func TestHerdrExitStatusFollowsThePanesShell(t *testing.T) {
+	bash, err := lookBash()
+	if err != nil {
+		t.Skip(err)
+	}
+	h := startHerdrSessionEnv(t, []string{"SHELL=" + bash})
+	c := startMCPClient(t, []string{
+		"HERDR_ENV=1",
+		"HERDR_PANE_ID=" + h.agent,
+		"HERDR_TAB_ID=" + h.tab,
+		"HERDR_WORKSPACE_ID=" + h.workspace,
+		"HERDR_SESSION=" + h.name,
+		"HERDR_SOCKET_PATH=" + h.socket,
+		"SHELL=" + bash,
+	}, "--backend=herdr", "--shell-type=zsh")
+	requireExitCodes(t, c, 1)
+}
+
+// ---- A status that cannot be read ends the wait ----
+
+// spoilExitFile finds the exit file of the command running in a pane — from
+// the argv of the tee the wrapper starts there — and spoils it before the
+// command finishes. Only that pane's own process tree is searched, so no other
+// server's files are touched.
+func spoilExitFile(t *testing.T, pane string, spoil func(exitFile string) error) <-chan error {
+	t.Helper()
+	panePID := tmuxExec(t, "display-message", "-p", "-t", pane, "#{pane_pid}")
+	done := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if out := teeOutFile(panePID); out != "" {
+				done <- spoil(strings.TrimSuffix(out, ".out") + ".exit")
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		done <- fmt.Errorf("no tee appeared under pane process %s", panePID)
+	}()
+	return done
+}
+
+// teeOutFile returns the output file of a tee running below a process, or "".
+func teeOutFile(rootPID string) string {
+	out, err := exec.Command("ps", "-A", "-o", "pid=,ppid=,args=").Output()
+	if err != nil {
+		return ""
+	}
+	parent := map[string]string{}
+	args := map[string][]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		parent[f[0]], args[f[0]] = f[1], f[2:]
+	}
+	for pid, argv := range args {
+		if filepath.Base(argv[0]) != "tee" || len(argv) < 2 || !strings.HasPrefix(argv[1], "/tmp/tmux-mcp-") {
+			continue
+		}
+		for p, hops := parent[pid], 0; p != "" && hops < 16; p, hops = parent[p], hops+1 {
+			if p == rootPID {
+				return argv[1]
+			}
+		}
+	}
+	return ""
+}
+
+// TestUnreadableExitStatusEndsTheWait spoils the exit file of a running
+// command: once with a junk line it cannot overwrite, once with a directory
+// where the file should be, so no status line ever comes. Both commands
+// finish, so the call must end promptly with exit code -1 and say why.
+//
+// REGRESSION: an exit file that never held a number kept execute-command polling forever
+func TestUnreadableExitStatusEndsTheWait(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		spoil func(string) error
+	}{
+		{"a junk status line", func(path string) error {
+			if err := os.WriteFile(path, []byte("junk\n"), 0o644); err != nil {
+				return err
+			}
+			return os.Chmod(path, 0o444)
+		}},
+		{"no status line", func(path string) error { return os.Mkdir(path, 0o755) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, self := agentPaneFixture(t)
+			runExec(t, c, map[string]any{"command": "true"})
+			spoiled := spoilExitFile(t, slotPaneID(t, self, 1), tc.spoil)
+
+			started := time.Now()
+			out, texts := runExec(t, c, map[string]any{"command": "sleep 2"})
+			if err := <-spoiled; err != nil {
+				t.Fatalf("the fixture could not spoil the exit file: %v", err)
+			}
+			if took := time.Since(started); took > 10*time.Second {
+				t.Errorf("the call took %v to give up on a finished command", took.Round(time.Millisecond))
+			}
+			if out.ExitCode != -1 {
+				t.Errorf("exit code %d, want -1 for a status that could not be read", out.ExitCode)
+			}
+			if !strings.Contains(strings.Join(texts, "\n"), "exit status could not be read") {
+				t.Errorf("the call did not say the exit status could not be read: %q", texts)
+			}
+		})
+	}
+}
+
+// TestReadExitFile pins the three states of the status file.
+func TestReadExitFile(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name, data string
+		missing    bool
+		state      exitRead
+		code       int
+	}{
+		{name: "no file yet", missing: true, state: exitPending},
+		{name: "an empty file", data: "", state: exitPending},
+		{name: "a number still being written", data: "3", state: exitPending},
+		{name: "an empty line", data: "\n", state: exitUnreadable},
+		{name: "a line that is not a number", data: "abc\n", state: exitUnreadable},
+		{name: "a status", data: "3\n", state: exitWritten, code: 3},
+		{name: "a status with spaces", data: " 0 \n", state: exitWritten, code: 0},
+	}
+	for i, tc := range cases {
+		path := filepath.Join(dir, "exit-"+string(rune('a'+i)))
+		if !tc.missing {
+			if err := os.WriteFile(path, []byte(tc.data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		code, state := readExitFile(path)
+		if state != tc.state || (state == exitWritten && code != tc.code) {
+			t.Errorf("%s: readExitFile = (%d, %v), want (%d, %v)", tc.name, code, state, tc.code, tc.state)
+		}
+	}
+}
+
+// TestShellFromArgv pins how a pane's real shell is named from its command
+// line, and that a program which is not a shell names none.
+func TestShellFromArgv(t *testing.T) {
+	cases := []struct {
+		argv []string
+		want string
+	}{
+		{[]string{"-zsh"}, "zsh"},
+		{[]string{"/bin/bash", "--norc"}, "bash"},
+		{[]string{"/opt/homebrew/bin/fish", "-l"}, "fish"},
+		{[]string{"/bin/dash"}, "dash"},
+		{[]string{"perl", "xsh.pl"}, ""},
+		{nil, ""},
+	}
+	for _, tc := range cases {
+		if got := shellFromArgv(tc.argv); got != tc.want {
+			t.Errorf("shellFromArgv(%q) = %q, want %q", tc.argv, got, tc.want)
+		}
+	}
+}
+
+// TestWrapperForUnknownShellUsesTheFlag pins the fallback: a pane whose
+// shell cannot be named gets the wrapper -shell-type names.
+func TestWrapperForUnknownShellUsesTheFlag(t *testing.T) {
+	if got := wrapperShell("", "fish"); got != "fish" {
+		t.Errorf("wrapperShell(\"\", fish) = %q, want fish", got)
+	}
+	if got := wrapperShell("bash", "fish"); got != "bash" {
+		t.Errorf("wrapperShell(bash, fish) = %q, want bash: the real shell wins", got)
+	}
+}
