@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -47,7 +48,7 @@ func slotFixture(t *testing.T) (*slots, paneRef) {
 
 	self := tmuxExec(t, "display-message", "-p", "-t", name, "#{pane_id}")
 	t.Setenv("TMUX_PANE", self)
-	return newSlots(newTmuxBackend(newTmuxClient("bash"))), newPaneRef(self)
+	return newSlots(newTmuxBackend(newTmuxClient())), newPaneRef(self)
 }
 
 // paneSize returns a pane's width and height in cells, which is how a test sees
@@ -243,68 +244,58 @@ func TestSlotPlacement(t *testing.T) {
 	}
 }
 
-// TestSlotTwoNeverSplitsAnAdoptedPane is the placement table's owner rule, at
-// the one point where the table and the policy disagreed.
+// TestSlotTwoNeverSplitsAnAdoptedPane is the placement table's owner rule.
 //
 // Slot 2 is normally carved out of the slot-1 pane, so the two helpers stack in
-// a column instead of squeezing the agent's own pane a second time. But the
-// slot-1 pane may be one the agent ADOPTED from the user, and an acquired pane
-// is the user's real estate: halving it rearranges a layout they built by hand.
-// anchorOrSelf states that policy and enforces it for every slot from 4 up; the
-// slot-2 fast path looked its anchor up by slot and liveness alone, so the rule
-// held only in windows where nothing had been adopted — which is to say, not in
-// the windows where it matters.
+// a column. An older version of this server could ADOPT one of the user's
+// shells as slot 1 and mark it ownerAcquired, and windows still carry such
+// records. That pane is the user's real estate: halving it rearranges a layout
+// they built by hand. So a slot-1 holder that is not agent-owned is not an
+// anchor, and slot 2 goes where slot 1 would have gone — right of the agent.
 //
-// The geometry of the ADOPTED pane is the assertion, because a split is visible
-// there and nowhere else: tmux halves the anchor. Its size before and after is
-// therefore the whole question, and it is asked of tmux rather than of the
-// registry. Where slot 2 does land is checked too, so a placement that avoided
-// the user's pane by putting the helper somewhere absurd is not read as success.
+// The legacy record is written by hand, because nothing in this server writes
+// one any more. The geometry of the user's pane is the assertion, asked of tmux
+// rather than of the registry, and where slot 2 lands is checked too, so a
+// placement that avoided the user's pane by putting the helper somewhere absurd
+// is not read as success.
 func TestSlotTwoNeverSplitsAnAdoptedPane(t *testing.T) {
 	sl, self := slotFixture(t)
 	ctx := context.Background()
 
-	// The user's own pane, made with raw tmux so the server has never marked it.
+	// The user's own pane, made with raw tmux and carrying a legacy acquired
+	// slot-1 record.
 	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
 	waitForClientPaneIdle(t, sl.b, usersPane)
-
-	tgt7, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
-	if err != nil {
-		t.Fatalf("resolve slot 1: %v", err)
-	}
-	one, _, _, owner := tgt7.Ref, tgt7.Slot, tgt7.Created, tgt7.Owner
-	if one != usersPane || owner != ownerAcquired {
-		t.Fatalf("the fixture did not exercise adoption: slot 1 resolved to %s (owner %q), want the "+
-			"user's pane %s adopted as %q", one.target(), owner, usersPane.target(), ownerAcquired)
+	if err := sl.b.Claim(ctx, usersPane, ownerAcquired, slotDefault); err != nil {
+		t.Fatalf("write the legacy acquired mark: %v", err)
 	}
 	beforeW, beforeH := paneSize(t, usersPane)
 
-	tgt8, err := sl.resolveHelper(ctx, 2, kindUnstated)
+	tgt, err := sl.resolveHelper(ctx, 2, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolve slot 2: %v", err)
 	}
-	two, slot, _, _ := tgt8.Ref, tgt8.Slot, tgt8.Created, tgt8.Owner
-	if slot != 2 {
-		t.Errorf("slot 2 resolution reported slot %d", slot)
+	if tgt.Slot != 2 {
+		t.Errorf("slot 2 resolution reported slot %d", tgt.Slot)
 	}
+	two := tgt.Ref
 	if two == usersPane || two == self {
 		t.Fatalf("slot 2 resolved to %s, which is the user's pane or the agent's own", two.target())
 	}
 
 	if afterW, afterH := paneSize(t, usersPane); afterW != beforeW || afterH != beforeH {
-		t.Errorf("the user's adopted pane %s went from %dx%d to %dx%d when slot 2 was opened: it "+
-			"was split in half to make room. We may type into a pane we adopted; we may not "+
-			"rearrange the layout it sits in, which is the rule anchorOrSelf applies one function "+
-			"away", usersPane.target(), beforeW, beforeH, afterW, afterH)
+		t.Errorf("the user's pane %s went from %dx%d to %dx%d when slot 2 was opened: it was "+
+			"split in half to make room. A pane the user opened is never an anchor",
+			usersPane.target(), beforeW, beforeH, afterW, afterH)
 	}
 
-	// And it went where the fallback says it should: out of the agent's own pane,
-	// there being no pane in this window that the server made.
+	// With no agent-made slot 1 to split, slot 2 takes slot 1's place: beside the
+	// agent's own pane, on its top row.
 	selfLeft, selfTop := paneOrigin(t, self)
 	twoLeft, twoTop := paneOrigin(t, two)
-	if twoLeft != selfLeft || twoTop <= selfTop {
-		t.Errorf("slot 2 landed at column %d row %d; with no agent-made pane to split it belongs "+
-			"below the agent's own pane at column %d row %d", twoLeft, twoTop, selfLeft, selfTop)
+	if twoLeft <= selfLeft || twoTop != selfTop {
+		t.Errorf("slot 2 landed at column %d row %d; with no agent-made slot 1 it belongs right of "+
+			"the agent's own pane at column %d row %d", twoLeft, twoTop, selfLeft, selfTop)
 	}
 }
 
@@ -407,7 +398,7 @@ func TestSlotWitnessSurvivesSessionScopedLeak(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	sl := newSlots(newTmuxBackend(newTmuxClient("bash")))
+	sl := newSlots(newTmuxBackend(newTmuxClient()))
 	ctx := context.Background()
 
 	name := uniqueSession(t)
@@ -448,7 +439,7 @@ func TestSlotWitnessSurvivesSessionScopedLeak(t *testing.T) {
 	}
 }
 
-// ---- Acquisition ----
+// ---- Reclaim, and never adopt ----
 
 // waitForClientPaneIdle polls the client directly, for the tests that have no
 // MCP server to ask.
@@ -456,7 +447,7 @@ func waitForClientPaneIdle(t *testing.T, b Backend, pane paneRef) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if state, err := b.Foreground(context.Background(), pane); err == nil && paneIsIdleShell(state) {
+		if state, err := b.Foreground(context.Background(), pane); err == nil && paneIsReadyShell(state) {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -464,154 +455,182 @@ func waitForClientPaneIdle(t *testing.T, b Backend, pane paneRef) {
 	t.Fatalf("pane %s did not settle at an idle shell prompt within 5s", pane.target())
 }
 
-// TestAcquireIdleUnownedPane covers the half of this design that touches panes
-// the server did not create.
+// TestReadyPredicate pins what "ready to read input" means, from the facts a
+// backend reports. The shell in the foreground is necessary and not enough: a
+// shell sourcing its rc is in the foreground with its own pid and is not
+// reading, and that is the state in which typed keys were thrown away.
+func TestReadyPredicate(t *testing.T) {
+	prompt := PaneState{PanePID: 10, ForegroundPID: 10, ForegroundCmd: "zsh", IsAlive: true,
+		InputKnown: true, LineEditing: true}
+	with := func(edit func(*PaneState)) *PaneState {
+		s := prompt
+		edit(&s)
+		return &s
+	}
+	cases := []struct {
+		name  string
+		state *PaneState
+		want  bool
+	}{
+		{"an idle prompt whose line editor is reading", &prompt, true},
+		{"the same shell while its rc runs (canonical mode)", with(func(s *PaneState) { s.LineEditing = false }), false},
+		{"typed bytes still queued", with(func(s *PaneState) { s.PendingInput = 17 }), false},
+		{"the tty probe did not answer", with(func(s *PaneState) { s.InputKnown = false }), false},
+		{"vim in the foreground (non-canonical, not the shell)", with(func(s *PaneState) {
+			s.ForegroundPID, s.ForegroundCmd = 11, "vim"
+		}), false},
+		{"sleep in the foreground", with(func(s *PaneState) {
+			s.ForegroundPID, s.ForegroundCmd, s.LineEditing = 12, "sleep", false
+		}), false},
+		{"a dead pane", with(func(s *PaneState) { s.IsAlive = false }), false},
+		{"dash, which has no line editor, at its prompt", with(func(s *PaneState) {
+			s.ForegroundCmd, s.LineEditing = "dash", false
+		}), true},
+		{"a login zsh", with(func(s *PaneState) { s.ForegroundCmd = "-zsh" }), true},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		if got := paneIsReadyShell(tc.state); got != tc.want {
+			t.Errorf("%s: paneIsReadyShell = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestIdleUnmarkedPaneIsNeverAdopted is the never-adopt rule at the policy
+// layer, where adoption used to live.
 //
-// The user already has an empty shell open beside the agent. Creating a second
-// one next to it is the behaviour that makes an agent's terminal fill with
-// identical idle splits, so an idle, unclaimed, same-user shell is adopted
-// instead — and marked "acquired" rather than "agent", because the difference
-// decides whether close-pane may kill it later.
-func TestAcquireIdleUnownedPane(t *testing.T) {
+// The user already has an idle shell open beside the agent. It carries no mark
+// of ours, so it is the user's: resolution must open a new pane, and must leave
+// the user's pane without a record. TestUnmarkedIdleUserShellIsNeverAdopted
+// covers the same rule through the tool surface.
+func TestIdleUnmarkedPaneIsNeverAdopted(t *testing.T) {
 	sl, self := slotFixture(t)
 	ctx := context.Background()
 
-	// The user's own pane: made with raw tmux, so the server never marked it.
 	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
 	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	tgt11, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
+	tgt, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
-	pane, _, created, _ := tgt11.Ref, tgt11.Slot, tgt11.Created, tgt11.Owner
-	if pane != usersPane {
-		t.Fatalf("resolveHelper returned %s instead of adopting the idle pane %s",
-			pane.target(), usersPane.target())
+	if tgt.Ref == usersPane {
+		t.Fatalf("resolveHelper adopted the user's idle pane %s", usersPane.target())
 	}
-	if !created {
-		t.Error("an adopted pane is new to the slot, so created must be true")
+	if !tgt.Created || tgt.Owner != ownerAgent {
+		t.Errorf("slot 1 came back created=%v owner=%q, want a new pane of ours", tgt.Created, tgt.Owner)
 	}
-
-	rec, found := recordFor(t, sl, self, usersPane)
-	if !found {
-		t.Fatal("adopted pane carries no registry record")
-	}
-	if rec.Owner != ownerAcquired {
-		t.Errorf("adopted pane is marked %q, want %q — the owner kind is what stops close-pane "+
-			"killing a pane the user opened", rec.Owner, ownerAcquired)
-	}
-	if rec.Slot != slotDefault {
-		t.Errorf("adopted pane carries slot %d, want %d", rec.Slot, slotDefault)
-	}
-
-	// And it must not be adopted twice into different slots.
-	if _, ok := sl.b.Records(ctx, self); ok != nil {
-		t.Fatalf("Records: %v", ok)
+	if rec, found := recordFor(t, sl, self, usersPane); found {
+		t.Errorf("the user's pane was marked anyway: %+v", rec)
 	}
 }
 
-// TestFailedAdoptionLeavesNoPartialMark covers the state a half-written
-// adoption used to leave on one of the USER's panes.
+// failingClaimOnce is a real Backend whose first Claim writes only the prefix a
+// failed slot write leaves — witness and owner, no slot — and reports failure.
+type failingClaimOnce struct {
+	Backend
+	failed bool
+}
+
+func (f *failingClaimOnce) Claim(ctx context.Context, p paneRef, owner string, slot int) error {
+	if !f.failed {
+		f.failed = true
+		_ = f.Backend.Claim(ctx, p, owner, 0)
+		return errors.New("injected: the slot write failed")
+	}
+	return f.Backend.Claim(ctx, p, owner, slot)
+}
+
+// failingSetSlot is a real Backend that cannot write a slot marker.
+type failingSetSlot struct{ Backend }
+
+func (failingSetSlot) SetSlot(context.Context, paneRef, int) error {
+	return errors.New("injected: the slot write failed")
+}
+
+// TestFailedSlotWriteDoesNotStrandAPane covers the pane a create leaves behind
+// when its slot write fails.
 //
-// markPaneOwnedAs writes witness → owner → slot and stops at the first failure,
-// so a context that expires or one transient tmux error leaves a prefix behind.
-// witness + owner with no slot is a record parseRegistryLine accepts, and it is
-// the worst record this server can produce on a pane it does not own: canAcquire
-// refuses any pane whose owner mark is set at all, so it can never be adopted
-// again; no slot lookup matches it, so it is never reused; and
-// close-pane({slot:"all"}) sweeps slotted records only, so no teardown ever
-// comes back for it. One of the user's shells, wearing our label, invisible to
-// every tool in this server — and nothing but the failing call ever knows.
+// The pane exists and is agent-owned, and no slot points at it. That used to be
+// a dead end: reuse matches on the slot number, so every later request opened
+// one more pane beside it. Now the next resolution reclaims it, and the window
+// heals instead of growing.
 //
-// # How the failure is produced
-//
-// By handing the adoption a context that can write nothing, against a pane
-// already carrying the prefix the first two writes leave. Interrupting a real
-// markPaneOwnedAs *between* its second and third tmux calls is not something a
-// test can arrange without winning a race measured in milliseconds, and a test
-// that has to win a race is one that reports green on a bad day. The prefix is
-// written by markPaneOwnedAs itself with slot 0, so it is the genuine article
-// rather than a hand-built approximation, and what is asserted is the property
-// that matters either way: after an adoption that failed, the pane carries
-// nothing of ours and can be adopted again.
-//
-// It also pins the rollback's detached context, which is not an optimisation. A
-// context deadline is the likeliest reason the mark failed in the first place;
-// a cleanup issued on that same dead context is three tmux commands that never
-// run, and the repair would be missing in exactly the case that motivates it.
-// This test's context is cancelled, so a rollback that reused it leaves the
-// markers in place and the assertions below go red.
-//
-// The happy path runs first so that an adoption which simply always fails
-// cannot pass this test.
-func TestFailedAdoptionLeavesNoPartialMark(t *testing.T) {
-	sl, self := slotFixture(t)
+// The second half is reclaim's own failure: a candidate whose slot write fails
+// is skipped rather than handed back, because a pane returned without its slot
+// would be found by nothing on the next call — and its record is left as it was.
+func TestFailedSlotWriteDoesNotStrandAPane(t *testing.T) {
+	_, self := slotFixture(t)
 	ctx := context.Background()
+	window := tmuxExec(t, "display-message", "-p", "-t", self.target(), "#{window_id}")
+	real := newTmuxBackend(newTmuxClient())
+	sl := newSlots(&failingClaimOnce{Backend: real})
 
-	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
-	waitForClientPaneIdle(t, sl.b, usersPane)
-
-	if !sl.adoptCandidateLocked(ctx, usersPane, slotDefault) {
-		t.Fatalf("adoption of the idle pane %s failed outright; the failure path below would then "+
-			"be the only thing this test exercises", usersPane.target())
+	first, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
+	if err != nil {
+		t.Fatalf("first resolveHelper: %v", err)
 	}
-	rec, found := recordFor(t, sl, self, usersPane)
-	if !found || rec.Owner != ownerAcquired || rec.Slot != slotDefault {
-		t.Fatalf("a successful adoption left record %+v (found=%v), want owner %q slot %d",
-			rec, found, ownerAcquired, slotDefault)
+	if rec, found := recordFor(t, sl, self, first.Ref); !found || rec.Slot != 0 || rec.Owner != ownerAgent {
+		t.Fatalf("the fixture did not leave an unslotted agent pane: found=%v rec=%+v", found, rec)
 	}
 
-	// Back to an unclaimed pane, then to the prefix a mark interrupted after its
-	// second write leaves: witness and owner, no slot.
-	if err := sl.b.ClearMarks(ctx, usersPane); err != nil {
-		t.Fatalf("reset the pane: %v", err)
+	second, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
+	if err != nil {
+		t.Fatalf("second resolveHelper: %v", err)
 	}
-	if err := sl.b.Claim(ctx, usersPane, ownerAcquired, 0); err != nil {
-		t.Fatalf("write the partial mark: %v", err)
+	if second.Ref != first.Ref {
+		t.Errorf("the second resolution opened %s instead of reclaiming the stranded pane %s",
+			second.Ref.target(), first.Ref.target())
 	}
-
-	dead, cancel := context.WithCancel(ctx)
-	cancel()
-	if sl.adoptCandidateLocked(dead, usersPane, slotDefault) {
-		t.Fatal("adoption reported success on a cancelled context, so nothing was written and the " +
-			"pane was claimed anyway — every keystroke sent to it after this would be sent to a " +
-			"pane we cannot identify again")
+	if got := len(panesInWindow(t, window)); got != 2 {
+		t.Errorf("the window holds %d panes, want 2 (the agent's and one helper)", got)
+	}
+	if rec, _ := recordFor(t, sl, self, first.Ref); rec.Slot != slotDefault {
+		t.Errorf("the reclaimed pane carries slot %d, want %d", rec.Slot, slotDefault)
 	}
 
-	for _, opt := range []string{paneOptSlot, paneOptOwner, paneOptWitness} {
-		if got := tmuxExec(t, "display-message", "-t", usersPane.target(), "-p", "#{"+opt+"}"); got != "" {
-			t.Errorf("%s is still %q on %s after the adoption failed; the pane is stranded — no slot "+
-				"lookup matches it, close-pane({slot:\"all\"}) does not see it, and the owner mark "+
-				"stops it being adopted ever again", opt, got, usersPane.target())
-		}
+	// Reclaim whose own slot write fails: the candidate is skipped.
+	if err := real.SetSlot(ctx, first.Ref, 0); err != nil {
+		t.Fatalf("unslot the helper again: %v", err)
 	}
-	if !sl.canAcquire(ctx, usersPane, self) {
-		t.Error("the pane cannot be adopted again after a failed adoption; an attempt that did not " +
-			"succeed has to leave the pane exactly as unclaimed as it found it")
+	broken := newSlots(failingSetSlot{Backend: real})
+	third, err := broken.resolveHelper(ctx, slotDefault, kindUnstated)
+	if err != nil {
+		t.Fatalf("third resolveHelper: %v", err)
+	}
+	if third.Ref == first.Ref {
+		t.Error("reclaim returned a pane whose slot write failed; no later call could find it")
+	}
+	if rec, found := recordFor(t, sl, self, first.Ref); !found || rec.Slot != 0 || rec.Owner != ownerAgent {
+		t.Errorf("the skipped candidate's record changed: found=%v rec=%+v", found, rec)
 	}
 }
 
-// TestAcquireRejectsPaneRunningCat is the idleness half of the predicate, tested
-// through the signal that actually works on both platforms.
+// TestReclaimRejectsPaneRunningCat is the idleness half of the reclaim
+// predicate, on a pane that carries exactly the mark a reclaimable pane carries.
 //
 // A pane running `cat` is alive and looks calm, and on macOS it even reports
-// waitingForInput=true — the field this predicate deliberately does not use.
-// What distinguishes it is that the foreground process is no longer the shell,
-// which is what paneIsIdleShell tests. Adopting it would send the agent's
-// command into cat's stdin, where it would be echoed and never run.
-func TestAcquireRejectsPaneRunningCat(t *testing.T) {
+// waitingForInput=true. What distinguishes it is that the foreground process is
+// not the shell. Reclaiming it would send the agent's command into cat's stdin,
+// where it would be echoed and never run.
+func TestReclaimRejectsPaneRunningCat(t *testing.T) {
 	sl, self := slotFixture(t)
 	ctx := context.Background()
 
 	busy := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
 	waitForClientPaneIdle(t, sl.b, busy)
+	if err := sl.b.Claim(ctx, busy, ownerAgent, 0); err != nil {
+		t.Fatalf("mark the pane as an unslotted agent pane: %v", err)
+	}
 	tmuxExec(t, "send-keys", "-t", busy.target(), "cat", "Enter")
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		state, err := sl.b.Foreground(ctx, busy)
 		if err == nil && !paneIsIdleShell(state) {
+			if paneIsReadyShell(state) {
+				t.Fatal("a pane running cat reads as a ready shell")
+			}
 			break
 		}
 		if time.Now().After(deadline) {
@@ -620,31 +639,26 @@ func TestAcquireRejectsPaneRunningCat(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	if sl.canAcquire(ctx, busy, self) {
-		t.Error("canAcquire accepted a pane running cat; the shell is not the foreground process")
-	}
-
-	tgt12, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
+	tgt, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
 	if err != nil {
 		t.Fatalf("resolveHelper: %v", err)
 	}
-	pane, _, _, _ := tgt12.Ref, tgt12.Slot, tgt12.Created, tgt12.Owner
-	if pane == busy {
-		t.Fatalf("resolveHelper adopted the busy pane %s", pane.target())
+	if tgt.Ref == busy {
+		t.Fatalf("resolveHelper reclaimed the busy pane %s", busy.target())
 	}
-	if rec, found := recordFor(t, sl, self, busy); found {
-		t.Errorf("the busy pane was marked anyway: %+v", rec)
+	if rec, _ := recordFor(t, sl, self, busy); rec.Slot != 0 {
+		t.Errorf("the busy pane was given slot %d anyway", rec.Slot)
 	}
 }
 
-// TestAcquireRejectsForeignUID is the uid guard at the level it actually lives.
+// TestReclaimRejectsForeignUID is the uid guard at the level it actually lives.
 //
 // The case it defends against — a pane whose own process is another user's shell
 // (`exec sudo -i`, an exec'd su, a namespace with a different uid) — cannot be
 // built in a test without sudo. pid 1 is the same shape of fact: a live process
 // owned by root, present on both platforms, needing no privileges to point at.
-// If the guard would adopt pid 1 it would adopt a root shell.
-func TestAcquireRejectsForeignUID(t *testing.T) {
+// If the guard would accept pid 1 it would type into a root shell.
+func TestReclaimRejectsForeignUID(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("running as root, so pid 1 is the same user and proves nothing")
 	}
@@ -661,17 +675,18 @@ func TestAcquireRejectsForeignUID(t *testing.T) {
 }
 
 // TestDuplicateHealingReleasesAcquiredLoser covers what happens to the pane that
-// loses a duplicate-slot race, which is a state no teardown path could reach.
+// loses a duplicate-slot race when it is one of the USER's panes, under a legacy
+// acquired record.
 //
 // Two server processes in one window can each mark a pane as slot 1, because
 // tmux has no compare-and-set on options; the oldest wins and the others are
-// healed. When a loser is one of the USER's panes, adopted by the other process,
-// unslotting it is not enough: close-pane({slot:"all"}) covers slotted records
-// only, so it becomes invisible to teardown, while canAcquire refuses any pane
-// carrying an owner mark, so it can never be adopted again either — an ordinary
-// shell, still titled "agent", that the agent mysteriously refuses to touch. The
-// loser must be handed back properly instead: every marker gone, the label gone,
-// the pane itself untouched.
+// healed. Unslotting a user's pane is not enough: it would keep our owner mark
+// and our label, an ordinary shell the agent mysteriously claims and never
+// uses. The loser must be handed back properly instead: every marker gone, the
+// label gone, the pane itself alive.
+//
+// The healing runs on every lookup of the slot, so it is exercised through
+// lookupSlot, which reports the winner without acting on it.
 func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 	sl, self := slotFixture(t)
 	ctx := context.Background()
@@ -692,13 +707,12 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 		}
 	}
 
-	tgt13, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
-	if err != nil {
-		t.Fatalf("resolveHelper: %v", err)
+	holder, found, err := sl.lookupSlot(ctx, slotDefault, kindUnstated)
+	if err != nil || !found {
+		t.Fatalf("lookupSlot: found=%v err=%v", found, err)
 	}
-	winner, _, _, _ := tgt13.Ref, tgt13.Slot, tgt13.Created, tgt13.Owner
-	if winner != first {
-		t.Fatalf("resolveHelper kept %s, want the oldest pane %s", winner.target(), first.target())
+	if holder.Record.Ref != first {
+		t.Fatalf("healing kept %s, want the oldest pane %s", holder.Record.Ref.target(), first.target())
 	}
 
 	// The loser is the user's pane again: alive, unmarked, unlabelled.
@@ -707,20 +721,13 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 	}
 	for _, opt := range []string{paneOptSlot, paneOptOwner, paneOptWitness} {
 		if got := tmuxExec(t, "display-message", "-t", second.target(), "-p", "#{"+opt+"}"); got != "" {
-			t.Errorf("%s is still %q on the released loser %s; leaving the owner mark retires the "+
-				"pane forever, because acquisition requires it to be unset", opt, got, second.target())
+			t.Errorf("%s is still %q on the released loser %s; the pane is the user's again and "+
+				"must carry nothing of ours", opt, got, second.target())
 		}
 	}
 	if title := tmuxExec(t, "display-message", "-t", second.target(), "-p", "#{pane_title}"); title == "agent" {
 		t.Errorf("the released loser is still titled %q; to the user that is a pane the agent "+
 			"claims and will not use", title)
-	}
-
-	// And it can be adopted again, which is the property the owner mark would
-	// otherwise have destroyed.
-	if !sl.canAcquire(ctx, second, self) {
-		t.Error("the released loser cannot be re-adopted; releasing it has to leave it exactly as " +
-			"unclaimed as it was before")
 	}
 }
 
@@ -760,10 +767,10 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 // # The second rule: who may run a command at all
 //
 // The same walk answers a wider question, because it is the same kind of
-// question and the same parse. Only backend_tmux.go may talk to the
-// multiplexer, and os/exec is the only way to talk to it, so an import of
-// os/exec anywhere else in the package is either a second tmux call site or the
-// start of one.
+// question and the same parse. Only the adapter files may talk to a
+// multiplexer, and os/exec is the only way to talk to one, so an import of
+// os/exec anywhere else in the package is either a second multiplexer call site
+// or the start of one.
 //
 // screenshot.go is the one exception and it is not a tmux exception: it runs
 // headless Chrome to render a PNG, and `open`/`xdg-open` to show one. Those are
@@ -774,6 +781,15 @@ func TestDuplicateHealingReleasesAcquiredLoser(t *testing.T) {
 // The rule matters more than a tidiness rule would, because the id policy must
 // never see is a tmux id: a file that can run tmux can read one, and every leak
 // this design guards against starts there.
+
+// adapterFiles are the Backend implementations: the only files that run a
+// multiplexer and the only files that may turn a handle back into an id.
+var adapterFiles = map[string]bool{"backend_tmux.go": true, "backend_herdr.go": true}
+
+// selfEnvVars are the variables that name this server's own pane, one per
+// multiplexer. Reading either directly is asking which pane this server runs in.
+var selfEnvVars = map[string]bool{`"TMUX_PANE"`: true, `"HERDR_PANE_ID"`: true}
+
 // audit is what one walk of the package found. Every field is a question the
 // test asks of the source rather than of a running server, because all four
 // rules below are about code that does not exist yet: the handler somebody adds
@@ -804,7 +820,7 @@ func newAudit() *audit {
 // policy file — which is how the controls below prove the analyzer detects
 // anything at all.
 func (a *audit) inspect(name string, file *ast.File) {
-	const adapter = "backend_tmux.go"
+	adapter := adapterFiles[name]
 
 	for _, imp := range file.Imports {
 		if imp.Path.Value == `"os/exec"` {
@@ -830,7 +846,7 @@ func (a *audit) inspect(name string, file *ast.File) {
 			// newPaneRef is the constructor half of the same rule: it turns an id
 			// INTO a handle, so a policy file that calls it has an id in hand.
 			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "newPaneRef" {
-				if name == adapter {
+				if adapter {
 					a.sawTargetCall = true
 				} else {
 					a.targetCallers = append(a.targetCallers, where+" calls newPaneRef")
@@ -845,7 +861,7 @@ func (a *audit) inspect(name string, file *ast.File) {
 			case "Self":
 				a.selfCallers[fn.Name.Name] = name
 			case "target":
-				if name == adapter {
+				if adapter {
 					a.sawTargetCall = true
 				} else {
 					a.targetCallers = append(a.targetCallers, where+" calls target()")
@@ -857,11 +873,11 @@ func (a *audit) inspect(name string, file *ast.File) {
 					a.addToolCallers[where] = "AddTool"
 				}
 			case "Getenv":
-				// os.Getenv("TMUX_PANE") is the same knowledge by another route,
-				// and reading it directly would bypass both this test and the
-				// single accessor it protects.
+				// os.Getenv("TMUX_PANE") or os.Getenv("HERDR_PANE_ID") is the same
+				// knowledge by another route, and reading it directly would bypass
+				// both this test and the single accessor it protects.
 				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "os" && len(call.Args) == 1 {
-					if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Value == `"TMUX_PANE"` {
+					if lit, ok := call.Args[0].(*ast.BasicLit); ok && selfEnvVars[lit.Value] {
 						a.selfCallers[fn.Name.Name] = name
 					}
 				}
@@ -887,7 +903,8 @@ func (a *audit) inspect(name string, file *ast.File) {
 // function named there is a place the design already allows to ask, and which of
 // them happens to ask this month is an implementation detail. What may never
 // appear is a handler that types. A future send-keys that reaches for
-// Backend.Self, or for os.Getenv("TMUX_PANE") directly to dodge this test, fails
+// Backend.Self, or for os.Getenv("TMUX_PANE") or os.Getenv("HERDR_PANE_ID")
+// directly to dodge this test, fails
 // the build's test step — which is the only way a rule like this survives a year
 // of edits, because the failure it prevents is invisible from outside the
 // process: the agent's own transcript fills with its own keystrokes, and there
@@ -895,17 +912,17 @@ func (a *audit) inspect(name string, file *ast.File) {
 //
 // # Rule 2: who may run a command at all
 //
-// Only backend_tmux.go may talk to the multiplexer, and os/exec is the only way
-// to talk to it, so an import of os/exec anywhere else is either a second tmux
-// call site or the start of one. screenshot.go is the one exception and it is
-// not a tmux exception: it runs headless Chrome to render a PNG, and
-// `open`/`xdg-open` to show one.
+// Only the adapter files — backend_tmux.go and backend_herdr.go — may talk to a
+// multiplexer, and os/exec is the only way to talk to one, so an import of
+// os/exec anywhere else is either a second multiplexer call site or the start of
+// one. screenshot.go is the one exception and it is not a multiplexer exception:
+// it runs headless Chrome to render a PNG, and `open`/`xdg-open` to show one.
 //
 // # Rule 3: who may turn a handle back into an id
 //
 // paneRef.String() prints "<pane>", so an id cannot leak through a format verb —
 // but that redaction is only as good as the rule that the real id is reachable
-// from ONE place. target() and newPaneRef are that place, and this clause is
+// from the adapters. target() and newPaneRef are that place, and this clause is
 // what keeps it one: the ten call sites outside the adapter that existed before
 // this contract all fed a PaneID field on a response type, and every one of them
 // vanished when those fields did. A new one appearing is a new leak, and it
@@ -932,11 +949,13 @@ func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 		"lookupSlot":          "the same, for the lookup close-pane and the reading tools perform",
 		"closePanes":          "teardown, which must not close the pane the request arrived through",
 		"listSlots":           "the registry read is scoped to the window this server's pane is in",
+		"detectionEnv":        "startup detection, which reads the claim in order to verify it and addresses no pane",
 	}
 
 	permittedExecImporters := map[string]string{
-		"backend_tmux.go": "the only file that runs tmux; every multiplexer call in the package is here",
-		"screenshot.go":   "headless Chrome and open/xdg-open, which are rendering, not multiplexer access",
+		"backend_tmux.go":  "the tmux adapter; every tmux call in the package is here",
+		"backend_herdr.go": "the herdr adapter; every herdr call in the package is here",
+		"screenshot.go":    "headless Chrome and open/xdg-open, which are rendering, not multiplexer access",
 	}
 
 	files, err := filepath.Glob("*.go")
@@ -982,20 +1001,22 @@ func TestOnlyPolicyCodeKnowsOurOwnPane(t *testing.T) {
 				"code", path, permittedNames(permittedExecImporters))
 		}
 	}
-	if !got.execImporters["backend_tmux.go"] {
-		t.Error("backend_tmux.go does not import os/exec, so it is not the file running tmux any " +
-			"more — whichever file now is, this test is no longer looking at it")
+	for adapter := range adapterFiles {
+		if !got.execImporters[adapter] {
+			t.Errorf("%s does not import os/exec, so it is not the file running its multiplexer any "+
+				"more — whichever file now is, this test is no longer looking at it", adapter)
+		}
 	}
 
 	// ---- Rule 3 ----
 	for _, where := range got.targetCallers {
-		t.Errorf("%s, outside backend_tmux.go: the real pane id must be reachable from one file "+
-			"only, or paneRef's redacting String() is a convention again and the next response "+
-			"field reintroduces the leak this release removed", where)
+		t.Errorf("%s, outside the adapter files: the real pane id must be reachable from the "+
+			"adapters only, or paneRef's redacting String() is a convention again and the next "+
+			"response field reintroduces the leak this release removed", where)
 	}
 	if !got.sawTargetCall {
-		t.Error("backend_tmux.go never turns a handle back into an id, so it is no longer the " +
-			"adapter — this clause is watching the wrong file and would pass over a leak anywhere else")
+		t.Error("no adapter file turns a handle back into an id, so they are no longer the " +
+			"adapters — this clause is watching the wrong files and would pass over a leak anywhere else")
 	}
 
 	// ---- Rule 4 ----
@@ -1021,6 +1042,10 @@ func typesIntoAPane(p paneRef, s *server) {
 	s.AddTool(tool, handler)
 	_ = newPaneRef("%3")
 }
+
+func readsHerdrPane() {
+	_ = os.Getenv("HERDR_PANE_ID")
+}
 `
 	fixture, err := parser.ParseFile(fset, "fixture.go", violation, 0)
 	if err != nil {
@@ -1032,6 +1057,10 @@ func typesIntoAPane(p paneRef, s *server) {
 	if _, ok := control.selfCallers["typesIntoAPane"]; !ok {
 		t.Error("the analyzer did not see os.Getenv(\"TMUX_PANE\") in the fixture, so rule 1 is " +
 			"being enforced by a walk that finds nothing")
+	}
+	if _, ok := control.selfCallers["readsHerdrPane"]; !ok {
+		t.Error("the analyzer did not see os.Getenv(\"HERDR_PANE_ID\") in the fixture, so rule 1 " +
+			"is blind to the herdr backend's own pane")
 	}
 	if !control.execImporters["fixture.go"] {
 		t.Error("the analyzer did not see the os/exec import in the fixture, so rule 2 is " +

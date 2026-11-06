@@ -1,11 +1,12 @@
 # tmux-mcp
 
-Agent-oriented MCP server for tmux — native process detection, smart triggers, and one
-handle: the slot.
+Agent-oriented MCP server for tmux and herdr — native process detection, smart triggers,
+and one handle: the slot.
 
 ## Quick start
 
-**Prerequisites**: tmux installed, Go 1.26.1+ or a pre-built binary.
+**Prerequisites**: tmux or [herdr](#running-under-herdr) installed, Go 1.26.1+ or a
+pre-built binary.
 
 ```bash
 # Install via Go
@@ -72,7 +73,7 @@ This project solves those four problems directly.
 | Addressing | pane IDs the agent must track | one session | one shell | **Stable slot numbers; no IDs anywhere** |
 | Invisible panes | No | Only invisible | Only invisible | **Either, per slot (`isolated`)** |
 | Works beside the user | No | No | No | **Yes — panes open in the window they are looking at** |
-| execute-command | Polling | N/A | Heuristic | **Synchronous (tmux wait-for)** |
+| execute-command | Polling | N/A | Heuristic | **Synchronous (blocks until the exit code is written)** |
 
 **ht-mcp** is fast and dependency-free but works only with headless terminals it creates
 itself. It cannot attach to existing sessions or manage pane layouts.
@@ -117,9 +118,27 @@ Four properties are worth knowing.
 
 - **The same slot is the same pane, every time.** A dev server started in slot 2 is still
   running in slot 2 on the next call. That is what makes a bare number sufficient.
-- **A slot is never the agent's own pane.** Resolution can create a pane, reuse one, or
-  adopt an idle unused shell already open in the window — the pane the server itself runs
-  in is excluded from all three, so a tool call can never type into the conversation.
+- **A slot is never the agent's own pane, and never one the user opened.** Resolution
+  reuses the pane already in the slot, reclaims an idle pane this server made earlier
+  that holds no slot, or creates a new one. A pane counts as the server's only when it
+  carries the server's marks; a shell the user opened carries none, so it is never taken,
+  however idle it looks. A reclaimed pane must be an idle shell at its prompt, owned by
+  the same user, with nothing waiting in its input — a TUI, a running command or a shell
+  still starting up is never taken. A reclaimed pane is put back in the server's working
+  directory and its screen is cleared, so `created: true` means a fresh slot in a fresh
+  directory — not a fresh shell process: variables an earlier agent exported, or a
+  virtualenv it activated, may still be set. The pane the server itself runs in is
+  excluded from all of it, so a tool call can never type into the conversation.
+- **Typing waits for the shell, and checks that it landed.** A pane a call has just
+  created or reclaimed is not typed into until its shell is reading input, so a slow
+  `.zshrc` cannot swallow the first command; `execute-command` waits the same way before
+  every command. Where the shell has a line editor, `send-keys`, `run-in-repl`,
+  `write-to-display` and `start-and-watch` send the text, confirm the editor took it, then
+  send Enter and confirm that too; a call whose text was not taken fails rather than
+  reporting success. A shell without a line editor (`bash --noediting`, `dash`) or one the
+  server does not recognise is used once its screen has settled. Key names sent with
+  `literal: false` — `C-c`, `Escape`, `Enter` — are never held back or checked, so an
+  interrupt always reaches a busy pane.
 - **`created` tells you when a slot changed underneath you.** Every creating call answers
   with `slot` and `created`. `created: true` means the pane is new *to that slot*, which is
   how an agent learns that the process it started there earlier is gone — the user closed
@@ -128,6 +147,20 @@ Four properties are worth knowing.
   `watch-pane` error on a slot that was never opened, rather than splitting the user's
   window to answer a question about a pane that did not exist. They carry no `created`
   field, because nothing they do can create.
+
+### Where slots open
+
+Placement depends only on the slot number, so the layout is the same whichever slots
+already exist:
+
+| Slot | Opens |
+|---|---|
+| 1 | Beside the agent, to its right |
+| 2 | Under slot 1, or beside the agent when slot 1 is not open |
+| 3 | Under the agent |
+| 4 and up | By halving the largest helper pane this server opened, along its longer side |
+
+A pane the user opened is never split to make room.
 
 ### Isolated slots: a pane nobody can see
 
@@ -155,8 +188,9 @@ runs the command, destroys the pane, and returns output with no slot at all.
 
 ### Closing
 
-`close-pane` kills panes the server created and merely interrupts (`C-c`) and releases
-panes it adopted from the user — their shell keeps running and their pane stays open.
+`close-pane` kills panes the server created. A slot record that says the user opened the
+pane — older versions of this server took idle shells over as slots — is never killed: the
+pane is interrupted (`C-c`) and released, and the user's shell keeps running in it.
 Closing a slot that was never opened is not an error; it answers `action: "none"`. It
 refuses the pane the server itself is running in even when that pane carries a valid
 agent-owned record, which is what a subagent started inside an outer agent's helper pane
@@ -195,11 +229,11 @@ read whichever kind the slot already is.
 | Tool | Purpose | Arguments | Returns |
 |---|---|---|---|
 | `list-slots` | What this agent has open, and what is running in each. Other agents' panes and the user's own panes are not listed | — | `[{slot, isolated, origin, foregroundCmd, isAlive}]` |
-| `close-pane` | Close a helper pane. Created panes are killed; adopted panes are interrupted and released | `slot` (a number or `"all"`) | `[{slot, action, detail}]` — `action` is `killed`, `released`, `none` or `error` |
+| `close-pane` | Close a helper pane. Created panes are killed; a pane the user opened is interrupted and released, never killed | `slot` (a number or `"all"`) | `[{slot, action, detail}]` — `action` is `killed`, `released`, `none` or `error` |
 | `notify` | Show a transient message to the user. One-way: it cannot report anything about the terminal | `message` *(required)*, `duration` | text |
 
-**execute-command** wraps your command with `tee` and `tmux wait-for` so it blocks
-synchronously until the command finishes. Output and exit code come back in one response —
+**execute-command** wraps your command with `tee` and an exit-code file, and blocks
+synchronously until the command finishes and that file is written. Output and exit code come back in one response —
 no polling, no separate result-fetch call.
 
 **send-keys** separates literal text (`literal: true`, the default) from tmux key names
@@ -412,9 +446,9 @@ pane — and the next `run-in-repl` would be talking to a bare shell.
 
 No polling. No parsing return values from a separate call. The exit code is in the response.
 
-`execute-command` tees stdout+stderr to a temp file and signals completion via
-`tmux wait-for`, so the exit code accurately reflects the original command even through
-pipelines.
+`execute-command` tees stdout+stderr to a temp file and writes the exit code to another,
+whose appearance is what completes the call, so the exit code accurately reflects the
+original command even through pipelines.
 
 ### 4. Coaching display pane
 
@@ -438,9 +472,9 @@ pipelines.
 {"tool": "close-pane", "params": {"slot": "all"}}
 ```
 
-`clear` wipes the pane's line buffer only on a pane the server created. On a pane adopted
-from the user it never does: a half-typed command line belongs to them, so the screen is
-redrawn around it and successive writes append.
+`clear` wipes the pane's line buffer only on a pane the server created. On a pane the user
+opened it never does: a half-typed command line belongs to them, so the screen is redrawn
+around it and successive writes append.
 
 ## Comparison with the original TypeScript implementation
 
@@ -449,24 +483,25 @@ This project started as a port of [nickgnd/tmux-mcp](https://github.com/nickgnd/
 
 | Area | nickgnd/tmux-mcp | This project |
 |---|---|---|
-| execute-command | Returns task ID; agent polls `get-command-result` | Synchronous via `tmux wait-for`; output + exit code in one response |
+| execute-command | Returns task ID; agent polls `get-command-result` | Synchronous; output + exit code in one response |
 | Input detection | None; agent regexes screen text | Native OS: `/proc/wchan` (Linux), `sysctl kern.proc.pid` (macOS) |
 | send-keys vs execute | Overloaded `execute-command` with `rawMode`+`noEnter` flags | Separate `send-keys` (text or key names) and `execute-command` |
 | C-c handling | Issue #31: sends literal "C-c" instead of SIGINT | `send-keys` with `literal: false` interprets `C-c` as interrupt |
-| Consecutive commands | Issue #28: unreliable | Each call gets a unique UUID wait channel |
+| Consecutive commands | Issue #28: unreliable | Each call gets its own UUID-named output and exit-code files |
 | Addressing | Agent tracks pane IDs and passes them back | A slot number the caller picks; the server holds the mapping |
 | Async monitoring | None | Smart triggers with progress notifications and optional channel push |
 | Runtime | Node.js / npx | Single 7MB Go binary |
 | Tool count | 13 | 13 |
 
 The polling model requires an agent to call `get-command-result` in a loop, wasting round
-trips and complicating timeout handling. `tmux wait-for` blocks inside the server process
-instead, so the agent gets the result in a single call.
+trips and complicating timeout handling. Here the wait happens inside the server process
+instead — it watches for the command's exit-code file — so the agent gets the result in a
+single call.
 
 ## Configuration
 
 ```
-tmux-mcp [--shell-type bash|zsh|fish] [--backend tmux] [--channel] [--version]
+tmux-mcp [--shell-type bash|zsh|fish] [--backend auto|tmux|herdr] [--channel] [--version]
 ```
 
 `--shell-type` controls how `execute-command` captures exit codes from a pipeline:
@@ -480,14 +515,64 @@ tmux-mcp [--shell-type bash|zsh|fish] [--backend tmux] [--channel] [--version]
 Match this to the shell running inside your tmux panes. A mismatch causes
 `execute-command` to report exit code `0` for every command.
 
-`--backend` selects the multiplexer. `tmux` is the only implementation today; the flag
-exists because the policy layer talks to a `Backend` port rather than to tmux directly.
+`--backend` selects the multiplexer. The default, `auto`, detects it at startup (see
+[Running under herdr](#running-under-herdr)); `tmux` or `herdr` forces one. The tools are
+the same under either: no tool, argument or response says which multiplexer is running.
 
 `--channel` enables Claude Code channel mode. See the [Channel mode](#channel-mode)
 section below.
 
 There are no MCP resources and no tool-group switch: the server registers one surface of
 thirteen tools and nothing else.
+
+## Running under herdr
+
+The server also runs inside herdr, the terminal multiplexer, with the same
+thirteen tools and the same slots. Nothing in the tool surface changes; slot 1 opens beside
+the agent's herdr pane exactly as it does beside a tmux pane.
+
+**Detection.** With `--backend auto`, each multiplexer's claim is read from the
+environment: tmux sets `TMUX_PANE`, herdr sets `HERDR_ENV=1` and `HERDR_PANE_ID`.
+
+- One claim present: that multiplexer is used, unless the check below disproves it — the
+  claimed pane's shell is found and is not an ancestor of this process, which is what a
+  variable inherited by an app launched from a pane looks like. Then there is no window.
+  When the check cannot run (no `TMUX` or `HERDR_SOCKET_PATH` naming a server, the
+  multiplexer not answering), the claim is believed. A server started outside its pane's
+  process tree on purpose should pass `--backend tmux` or `--backend herdr`.
+- Both present — a herdr started from a tmux pane, or the reverse, passes the outer
+  multiplexer's variables down — and each claim is checked: the claimed pane's shell must
+  be an ancestor of this process. The nearest verified one wins, since the innermost
+  multiplexer is the one whose window holds the agent.
+- Neither verified, or no claim at all: tmux with no window. Visible slots are refused
+  with a message saying so, and isolated slots still work.
+
+**Requirements.** herdr 0.9.1 (the version this is tested against), with `herdr` on
+`PATH` or its location in `HERDR_BIN_PATH`. The server reaches the herdr instance it runs
+in through the `HERDR_SOCKET_PATH` herdr sets in its panes. tmux is optional: isolated
+slots run on a private tmux server even under herdr, so without tmux on `PATH` an
+`isolated: true` request fails and visible slots keep working.
+
+**Where slot records live.** tmux keeps them as pane options. herdr has no equivalent, so
+the server writes them to a state file, one per herdr instance:
+
+```
+$XDG_STATE_HOME/tmux-mcp/herdr/<sha256 of the herdr socket path>.json
+```
+
+`$XDG_STATE_HOME` defaults to `~/.local/state`. The file is
+`{"version": 1, "panes": [{"pane_id", "terminal_id", "owner", "slot"}]}`. A record counts
+only while herdr still lists that pane with the same terminal id, so a restarted herdr that
+reuses pane numbers never hands a slot a stranger's pane; stale records are dropped on the
+next read. Writes take a file lock and replace the file atomically, so several servers can
+share one herdr. A file that does not parse is moved aside to `<name>.json.corrupt-<unix
+time>` and the server starts with no records; the panes those records named are then left
+alone, like any pane the user opened.
+
+**Restored sessions.** When herdr restores a saved session, it recreates panes with new
+terminal ids. The records for the old ones no longer match, so restored helper panes are
+unmarked — they count as the user's, and the server opens fresh panes rather than reusing
+them.
 
 ## Channel mode
 
@@ -528,7 +613,8 @@ Without `--channel`, no channel capability is declared and no notifications are 
 
 ## Development
 
-**Prerequisites:** Go 1.26.1+, tmux 3.2+
+**Prerequisites:** Go 1.26.1+, tmux 3.2+; herdr 0.9.1 for the herdr scenarios, which are
+skipped without it
 
 ```bash
 go build -o tmux-mcp .
@@ -541,14 +627,18 @@ go test ./...          # full suite (tmux must be running)
 | File | Purpose |
 |---|---|
 | `main.go` | MCP server setup, flags, tool registration |
-| `backend_tmux.go` | The `Backend` implementation: every tmux invocation in the program lives here, and it is the only file that knows what a pane identifier looks like |
+| `detect.go` | Startup choice of multiplexer: the environment claims, the ancestry check, the `--backend` flag |
+| `backend_tmux.go` | The tmux `Backend`: every tmux invocation in the program lives here |
+| `backend_herdr.go` | The herdr `Backend`: every herdr invocation lives here; isolated slots are handed to a private tmux server |
+| `herdr_registry.go`, `herdr_lock_*.go` | The herdr slot-record state file, its witness check, and the file lock that serialises writes |
 | `agent_tools.go` | The thirteen tool registrations and their handlers |
-| `helper_panes.go` | Helper-pane policy: slot resolution, placement, adoption, ownership marks, teardown |
+| `helper_panes.go` | Helper-pane policy: slot resolution, reclaim, placement, ownership marks, teardown, waiting for a shell and confirming typed input landed, `execute-command`'s run-and-wait |
 | `pane_arg.go` | The shared `slot`/`isolated` argument parser, the retired-argument rejection, and the response types |
 | `channel.go` | Channel mode: `ChannelEmitter`, notifications, instructions |
 | `triggers.go` | `NotificationMode`, `Trigger`, `monitorPane` loop, `parseTriggers`, `WatchResult` |
 | `screenshot.go` | xterm.js rendering for `screenshot-pane` |
 | `process.go` | `PaneState` struct, `GetPaneState` (OS dispatch) |
+| `tty_darwin.go`, `tty_linux.go`, `tty_other.go` | Terminal line-discipline probe: whether the line editor is reading, and how many typed bytes are still unread |
 | `process_darwin.go` | macOS: `sysctl kern.proc.pid`, `wmesg ttyin` detection |
 | `process_linux.go` | Linux: `/proc/wchan`, `/proc/syscall` detection |
 | `process_other.go` | Stub for other platforms (`WaitingForInput` always false) |
@@ -559,7 +649,14 @@ go test ./...          # full suite (tmux must be running)
 | `isolated_test.go` | Invisible slots: round trip, namespace isolation, the fixed kind, duplicate healing, orphan reaping |
 | `reading_test.go` | The four reading tools do not create, with the pane-count control that proves the probe can see a pane appear |
 | `slot_tools_test.go` | Slot resolution per tool, ownership-aware clearing, records living in tmux rather than in this process |
-| `pane_safety_test.go` | Adoption safety, idle-shell detection, attribution of every pane the server makes |
+| `pane_safety_test.go` | Idle-shell detection, attribution of every pane the server makes |
+| `readiness_test.go` | A new pane is not typed into until its shell's line editor is reading |
+| `reclaim_test.go` | An unmarked user shell is never taken; a busy or TUI pane is never reclaimed; slot 1 survives a server restart |
+| `placement_test.go` | The placement table, slot by slot |
+| `shell_input_test.go` | Shells without a line editor or with an unknown name, C-c into a busy shell, named keys and multi-line text never reported as unsent, a single run on re-send, a reclaimed pane's directory, a new pane with no record |
+| `detect_test.go`, `detect_probe_test.go` | The detection rule: both claims present, and a lone claim the ancestry check disproves or cannot run |
+| `backend_herdr_test.go`, `herdr_send_test.go` | The same scenarios against a private herdr session (skipped without herdr); text starting with a dash |
+| `herdr_registry_test.go`, `herdr_unit_test.go` | The state file's witness, locking, snapshot under the lock, write-only-on-change and corrupt-file recovery; key-name mapping; error text naming no multiplexer |
 | `helper_panes_test.go`, `pane_arg_test.go` | Policy and argument-parsing units |
 | `e2e_test.go`, `scenarios_test.go` | MCP client harness, individual tools, multi-step scenarios including channel mode |
 | `missing_tests_test.go`, `process_test.go`, `screenshot_test.go` | Review-driven gap coverage, OS process inspection, renderer |

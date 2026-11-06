@@ -5,13 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // This file holds helper-pane *policy*: which pane the agent gets, where it is
-// placed, and under what conditions an existing pane may be adopted.
+// placed, which of our own panes may be reclaimed, and how keys are typed into a
+// shell so that they are known to have landed.
 // backend_tmux.go is a thin wrapper over the tmux CLI — everything in it is a
 // command with arguments — and mixing policy into it would spread the
 // safety-critical decisions across a 900-line client. The low-level option reads
@@ -35,12 +41,26 @@ import (
 // create a pane; and the lock does NOT order two server processes sharing a
 // window, which is why the duplicate healing in slotCandidateLocked is the
 // second half of this lock rather than defensive decoration.
+//
+// shell is the -shell-type flag, which execInPane needs to spell the exit
+// status of a pipeline. It defaults to bash, the flag's own default.
+//
+// cwd is this server's working directory, which is the agent's. A new pane
+// starts there, and a reclaimed one is put back there before it is handed out.
 type slots struct {
 	b      Backend
+	shell  string
+	cwd    string
 	slotMu sync.Mutex
 }
 
-func newSlots(b Backend) *slots { return &slots{b: b} }
+func newSlots(b Backend) *slots {
+	s := &slots{b: b, shell: "bash"}
+	if wd, err := os.Getwd(); err == nil {
+		s.cwd = wd
+	}
+	return s
+}
 
 // errNoWindow is returned whenever a call needs the server's own pane and there
 // is none. It is an INTERNAL sentinel: its text never reaches a caller, because
@@ -49,7 +69,7 @@ func newSlots(b Backend) *slots { return &slots{b: b} }
 // pane turns it into a message.
 //
 // Callers test it with errors.Is and hand the caller errNoWindowText instead.
-var errNoWindow = errors.New("this server is not running inside tmux ($TMUX_PANE is unset)")
+var errNoWindow = errors.New("this server is not running inside a multiplexer pane")
 
 // errNoWindowText is the one sentence a caller sees when it asked for a pane in
 // the user's window and there is no window.
@@ -62,8 +82,12 @@ var errNoWindow = errors.New("this server is not running inside tmux ($TMUX_PANE
 // exactly that guessing. The predecessor of this sentence named three routes —
 // paneId, headless:true and create-headless — and all three are deleted by this
 // release, so it would have directed an agent to three things that do not exist.
-const errNoWindowText = "no window to place a pane in: this server is not running inside tmux — " +
-	"use isolated: true"
+//
+// It names no multiplexer. The agent's tools are the same under every backend,
+// and a sentence that said "tmux" would tell it which one it is under — and,
+// under herdr, would be false.
+const errNoWindowText = "no window to place a pane in: this server is not running inside a " +
+	"terminal pane — use isolated: true"
 
 // visibleError maps the internal sentinel onto that sentence. It is applied
 // where a request that needed the user's window fails, and nowhere else: a path
@@ -213,7 +237,7 @@ type slotHolder struct {
 const missingSlotText = "slot %d does not exist; open it with open-pane or by running " +
 	"something in it"
 
-// lookupSlot finds the pane occupying a slot without creating or adopting one,
+// lookupSlot finds the pane occupying a slot without creating or reclaiming one,
 // and is the entry point the READING tools use.
 //
 // This is the lock-taking wrapper. The teardown that close-pane performs goes
@@ -254,7 +278,7 @@ func (s *slots) lookupSlot(ctx context.Context, slot int, kind kindRequest) (slo
 	return holder, true, nil
 }
 
-// lookupSlotLocked finds the pane occupying a slot WITHOUT creating or adopting
+// lookupSlotLocked finds the pane occupying a slot WITHOUT creating or reclaiming
 // one, in BOTH registries. The caller must hold slotMu and pass the self it read
 // inside that hold — an empty self meaning "there is no window", which is not an
 // error here.
@@ -274,8 +298,8 @@ func (s *slots) lookupSlot(ctx context.Context, slot int, kind kindRequest) (slo
 // duplicate healing — because those fix state that is already wrong, and leaving
 // them to the create path would mean a window could only be healed by growing.
 //
-// Creating one pane in order to close it would be absurd, and adopting one in
-// order to release it would touch a pane the user owns for no reason at all.
+// Creating one pane in order to close it would be absurd, and reclaiming one in
+// order to close it would kill a pane nobody asked about.
 func (s *slots) lookupSlotLocked(
 	ctx context.Context, slot int, kind kindRequest, self paneRef,
 ) (slotHolder, bool, error) {
@@ -287,7 +311,7 @@ func (s *slots) lookupSlotLocked(
 
 		// The server's own pane is CONSIDERED here, and teardown is the only
 		// lookup that considers it. Every other path excludes it — reuse must
-		// never hand it back, acquisition must never claim it, the "all" sweep
+		// never hand it back, reclaim must never take it, the "all" sweep
 		// must never touch it, list-slots must not report it — and here exclusion
 		// is wrong for a reason that does not apply to any of those.
 		//
@@ -327,14 +351,14 @@ func (s *slots) lookupSlotLocked(
 // resolveHelperLocked is the body of resolveHelper. The caller must hold slotMu.
 //
 // Splitting it out is what keeps the whole decision on one registry read per
-// kind. Every branch below — reuse, adopt, create — is chosen from a snapshot
+// kind. Every branch below — reuse, reclaim, create — is chosen from a snapshot
 // taken inside this lock hold and acts while the lock still holds it, so no
 // concurrent caller in this process can claim the slot between the read that
 // found it free and the write that takes it.
 //
 // Each branch also states the owner it is handing back, and each knows it for
-// certain: reuse carries the record it chose from, adoption has just written
-// ownerAcquired, and a pane we made is ours. See resolveHelper for what the
+// certain: reuse carries the record it chose from, and a reclaimed pane and a
+// pane we made are both ownerAgent. See resolveHelper for what the
 // value is for.
 //
 // # No window is not a failure here
@@ -364,9 +388,20 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequ
 	// Reuse, visible. It runs first for an unstated kind because a visible pane
 	// is the one the user can see, and because finding one here saves the second
 	// registry read below on the overwhelmingly common path.
+	//
+	// A holder marked ownerAcquired is not reused. That mark means the pane was
+	// opened by the user and taken over by an older version of this server, and
+	// a pane the user opened is not one we type into: whatever runs in it now
+	// may be theirs. The record is dropped instead — marks and label, with no
+	// C-c, because the process there may be the user's — and the slot is
+	// resolved as if it were empty, so the agent gets a new pane and is told so.
 	if kind != kindIsolated {
 		if rec, ok := s.slotCandidateLocked(ctx, slot, self, reg, false); ok {
-			return s.helperResult(rec.Ref, self, slot, false, rec.Owner, false)
+			if rec.Owner != ownerAcquired {
+				return s.helperResult(rec.Ref, self, slot, false, rec.Owner, false)
+			}
+			s.disownLocked(ctx, rec)
+			delete(reg, rec.Ref)
 		}
 	}
 
@@ -414,30 +449,40 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequ
 		return paneTarget{}, errNoWindow
 	}
 
-	// Adopt. The registry lookup here is the "unowned" half of the acquisition
-	// predicate, done from the map the caller already holds so that a pane we
-	// know to be ours costs no extra tmux round-trip; canAcquire re-reads the
-	// owner mark for the panes that reach it, because absence from this map means
-	// "no record we recognise", which is not the same as "unclaimed".
-	if pane, ok := s.acquirePaneLocked(ctx, reg, slot, self); ok {
-		return s.helperResult(pane, self, slot, true, ownerAcquired, false)
+	// Reclaim. A pane this server family opened and no slot points at any more
+	// is ours and otherwise unreachable, so it is used before anything new is
+	// opened. Nothing unmarked is ever a candidate: a pane without our marks is
+	// the user's, however idle it looks. See reclaimPaneLocked.
+	if pane, ok := s.reclaimPaneLocked(ctx, reg, slot, self); ok {
+		if err := s.resetReclaimed(ctx, pane); err != nil {
+			return paneTarget{}, fmt.Errorf("slot %d: %w", slot, err)
+		}
+		return s.helperResult(pane, self, slot, true, ownerAgent, false)
 	}
 
-	// Create. Failures of the two markers below are deliberately not fatal, for
-	// the same reason SplitPane ignores its own: the pane exists and works, it
-	// just will not be found again as a reuse candidate, so the caller loses
-	// nothing now and at worst gets a second pane later. Returning an error here
-	// would abandon a pane that has already been created — and the user can SEE
-	// this one, which is what makes the isolated create path below decide the
-	// other way.
+	// Create. The claim is one write of all three marks, and a failed one is
+	// not fatal while the pane still carries the agent-owned mark the backend
+	// writes when it opens it: that pane is an unslotted agent pane, and the
+	// next resolution reclaims it rather than opening another. A pane carrying
+	// no record at all is different. Nothing tells it from one the user opened —
+	// no reclaim takes it and no close reaches it — so it is closed, on a
+	// detached context for the reason createIsolatedLocked gives, and the
+	// failure is reported.
 	place := s.placementForSlot(ctx, reg, slot, self)
 	pane, err := s.b.OpenBeside(ctx, place)
 	if err != nil {
 		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
-	_ = s.b.SetSlot(ctx, pane, slot)
+	if err := s.b.Claim(ctx, pane, ownerAgent, slot); err != nil && !s.carriesRecord(ctx, self, pane) {
+		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
+		defer cancel()
+		_ = s.b.Close(undoCtx, pane)
+		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
+	}
 	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
-	s.waitForShellReady(ctx, pane)
+	if err := s.waitForShellReady(ctx, pane); err != nil {
+		return paneTarget{}, fmt.Errorf("slot %d: %w", slot, err)
+	}
 	return s.helperResult(pane, self, slot, true, ownerAgent, false)
 }
 
@@ -457,13 +502,15 @@ func slotOccupied(reg map[paneRef]paneRecord, slot int) bool {
 // createIsolatedLocked opens a pane nobody can see and claims it. The caller
 // must hold slotMu.
 //
-// # There is no adoption branch, and its absence is a decision
+// # There is no reclaim branch
 //
-// Adoption exists to reuse a shell the USER left idle in the window they are
-// looking at. This socket has no user and no window, and every pane on it was
-// created by an agent. A predicate that could adopt here would be a predicate
-// that could type into ANOTHER SERVER'S pane, with the namespace filter as the
-// only thing preventing it — and it must not become the only thing.
+// Every pane on this socket was created by an agent, and an unslotted one in
+// our namespace is either a one-shot execute-command still running or a pane a
+// dead process never finished claiming. Taking the first would type into a
+// command in flight, and the second is reaped by close-pane({slot:"all"}). A
+// predicate that could take panes here would also be one that could type into
+// ANOTHER SERVER'S pane, with the namespace filter as the only thing preventing
+// it — and it must not become the only thing.
 //
 // # A failed claim CLOSES the pane, where the visible path shrugs
 //
@@ -477,8 +524,7 @@ func slotOccupied(reg map[paneRef]paneRecord, slot int) bool {
 // point rather than a detail: the likeliest reason a mark write failed is that
 // the caller's context expired, and a kill issued on that same dead context is a
 // command that does not run — leaving exactly the stranded shell this branch
-// exists to prevent. It is the same reasoning adoptCandidateLocked's rollback
-// states, with a heavier consequence.
+// exists to prevent.
 //
 // waitForShellReady is not optional here. OpenIsolated takes no initial command,
 // so whatever the caller does next sends into a shell that may still be sourcing
@@ -495,7 +541,9 @@ func (s *slots) createIsolatedLocked(ctx context.Context, slot int, self paneRef
 		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
 	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
-	s.waitForShellReady(ctx, pane)
+	if err := s.waitForShellReady(ctx, pane); err != nil {
+		return paneTarget{}, fmt.Errorf("slot %d: %w", slot, err)
+	}
 	return s.helperResult(pane, self, slot, true, ownerAgent, true)
 }
 
@@ -505,10 +553,10 @@ func (s *slots) createIsolatedLocked(ctx context.Context, slot int, self paneRef
 // Returning the server's own pane would mean the agent typing into its own
 // session — the failure this entire design exists to prevent. It should be
 // unreachable: the self-exclusion in slotCandidateLocked drops self from reuse,
-// canAcquire drops it from acquisition, and a split never returns the pane it
-// split. The check is written anyway because it costs one string comparison, and
-// because the failure it guards against is the one failure that cannot be
-// diagnosed from outside the process: the agent's own transcript would fill with
+// reclaimPaneLocked skips it, and a split never returns the pane it split. The
+// check is written anyway because it costs one string comparison, and because
+// the failure it guards against is the one failure that cannot be diagnosed
+// from outside the process: the agent's own transcript would fill with
 // its own keystrokes and there would be nothing left to read the diagnosis from.
 //
 // It is also the single exit the owner passes through, which is what makes
@@ -588,19 +636,19 @@ func (s *slots) slotCandidateLocked(
 }
 
 // retireDuplicateLocked takes the slot away from the loser of a duplicate-slot
-// race, and for an adopted pane it does considerably more than that. The caller
-// must hold slotMu.
+// race, and for a pane under an ownerAcquired record it does considerably more
+// than that. The caller must hold slotMu.
 //
-// Merely unslotting an ownerAcquired loser strands one of the USER's panes in
-// the exact state clearPaneRegistration's comment says must never be produced:
-// invisible to close-pane({slot:"all"}), which covers slotted records only;
-// permanently un-re-adoptable, because canAcquire refuses any pane whose owner
-// mark is set at all; and still wearing the title "agent". To the user that is
-// an ordinary shell the agent mysteriously refuses to touch again, and no tool
-// in this server lists it, so nothing will ever come back for it. An adopted
-// loser is therefore RELEASED — the same C-c, the same three markers, the same
-// label removal close-pane would perform — because a claim we have just decided
-// not to use is a claim we must drop.
+// An ownerAcquired record names a pane the USER opened, which an older version
+// of this server took over as a slot. Merely unslotting such a loser strands it
+// in the exact state clearPaneRegistration's comment says must never be
+// produced: invisible to close-pane({slot:"all"}), which covers slotted records
+// only; never a slot again, because only ownerAgent panes are reclaimed; and
+// still wearing the title "agent". To the user that is an ordinary shell with a
+// stale label, and no tool in this server lists it, so nothing will ever come
+// back for it. An acquired loser is therefore RELEASED — the same C-c, the same
+// three markers, the same label removal close-pane would perform — because a
+// claim we have just decided not to use is a claim we must drop.
 //
 // An ownerAgent loser keeps the older, lighter treatment: the slot marker goes
 // and the pane stays. It is a pane this server created, so nothing of the user's
@@ -682,164 +730,124 @@ func (s *slots) closeCandidateLocked(
 	return dead[0], true
 }
 
-// acquirePaneLocked adopts the first pane in the window that may be adopted, and
-// marks it as ours-by-adoption. The caller must hold slotMu.
+// reclaimPaneLocked gives a slot a pane this server family opened and nothing
+// points at any more. The caller must hold slotMu.
 //
-// Panes are considered in pane-id order — oldest first — so that the choice is
-// deterministic under test and so that repeated adoptions in one window walk the
-// same sequence rather than depending on tmux's layout ordering.
+// # Why such panes exist
 //
-// The owner recorded is ownerAcquired, never ownerAgent, and that distinction is
-// the whole reason the owner field carries a kind rather than a boolean:
-// close-pane KILLS a pane we created and merely RELEASES one we adopted, because
-// killing a pane the user opened is the single unrecoverable action in this
-// design. Marking an adopted pane "agent" would also make it a reuse candidate
-// for legacy split-pane calls, whose contract says a reused pane is safe to
-// kill.
+// An agent-owned pane with no slot marker is reachable by no request: reuse
+// matches on the slot number, and nothing else looks at agent-owned panes. Three
+// things leave panes in that state — a v1 split-pane, which marked its pane with
+// no slot; the loser of a duplicate-slot race, which keeps its pane and loses
+// its number (retireDuplicateLocked); and a create whose slot write failed.
+// Without this step every later request opens one more pane beside it, and the
+// window fills with idle helpers nobody can address.
 //
-// A failure to write the markers abandons the adoption rather than returning the
-// pane: an adopted pane whose owner mark did not stick is a pane we would type
-// into and never be able to identify again, which is worse than not adopting it.
-// Abandoning it also means undoing whatever part of the mark did stick, which is
-// adoptCandidateLocked's job and the reason that step is a function of its own.
-func (s *slots) acquirePaneLocked(
+// # What may be taken
+//
+// Only records from the witnessed registry, so a pane carrying none of our
+// marks — the user's shell, a pane restored by tmux-resurrect, a released
+// helper — is never a candidate, however idle it looks. Among ours: owner
+// "agent" (an ownerAcquired record names a pane the user opened), no slot,
+// alive, not this server's own pane, the shell at a line-editing prompt with
+// nothing queued (paneIsReadyShell), and the same user as this server. A pane
+// running anything — a dev server, an editor, cat — is left alone, because
+// typing into it would feed that program; so is one still sourcing its rc,
+// because the line editor is not reading yet.
+//
+// Panes are considered oldest first, so the choice is deterministic. A pane
+// whose slot write fails is skipped rather than returned: a pane handed back
+// without its slot would be found by nothing on the next call.
+//
+// The reclaimed pane is reported as created, because it is new to this slot:
+// the agent must not assume that a process of its own is running there. Its
+// caller puts it back in this server's directory; see resetReclaimed.
+func (s *slots) reclaimPaneLocked(
 	ctx context.Context, reg map[paneRef]paneRecord, slot int, self paneRef,
 ) (paneRef, bool) {
-	panes, err := s.b.Siblings(ctx, self)
-	if err != nil {
-		return paneRef{}, false
+	var candidates []paneRecord
+	for _, rec := range reg {
+		if rec.Owner != ownerAgent || rec.Slot != 0 || rec.Dead || rec.Ref.empty() || rec.Ref == self {
+			continue
+		}
+		candidates = append(candidates, rec)
 	}
-	sort.Slice(panes, func(i, j int) bool {
-		return panes[i].Seq < panes[j].Seq
-	})
-	for _, p := range panes {
-		if _, claimed := reg[p.Ref]; claimed {
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Seq < candidates[j].Seq })
+	for _, rec := range candidates {
+		state, err := s.b.Foreground(ctx, rec.Ref)
+		if err != nil || !paneIsReadyShell(state) || !sameUIDAsAgent(state) {
 			continue
 		}
-		if !s.canAcquire(ctx, p.Ref, self) {
+		if err := s.b.SetSlot(ctx, rec.Ref, slot); err != nil {
 			continue
 		}
-		if !s.adoptCandidateLocked(ctx, p.Ref, slot) {
-			continue
-		}
-		return p.Ref, true
+		_ = s.b.SetTitle(ctx, rec.Ref, helperTitle(slot))
+		return rec.Ref, true
 	}
 	return paneRef{}, false
 }
 
-// partialMarkUndoTimeout bounds the rollback in adoptCandidateLocked. It is
-// short because the rollback is three set-option calls against a pane we have
-// just been talking to, and because it runs under slotMu: a wedged tmux must not
-// be able to hold the lock that every other resolution is queued behind.
-const partialMarkUndoTimeout = 2 * time.Second
-
-// adoptCandidateLocked writes the markers that make one candidate pane
-// ours-by-adoption, and leaves NOTHING behind if it cannot write all of them.
-// The caller must hold slotMu.
+// resetReclaimed puts a reclaimed pane back where a new pane would start: in
+// this server's directory, with a clear screen.
 //
-// Claim writes witness → owner → slot and returns on the first failure, so a cancelled context or one transient tmux error leaves a *prefix*
-// of that sequence on the pane. Every prefix is inert to slot resolution — the
-// write order is chosen there precisely so a half-claimed pane can never steer a
-// later call — and "inert" was mistaken for "harmless", which it is not on a
-// pane the USER owns.
-//
-// witness + owner with no slot is a record parseRegistryLine accepts, and it
-// strands the pane in exactly the state clearPaneRegistration's comment says
-// must never be produced. canAcquire refuses any pane whose owner mark is set at
-// all, so it can never be adopted again; no slot lookup matches it, so it is
-// never reused; and close-pane({slot:"all"}) covers records at slotDefault and
-// above, so no teardown will ever come back for it. What the user is left with
-// is one of their own shells, wearing our label, that no tool in this server can
-// see or release — and the moment the write fails is the only moment anything in
-// the process knows it happened.
-//
-// The undo runs on a context DETACHED from the caller's, and that is the whole
-// point rather than a detail. The likeliest reason the mark failed is that the
-// caller's context expired; a rollback issued on that same dead context is three
-// tmux commands that do not run, so the repair would be missing in precisely the
-// case that motivates it. context.WithoutCancel keeps the values and drops the
-// cancellation, and the timeout above bounds what that buys.
-//
-// The title is written last and its failure ignored, as everywhere else here: a
-// label is cosmetic, and a pane we have successfully claimed must not be
-// abandoned over one. This is also why the whole step is its own function —
-// a future edit that adds a fourth marker has one place to put it, and cannot
-// add it above the rollback by accident.
-func (s *slots) adoptCandidateLocked(ctx context.Context, pane paneRef, slot int) bool {
-	if err := s.b.Claim(ctx, pane, ownerAcquired, slot); err != nil {
-		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
-		defer cancel()
-		_ = s.b.ClearMarks(undoCtx, pane)
-		return false
+// A reclaimed pane is reported as created, and the agent will treat it as one.
+// The shell in it is not new, though: it was left by an earlier agent, which may
+// have cd'd anywhere. The directory is the part that can be put right safely —
+// one cd, typed at a prompt reclaim has already confirmed — so it is, and the
+// screen is cleared the way write-to-display clears a pane we own. Exported
+// variables, an activated virtualenv and shell options cannot be undone without
+// knowing what set them, and stay as they were; the README says so.
+func (s *slots) resetReclaimed(ctx context.Context, pane paneRef) error {
+	if s.cwd == "" {
+		return nil
 	}
-	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
-	return true
+	if err := s.sendValidated(ctx, pane, "cd -- "+shellQuote(s.cwd), true, true); err != nil {
+		return err
+	}
+	return s.clearForDisplay(ctx, paneTarget{Ref: pane, Owner: ownerAgent})
 }
 
-// canAcquire reports whether an unowned pane may be adopted as a helper.
-//
-// Every error is a "no". This predicate decides whether to type into a pane that
-// the USER, not the server, opened; a probe that failed is not evidence of
-// safety, and the fallback when it says no is merely to create a pane, which is
-// always correct and only slightly less thrifty.
-//
-// # What it checks
-//
-// The pane is not this server's own (Invariant R). It is alive with its shell in
-// the foreground — paneIsIdleShell, NOT PaneState.WaitingForInput, and that must
-// not regress: an idle interactive shell reports waitingForInput=false on Linux,
-// where readline blocks in poll/select rather than n_tty_read, and true on
-// macOS. It carries no owner mark of any kind. And the process that would
-// receive our keystrokes belongs to the same user as this server.
-//
-// The uid guard's usual justification is half wrong, and the correction matters
-// because the next reader will otherwise delete the guard as redundant. An
-// ordinary `sudo -i` does NOT slip past the idle check: sudo runs as a child of
-// the user's shell, so ForegroundPID != PanePID and paneIsIdleShell already says
-// no. What the uid guard actually closes is the case where the pane's OWN
-// process belongs to another user — `exec sudo -i`, a pane started as
-// `split-window sudo -i`, an exec'd `su`, a shell in a namespace with a
-// different uid. There ForegroundPID == PanePID, the command is "bash", and
-// nothing but the uid tells it apart from an ordinary idle shell.
-//
-// # What it cannot check — known, accepted limitations
-//
-// These are not TODOs. They are the price of acquisition, accepted knowingly
-// when this shipped enabled by default, and they are written down because the
-// guards above look complete and are not.
-//
-// It cannot see the tty's input buffer. A pane where the user typed a command
-// and never pressed Enter is indistinguishable from a pane sitting at an empty
-// prompt: same foreground process, same pid, same everything we can observe.
-// Adopting it and sending "cmd\n" executes the CONCATENATION of their
-// unsubmitted text and our command — `git push --forceecho hello`, or worse,
-// something that parses. This is not detectable from outside the process: tmux
-// exposes #{cursor_x} and #{cursor_y} but nothing that says where the prompt
-// ends, so pending input cannot be told apart from a wide prompt. (write-to-
-// display sends C-u before writing for exactly this reason; that clears the
-// user's line, which is a destruction we are not willing to perform here.)
-//
-// And the uid guard proves WHO owns the shell, not WHAT context it is in. A
-// shell inside a user namespace, inside a virtualenv, inside a container's exec
-// session, or one with AWS_PROFILE=production exported, passes every check here
-// — it is the right user, at a prompt, doing nothing. Our commands then run in
-// that context, with that environment, against that account.
-func (s *slots) canAcquire(ctx context.Context, pane, self paneRef) bool {
-	if pane.empty() || pane == self {
-		return false
-	}
-	owner, err := s.b.OwnerMark(ctx, pane)
-	if err != nil || owner != "" {
-		return false
-	}
-	state, err := s.b.Foreground(ctx, pane)
+// shellQuote quotes a string as one word for any POSIX shell, and for fish:
+// single quotes, with each embedded quote closed, escaped and reopened.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// carriesRecord reports whether a pane has a record of ours in the window
+// registry. A failed read counts as no record.
+func (s *slots) carriesRecord(ctx context.Context, self, pane paneRef) bool {
+	reg, err := s.b.Records(ctx, self)
 	if err != nil {
 		return false
 	}
-	if !paneIsIdleShell(state) {
-		return false
-	}
-	return sameUIDAsAgent(state)
+	_, ok := reg[pane]
+	return ok
+}
+
+// partialMarkUndoTimeout bounds a cleanup that runs on a context detached from
+// the caller's. It is short because the cleanup is a handful of commands
+// against a pane we have just been talking to, and because it runs under
+// slotMu: a wedged multiplexer must not be able to hold the lock every other
+// resolution is queued behind.
+const partialMarkUndoTimeout = 2 * time.Second
+
+// disownLocked drops this server's record from a pane the user opened, and
+// leaves the pane and whatever runs in it exactly as they are. The caller must
+// hold slotMu.
+//
+// It is what resolution does with a legacy ownerAcquired holder. Unlike
+// releaseAcquiredLocked there is no C-c: close-pane is a request to stop using
+// the pane, made by the agent that started something there, while this runs
+// on the way to some unrelated request, and the process now in the pane may be
+// the user's own. The cleanup runs on a detached context for the reason
+// createIsolatedLocked gives, and its failures are ignored: the slot is
+// resolved to a new pane either way, and a mark that survives is retried by the
+// next resolution that meets it.
+func (s *slots) disownLocked(ctx context.Context, rec paneRecord) {
+	undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
+	defer cancel()
+	_ = s.b.ClearMarks(undoCtx, rec.Ref)
+	_ = s.b.SetTitle(undoCtx, rec.Ref, "")
 }
 
 // sameUIDAsAgent reports whether the process that would receive our keystrokes
@@ -859,8 +867,8 @@ func (s *slots) canAcquire(ctx context.Context, pane, self paneRef) bool {
 // The reference identity is os.Getuid(), this server's own uid, rather than the
 // uid of the agent's pane. It needs no syscall, cannot fail, and fails in the
 // safe direction: a server somehow running as root would compare 0 against the
-// user's 501 and acquire nothing at all, whereas comparing pane-to-pane would
-// have it cheerfully adopt every shell the user owns.
+// user's 501 and reclaim nothing at all, whereas comparing pane-to-pane would
+// accept whatever identity the agent's pane happened to have.
 func sameUIDAsAgent(state *PaneState) bool {
 	if state == nil {
 		return false
@@ -879,31 +887,25 @@ func sameUIDAsAgent(state *PaneState) bool {
 
 // placementForSlot decides where a new helper pane goes.
 //
-//	slot 1  → split self horizontally: the helper lands beside the agent, which
-//	          is where the user is already looking.
-//	slot 2  → split the slot-1 pane vertically — if we MADE the slot-1 pane — so
-//	          the two helpers stack in the same column instead of squeezing the
-//	          agent's own pane again.
-//	slot 3  → split self vertically.
-//	slot ≥4 → split whichever agent-owned pane has the most room left.
+//	slot 1  → split self beside: the helper lands right of the agent, which is
+//	          where the user is already looking.
+//	slot 2  → split the slot-1 pane below, so the two helpers stack in one
+//	          column instead of squeezing the agent's own pane again. With no
+//	          live slot-1 pane of ours it goes beside self instead: the spot
+//	          slot 1 would have taken.
+//	slot 3  → split self below: under the agent, in the agent's column.
+//	slot ≥4 → split the largest helper we made, along its longer side.
 //
-// Every anchor in that table is a pane this server created, and the owner check
-// in case 2 is what makes that true rather than nearly true. The slot-1 pane may
-// have been ADOPTED from the user, and an acquired pane is the user's real
-// estate: we may type into it, because that is what acquisition means, but
-// halving it rearranges a layout they built by hand — a visible change nobody
-// asked for, arriving from a request to open a second helper somewhere. That is
-// the policy anchorOrSelf states and enforces for slot ≥4; this fast path
-// skipped it, which made the rule true only where nothing had been adopted. An
-// acquired slot 1 therefore falls through to anchorOrSelf, which picks another
-// pane we made or, finding none, splits the agent's own pane — the same answer
-// as if slot 1 were not there at all.
+// Every anchor in that table is self or a pane this server created. The owner
+// check in case 2 is what makes that true rather than nearly true: a legacy
+// ownerAcquired record in slot 1 names a pane the user opened, and halving it
+// would rearrange a layout they built by hand.
 //
-// Only the anchor can be missing, and every fallback chain terminates at self,
-// which cannot be missing: resolveHelperLocked has already failed with
-// errNoWindow if there were no self pane. So a slot-2 request made while slot 1
-// does not exist produces exactly one pane, placed where slot 1 would have gone
-// and marked slot 2.
+// The table depends on nothing but which of our own helpers exist. That is the
+// property that keeps the agent's pane at least half its height after slots 1
+// to 3, and it is why the slot-2 fallback is "beside self" rather than "below
+// self": below self is slot 3's place, and taking it there squeezes the agent
+// twice.
 //
 // It deliberately does NOT create the missing anchor first. Resolving one slot
 // creates at most one pane: creating slot 1 as a side effect of a slot-2 request
@@ -912,9 +914,10 @@ func sameUIDAsAgent(state *PaneState) bool {
 // it cannot mean that if the call also produced a second pane for another slot.
 //
 // It returns no error. Every failure inside degrades to the self anchor, which
-// is where the fallback chain ends anyway; letting a cosmetic geometry decision
-// fail a resolution that is otherwise able to proceed would trade a slightly
-// worse layout for no pane at all.
+// cannot be missing: resolveHelperLocked has already failed with errNoWindow if
+// there were no self pane. Letting a cosmetic geometry decision fail a
+// resolution that is otherwise able to proceed would trade a slightly worse
+// layout for no pane at all.
 func (s *slots) placementForSlot(
 	ctx context.Context, reg map[paneRef]paneRecord, slot int, self paneRef,
 ) placement {
@@ -925,12 +928,26 @@ func (s *slots) placementForSlot(
 		if rec, ok := aliveSlotPane(reg, slotDefault); ok && rec.Owner == ownerAgent && rec.Ref != self {
 			return placement{Anchor: rec.Ref, Axis: splitBelow, SizePercent: 50}
 		}
-		return placement{Anchor: s.anchorOrSelf(ctx, reg, self), Axis: splitBelow, SizePercent: 50}
+		return placement{Anchor: self, Axis: splitBeside, SizePercent: 50}
 	case 3:
 		return placement{Anchor: self, Axis: splitBelow, SizePercent: 50}
 	default:
-		return placement{Anchor: s.anchorOrSelf(ctx, reg, self), Axis: splitBelow, SizePercent: 50}
+		helper, ok := s.largestHelper(ctx, reg, self)
+		if !ok {
+			return placement{Anchor: self, Axis: splitBeside, SizePercent: 50}
+		}
+		return placement{Anchor: helper.Ref, Axis: longerSide(helper), SizePercent: 50}
 	}
+}
+
+// longerSide is the axis that halves a pane's longer visual side. A cell is
+// about twice as tall as it is wide, so a pane is visually wider than tall when
+// its width in cells exceeds twice its height.
+func longerSide(p paneInfo) splitAxis {
+	if p.Width > 2*p.Height {
+		return splitBeside
+	}
+	return splitBelow
 }
 
 // aliveSlotPane returns the live pane holding the given slot, if any.
@@ -949,46 +966,37 @@ func aliveSlotPane(reg map[paneRef]paneRecord, slot int) (paneRecord, bool) {
 	return paneRecord{}, false
 }
 
-// anchorOrSelf returns the agent-owned pane with the most room to give up, or
-// self when there is none.
+// largestHelper returns the agent-owned pane with the most room to give up.
 //
-// Panes are ranked by AREA — width × height. tmux exposes no area variable, and
-// width and height are the only per-pane size facts available; area rather than
-// either dimension alone is the right metric because a split halves one
-// dimension, and the pane that can lose half of one and stay usable is the one
-// with the most cells to start with. Ties go to the lowest pane id purely so the
-// choice is deterministic under test.
+// Panes are ranked by AREA — width × height. Area rather than either dimension
+// alone is the right metric because a split halves one dimension, and the pane
+// that can lose half of one and stay usable is the one with the most cells to
+// start with. Ties go to the oldest pane purely so the choice is deterministic
+// under test.
 //
-// Acquired panes are excluded on purpose. An acquired pane is the user's real
-// estate: we may type into it, because that is what acquisition means, but
-// halving it rearranges a layout the user built by hand, which is a visible
-// change nobody asked for. We split panes we made.
-func (s *slots) anchorOrSelf(
+// Only panes this server made qualify. A legacy acquired pane is the user's,
+// and halving it rearranges a layout the user built by hand; the agent's own
+// pane is not a helper.
+func (s *slots) largestHelper(
 	ctx context.Context, reg map[paneRef]paneRecord, self paneRef,
-) paneRef {
+) (paneInfo, bool) {
 	panes, err := s.b.Siblings(ctx, self)
 	if err != nil {
-		return self
+		return paneInfo{}, false
 	}
-	var best paneRef
-	bestArea, bestSeq := 0, 0
+	var best paneInfo
+	found := false
 	for _, p := range panes {
 		rec, ok := reg[p.Ref]
 		if !ok || rec.Owner != ownerAgent || rec.Dead || p.Ref == self {
 			continue
 		}
-		area := p.Width * p.Height
-		switch {
-		case area > bestArea:
-			best, bestArea, bestSeq = p.Ref, area, p.Seq
-		case area == bestArea && !best.empty() && p.Seq < bestSeq:
-			best, bestSeq = p.Ref, p.Seq
+		area, bestArea := p.Width*p.Height, best.Width*best.Height
+		if !found || area > bestArea || (area == bestArea && p.Seq < best.Seq) {
+			best, found = p, true
 		}
 	}
-	if best.empty() {
-		return self
-	}
-	return best
+	return best, found
 }
 
 // ---- Teardown ----
@@ -1019,14 +1027,14 @@ const (
 // nothing survives that the user wanted. Killing a pane the USER opened is the
 // one unrecoverable action available anywhere in this design — whatever was in
 // its scrollback, whatever they had half-typed, whatever ssh session it held, is
-// gone with no way back. Sending C-c into an idle shell we were allowed to adopt
-// is not in that category: it interrupts nothing that was running, and hands the
-// pane back in the state we found it.
+// gone with no way back. Releasing it — C-c and the marks removed — is not in
+// that category: it interrupts at most what the agent left running there, and
+// hands the pane back as an ordinary shell.
 //
 // # Why the self guard is here and not in the caller
 //
 // Every OTHER path already excludes this server's own pane — slotCandidateLocked
-// drops it from reuse, canAcquire drops it from acquisition,
+// drops it from reuse, reclaimPaneLocked skips it,
 // slottedHelpersInSelfWindowLocked drops it from "all" — and the one path that
 // did not was the explicit one. close-pane({paneId}) looked the pane up, found a
 // valid agent-owned record, and went straight to KillPane. Putting the guard at
@@ -1082,7 +1090,8 @@ func (s *slots) closeHelperLocked(ctx context.Context, rec paneRecord, self pane
 	}
 }
 
-// releaseAcquiredLocked hands an adopted pane back to the user: interrupt
+// releaseAcquiredLocked hands a pane under an ownerAcquired record back to the
+// user: interrupt
 // whatever we may have left running in it, remove every marker, drop the label.
 // The caller must hold slotMu.
 //
@@ -1256,8 +1265,8 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 // slotted or not. The caller must hold slotMu.
 //
 // It is namespace-scoped where the visible half is slot-scoped, and the
-// asymmetry is the same argument that abolishes adoption on that socket: every
-// pane in our namespace was created by this process, so a pane whose marks are
+// asymmetry follows from who can own a pane there: every pane in our namespace
+// was created by this process, so a pane whose marks are
 // missing or partial is still ours to close. In the user's window the opposite
 // holds — an unmarked pane there is presumed the user's, and killing it is the
 // one unrecoverable action in this design.
@@ -1398,7 +1407,7 @@ func (s *slots) visibleSlotsLocked(
 // only thing a caller needs to know is where the pane came from.
 const (
 	originCreated = "created"
-	originAdopted = "adopted"
+	originAdopted = "adopted" // an ownerAcquired record, left by an older server
 )
 
 // listSlots answers list-slots, and takes slotMu because reading the registry
@@ -1431,7 +1440,7 @@ func (s *slots) listSlots(ctx context.Context) ([]slotListing, error) {
 //
 // So it runs the same two repairs resolution runs, through the same functions:
 // self-exclusion clears a stale marker off our own pane, and duplicate healing
-// keeps the oldest holder and retires the rest (releasing an adopted loser
+// keeps the oldest holder and retires the rest (releasing an acquired loser
 // rather than stranding it). That makes a read mildly mutating, which is why
 // list-slots carries no readOnlyHint.
 //
@@ -1526,44 +1535,481 @@ func (s *slots) listingFor(ctx context.Context, rec paneRecord, isolated bool) s
 	return entry
 }
 
-// waitForShellReady blocks until a just-created pane's shell is sitting at its
-// prompt, or until a short timeout expires. It is best-effort by design and
-// never reports failure.
+// ---- Typing into a shell: readiness, and evidence that the input landed ----
 //
-// tmux's split-window returns as soon as the pane exists, which is well before
-// the shell inside it has finished sourcing its rc files. This repo already
-// carries direct evidence that the gap is real and long enough to matter: the
-// comment on foregroundOfGroup in process.go documents powerlevel10k forking
-// helper processes out of its precmd hooks on a developer's machine, which is
-// the same startup work, observed from the other side. Keystrokes delivered into
-// a shell that is still initialising can be mangled or dropped outright — the
-// tty's line discipline and echo settings are still being configured, and any
-// input that arrives first is at the mercy of whatever the shell does next —
-// which produces the worst class of bug this server can have: a command that
-// looks sent, leaves a plausible-looking pane, and never ran.
+// Everything below is written once, here, above the port, so every backend
+// gets the same rules. A backend supplies the facts in PaneState — whose
+// process is in the foreground, whether the tty is in canonical mode, whether
+// that process is asleep reading the tty, how much is queued on it — and these
+// functions decide what those facts permit.
+
+// Timing for the readiness gate and the landing checks.
 //
-// A timeout returns the pane anyway rather than failing. A slow shell is not an
-// error, and a resolution that refused to hand back a pane it had just
-// successfully created would turn a cosmetic delay into a hard failure. The wait
-// is short for the same reason: it is insurance against the common case, not a
-// guarantee.
+// shellReadyTimeout covers a heavy interactive rc (powerlevel10k, nvm, conda)
+// with room to spare; a shell slower than that fails the call with a message
+// naming the slot rather than having keys typed into a terminal nobody reads.
+// opaqueBudget bounds the wait for a pane the probe cannot read. promptSettle
+// and editorOffSettle are how long a screen must stay unchanged to count as a
+// prompt when no positive answer exists; see settleFor. inputLandingTimeout is
+// how long a line editor that is already reading is given to take what was
+// sent: it consumes keys in microseconds, so two seconds only ever runs out
+// when nothing is reading at all.
+const (
+	shellReadyTimeout   = 10 * time.Second
+	opaqueBudget        = 3 * time.Second
+	promptSettle        = 300 * time.Millisecond
+	editorOffSettle     = 2 * time.Second
+	inputLandingTimeout = 2 * time.Second
+	readyPollInterval   = 50 * time.Millisecond
+	readyStreak         = 2
+)
+
+// The ways typing into a shell can be refused. They name no pane; the handlers
+// prefix the slot. Each says only what is provably true: errInputNotTaken is
+// used only for a single line sent without Enter, which cannot have run.
+var (
+	errShellNotReady = errors.New("the shell did not become ready to read input, so nothing was typed")
+	errInputNotTaken = errors.New("the shell did not read the keys that were sent, " +
+		"so they were not run; nothing was submitted")
+	errInputUnconfirmed = errors.New("could not confirm the shell read the input; " +
+		"look at the pane before sending it again")
+	errEnterNotTaken = errors.New("the shell did not read the Enter key, so the line it holds was not run")
+)
+
+// paneIsReadyShell reports whether a shell is at a prompt whose line editor is
+// reading: the shell in the foreground (paneIsIdleShell), its tty in
+// non-canonical mode, and nothing typed and still unread.
 //
-// Only the creation path waits. Reuse does not need it — a pane is only a reuse
-// candidate because it was already found idle — and neither does acquisition,
-// where canAcquire has just proved the shell idle as its precondition.
-func (s *slots) waitForShellReady(ctx context.Context, pane paneRef) {
-	const (
-		readyTimeout  = 2 * time.Second
-		readyInterval = 50 * time.Millisecond
-	)
-	deadline := time.Now().Add(readyTimeout)
+// It is reclaim's predicate, and it is strict on purpose: a pane is only taken
+// on a positive answer. A shell with no line editor of its own never leaves
+// canonical mode, so for those the mode is not required and only the empty
+// queue is.
+func paneIsReadyShell(s *PaneState) bool {
+	if !paneIsIdleShell(s) || !s.InputKnown || s.PendingInput != 0 {
+		return false
+	}
+	return s.LineEditing || !hasLineEditor(s.ForegroundCmd)
+}
+
+// hasLineEditor reports whether a shell reads its prompt through a line editor
+// that switches the tty out of canonical mode. dash, plain sh, ksh and csh read
+// lines through the kernel's own canonical mode.
+func hasLineEditor(cmd string) bool {
+	switch strings.TrimPrefix(cmd, "-") {
+	case "zsh", "bash", "fish", "tcsh":
+		return true
+	}
+	return false
+}
+
+// promptReading is what one sample of a pane says about whether it is reading.
+type promptReading int
+
+const (
+	// promptNotYet: something else owns the tty, input is queued, or the
+	// pane's shell is running rather than waiting — sourcing its rc.
+	promptNotYet promptReading = iota
+	// promptEditing: a line editor has the tty in non-canonical mode.
+	promptEditing
+	// promptCanonical: the kernel reports the pane's own process asleep in a
+	// read on its tty (Linux shows this; macOS does not).
+	promptCanonical
+	// promptQuiet: a shell this probe knows is in the foreground, asleep, with
+	// its tty canonical and nothing queued. That is a prompt read without a line
+	// editor — or an rc waiting on a timer. Only a settled screen tells them
+	// apart; see waitForShellReady.
+	promptQuiet
+	// promptOpaque: the pane's own process is in the foreground, but the probe
+	// cannot give a positive answer about it: the platform has no probe, the
+	// probe failed, or the program is not a shell the probe knows.
+	promptOpaque
+)
+
+// readPrompt classifies one sample.
+//
+// The two positive answers are facts the kernel reports, not inferences from a
+// name. A line editor clears ICANON for as long as it waits at the prompt; a
+// canonical reader sleeps in the tty's read routine, where the platform says
+// so. A shell sourcing its rc is neither: it is running, or asleep somewhere
+// else (a timer, select, a child).
+func readPrompt(s *PaneState) promptReading {
+	if s == nil || !s.IsAlive || s.PanePID <= 0 || s.ForegroundPID != s.PanePID {
+		return promptNotYet
+	}
+	if !ttyProbeSupported || !s.InputKnown {
+		return promptOpaque
+	}
+	switch {
+	case s.PendingInput != 0:
+		return promptNotYet
+	case s.LineEditing:
+		return promptEditing
+	case s.ReadingTTY:
+		return promptCanonical
+	case !isShellProcess(s.ForegroundCmd):
+		return promptOpaque
+	case s.WaitingForInput:
+		return promptQuiet
+	}
+	return promptNotYet
+}
+
+// atPrompt is the positive answer: a line editor or a canonical reader.
+func atPrompt(r promptReading) bool { return r == promptEditing || r == promptCanonical }
+
+// settleFor is how long a pane's screen must stay unchanged, with something on
+// it, before a reading that has no positive answer counts as a prompt.
+//
+// A shell that normally runs a line editor and is sitting canonical and quiet
+// is most often still in its rc — waiting on a timer or a slow network call —
+// so it is given the long settle: an rc that has drawn nothing never settles at
+// all, and one that drew a banner has to stay silent for two seconds. A shell
+// with no line editor, or a program the probe does not know, is given the
+// short one.
+func settleFor(r promptReading, cmd string) time.Duration {
+	if r == promptQuiet && hasLineEditor(cmd) {
+		return editorOffSettle
+	}
+	return promptSettle
+}
+
+// waitForShellReady blocks until a pane is reading input at a prompt, and fails
+// when a shell it can read does not get there.
+//
+// The multiplexer returns a new pane as soon as it exists, long before the shell
+// inside it has finished its rc files. Keys that arrive first queue on the tty,
+// and an rc that drains typeahead discards them: the command looks sent, the
+// pane looks fine, and nothing ran. So a pane this resolution has just opened or
+// reclaimed is not handed to a caller until it is reading, and execute-command
+// waits the same way before it types its command line.
+//
+// A positive answer has to hold on two polls in a row. A line editor flips the
+// tty into non-canonical mode for good; an rc that reads a key or two (`read
+// -k`) flips it for an instant, and a single sample can land in that instant.
+//
+// Without a positive answer, a pane still counts as ready once nothing is
+// queued and its screen, with a prompt or anything else on it, has not changed
+// for settleFor. That is how a shell with its line editor switched off (bash
+// --noediting, zsh under TERM=dumb) or with none (dash) is recognised, since a
+// canonical read is invisible to the probe on macOS. A pane the probe cannot
+// read at all — no probe on this platform, a probe that failed, a program it
+// does not know — is used after opaqueBudget at the latest, as it was before
+// the probe existed. Only a shell the probe can read, and that never settles,
+// is an error.
+//
+// A pane that vanishes ends the wait at once: no amount of waiting brings it
+// back.
+func (s *slots) waitForShellReady(ctx context.Context, pane paneRef) error {
+	deadline := time.Now().Add(shellReadyTimeout)
+	streak := 0
+	var opaqueSince, settledSince time.Time
+	var lastScreen string
 	for {
-		if state, err := s.b.Foreground(ctx, pane); err == nil && paneIsIdleShell(state) {
-			return
+		state, err := s.b.Foreground(ctx, pane)
+		if errors.Is(err, errPaneGone) {
+			return errShellNotReady
 		}
-		if ctx.Err() != nil || time.Now().After(deadline) {
-			return
+		reading := promptNotYet
+		if err == nil {
+			reading = readPrompt(state)
 		}
-		time.Sleep(readyInterval)
+		now := time.Now()
+		switch reading {
+		case promptEditing, promptCanonical:
+			streak++
+			if streak >= readyStreak {
+				return nil
+			}
+		case promptQuiet, promptOpaque:
+			streak = 0
+			if reading == promptOpaque {
+				if opaqueSince.IsZero() {
+					opaqueSince = now
+				}
+				if now.Sub(opaqueSince) >= opaqueBudget {
+					return nil
+				}
+			}
+			screen, capErr := s.b.Capture(ctx, pane, 0, false)
+			switch {
+			case capErr != nil || screen != lastScreen || settledSince.IsZero():
+				lastScreen, settledSince = screen, now
+			case strings.TrimSpace(screen) != "" && now.Sub(settledSince) >= settleFor(reading, state.ForegroundCmd):
+				return nil
+			}
+		default:
+			streak = 0
+			opaqueSince, settledSince = time.Time{}, time.Time{}
+		}
+		if reading != promptOpaque {
+			opaqueSince = time.Time{}
+		}
+		if reading != promptQuiet && reading != promptOpaque {
+			settledSince = time.Time{}
+		}
+		if time.Now().After(deadline) || !sleepCtx(ctx, readyPollInterval) {
+			return errShellNotReady
+		}
+	}
+}
+
+// sleepCtx waits for d, and reports false when ctx ends first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// atLineEditor reports whether a pane's line editor is reading right now, on
+// the same two-sample rule waitForShellReady uses.
+func (s *slots) atLineEditor(ctx context.Context, pane paneRef) bool {
+	for i := 0; i < readyStreak; i++ {
+		if i > 0 && !sleepCtx(ctx, readyPollInterval) {
+			return false
+		}
+		state, err := s.b.Foreground(ctx, pane)
+		if err != nil || readPrompt(state) != promptEditing {
+			return false
+		}
+	}
+	return true
+}
+
+// sendValidated types into a pane and, when a line editor is reading there,
+// makes sure it took what was typed.
+//
+// It is the one path every keystroke-delivering tool uses for its payload. It
+// does not wait for a prompt: a pane this call opened or reclaimed has already
+// been waited for during resolution, and a send into an existing slot is meant
+// for whatever owns its tty now — a REPL, an editor, a builtin loop the agent
+// wants to interrupt, a `read` waiting for an answer. Those keys pass straight
+// through, as they always have.
+//
+// The checks apply only where they mean something, which is a literal payload
+// typed at a line editor:
+//
+//  1. Send the text WITHOUT Enter and wait until the queue is empty with the
+//     editor still reading: the evidence it took the bytes into its buffer.
+//     A single line still queued when the budget runs out has not run, because
+//     Enter was never sent, and the call says so. A payload with a line break
+//     in it may have run its first line, so the most that can be said is that
+//     reading it could not be confirmed.
+//  2. Send Enter on its own and wait until it is no longer queued. A CR the
+//     editor consumed is accept-line; one left in the queue is a line that did
+//     not run.
+//
+// A key sent with literal:false — C-c, Escape, Enter, any key name — is never
+// checked as text. It is not text: it is an action for whatever reads the tty,
+// and the state it leaves the shell in says nothing about whether it arrived.
+func (s *slots) sendValidated(ctx context.Context, pane paneRef, text string, literal, enter bool) error {
+	if !literal || !ttyProbeSupported || !s.atLineEditor(ctx, pane) {
+		return s.b.SendKeys(ctx, pane, text, literal, enter)
+	}
+	if text != "" {
+		multiLine := strings.ContainsAny(text, "\r\n")
+		if err := s.b.SendKeys(ctx, pane, text, literal, false); err != nil {
+			return err
+		}
+		if !s.awaitConsumed(ctx, pane, !multiLine) {
+			if multiLine {
+				return errInputUnconfirmed
+			}
+			return errInputNotTaken
+		}
+	}
+	if !enter {
+		return nil
+	}
+	if err := s.b.SendKeys(ctx, pane, "Enter", false, false); err != nil {
+		return err
+	}
+	if !s.awaitConsumed(ctx, pane, false) {
+		return errEnterNotTaken
+	}
+	return nil
+}
+
+// awaitConsumed polls until nothing typed is left unread on the pane's tty.
+// With stillEditing it also requires the line editor to be reading, which is
+// what tells "the editor has the bytes in its buffer" apart from "a canonical
+// reader has not yet seen a complete line".
+//
+// A foreground that is no longer the shell counts as consumed: the input
+// started something, which is the opposite of input left in the queue. So does
+// a pane that is gone, because the send itself has already succeeded and the
+// next call will find out.
+func (s *slots) awaitConsumed(ctx context.Context, pane paneRef, stillEditing bool) bool {
+	deadline := time.Now().Add(inputLandingTimeout)
+	for {
+		state, err := s.b.Foreground(ctx, pane)
+		switch {
+		case errors.Is(err, errPaneGone):
+			return true
+		case err == nil && !paneIsIdleShell(state):
+			return true
+		case err == nil && state.InputKnown && state.PendingInput == 0 &&
+			(!stillEditing || state.LineEditing):
+			return true
+		}
+		if time.Now().After(deadline) || !sleepCtx(ctx, readyPollInterval) {
+			return false
+		}
+	}
+}
+
+// ---- Running one command to completion ----
+
+// Timing for execInPane. execStartTimeout is how long a command typed into a
+// ready shell is given to begin before the shell is looked at again;
+// execPollInterval is how often the exit file is checked.
+const (
+	execStartTimeout = 3 * time.Second
+	execPollInterval = 50 * time.Millisecond
+)
+
+// execInPane runs one shell command in a pane and waits for it to finish.
+//
+// The command is wrapped so that it marks its own start, tees its output to a
+// file and writes its exit status to another (see wrapCommand), and completion
+// is the exit file appearing. Polling a file is the one completion signal that
+// works under every multiplexer; nothing here needs the multiplexer to wait.
+//
+// When the pane's own shell is in the foreground, the command line is not typed
+// until that shell is reading (waitForShellReady): a shell still busy with
+// something of its own would queue the line, and an rc can throw it away. When
+// another program owns the tty, the line is for that program, and it is sent as
+// it always has been.
+//
+// # The one re-send
+//
+// The wrapper is typed through sendValidated, so a line editor has taken every
+// byte and the Enter. That still does not prove the command started: an rc file
+// can discard a line its editor had already accepted, and a completion widget
+// can take Enter for itself and leave the line where it was. So the start
+// marker is watched, and if it has not appeared after execStartTimeout while
+// the shell is back at a prompt with nothing running, the command provably
+// never began, and it is sent once more — after C-u, so that a copy still in
+// the buffer is not run together with the new one. C-u is safe here: every pane
+// execute-command types into is one this server owns, so the line is ours.
+//
+// Only then. Any sign that it started — the marker, or a foreground that is not
+// the shell — rules the re-send out, because running somebody's command twice is
+// worse than reporting that it did not finish.
+//
+// A context that ends first returns timedOut with whatever output exists.
+func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*execOutcome, error) {
+	id := uuid.New().String()
+	base := filepath.Join("/tmp", "tmux-mcp-"+id)
+	startFile, outFile, exitFile := base+".start", base+".out", base+".exit"
+	defer os.Remove(startFile)
+	defer os.Remove(outFile)
+	defer os.Remove(exitFile)
+
+	if s.shellOwnsTTY(ctx, pane) {
+		if err := s.waitForShellReady(ctx, pane); err != nil {
+			return nil, err
+		}
+	}
+	wrapped := wrapCommand(s.shell, command, startFile, outFile, exitFile)
+	if err := s.sendValidated(ctx, pane, wrapped, true, true); err != nil {
+		return nil, fmt.Errorf("send command: %w", err)
+	}
+
+	startBy := time.Now().Add(execStartTimeout)
+	resent := false
+	for {
+		if code, ok := readExitFile(exitFile); ok {
+			out, err := os.ReadFile(outFile)
+			if err != nil {
+				return nil, fmt.Errorf("read output file: %w", err)
+			}
+			return &execOutcome{Output: strings.TrimRight(string(out), "\n"), ExitCode: code}, nil
+		}
+		if !resent && time.Now().After(startBy) && s.neverStarted(ctx, pane, startFile) {
+			resent = true
+			if err := s.b.SendKeys(ctx, pane, "C-u", false, false); err != nil {
+				return nil, fmt.Errorf("send command: %w", err)
+			}
+			if err := s.sendValidated(ctx, pane, wrapped, true, true); err != nil {
+				return nil, fmt.Errorf("send command: %w", err)
+			}
+		}
+		if !sleepCtx(ctx, execPollInterval) {
+			partial := ""
+			if data, err := os.ReadFile(outFile); err == nil {
+				partial = strings.TrimRight(string(data), "\n")
+			}
+			return &execOutcome{Output: partial, ExitCode: -1, TimedOut: true}, nil
+		}
+	}
+}
+
+// shellOwnsTTY reports whether the pane's own process is in the foreground, so
+// that what is typed there goes to the shell rather than to a program it runs.
+func (s *slots) shellOwnsTTY(ctx context.Context, pane paneRef) bool {
+	state, err := s.b.Foreground(ctx, pane)
+	return err == nil && state != nil && state.IsAlive && state.PanePID > 0 &&
+		state.ForegroundPID == state.PanePID
+}
+
+// neverStarted reports whether a sent command provably did not begin: the shell
+// is at a prompt AND the start marker is absent. The shell is read first, so a
+// command that starts and finishes between the two reads leaves its marker
+// behind and is seen as started.
+func (s *slots) neverStarted(ctx context.Context, pane paneRef, startFile string) bool {
+	state, err := s.b.Foreground(ctx, pane)
+	if err != nil || !atPrompt(readPrompt(state)) {
+		return false
+	}
+	_, err = os.Stat(startFile)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// readExitFile reads the exit status a wrapped command wrote. ok is false until
+// the file holds a number: the shell creates the file before it writes to it,
+// so an empty read is a write still in progress, not a status.
+func readExitFile(path string) (code int, ok bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	code, err = strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, false
+	}
+	return code, true
+}
+
+// wrapCommand builds the line execInPane types: mark the start, run the command
+// with stdout and stderr through tee into outFile (so it also shows in the
+// pane), and write the command's own exit status, not tee's, into exitFile.
+//
+// The status idiom is the shell's own, which is why the shell type is a server
+// flag: zsh's $pipestatus is 1-indexed, bash's $PIPESTATUS 0-indexed, and fish
+// only sets $pipestatus inside a pipeline, so there the status is captured
+// before the pipe instead. printf with an empty format is the one way to create
+// an empty file that all three accept.
+func wrapCommand(shell, command, startFile, outFile, exitFile string) string {
+	switch shell {
+	case "fish":
+		return fmt.Sprintf(
+			`printf '' > %s; begin; %s; set _exit $status; end 2>&1 | tee %s; echo $_exit > %s`,
+			startFile, command, outFile, exitFile,
+		)
+	case "zsh":
+		return fmt.Sprintf(
+			`printf '' > %s; { %s } 2>&1 | tee %s; echo ${pipestatus[1]} > %s`,
+			startFile, command, outFile, exitFile,
+		)
+	default: // bash
+		return fmt.Sprintf(
+			`printf '' > %s; { %s; } 2>&1 | tee %s; echo ${PIPESTATUS[0]} > %s`,
+			startFile, command, outFile, exitFile,
+		)
 	}
 }

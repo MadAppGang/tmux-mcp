@@ -7,7 +7,11 @@ import "errors"
 // not a value — it is the difference between a guard and the appearance of one.
 var errUIDUnsupported = errors.New("process uid lookup is unsupported on this platform")
 
-// PaneState captures the OS-level state of a tmux pane's process.
+// PaneState captures the OS-level state of a pane's process.
+//
+// The last three fields describe the pane's tty rather than its process, and
+// they are kept off the wire: pane-state's response shape does not change, and
+// they exist for the readiness gate, not for the agent. See ttyInputState.
 type PaneState struct {
 	PanePID         int    `json:"panePid"`
 	ForegroundPID   int    `json:"foregroundPid"`
@@ -15,6 +19,39 @@ type PaneState struct {
 	IsAlive         bool   `json:"isAlive"`
 	WaitingForInput bool   `json:"waitingForInput"`
 	ExitCode        int    `json:"exitCode,omitempty"`
+
+	// InputKnown is true when the tty probe answered, so the two fields after
+	// it are facts rather than zero values. Every gate that relies on them
+	// checks it first, and a probe that failed reads as "not ready".
+	InputKnown bool `json:"-"`
+	// LineEditing is true when the tty is in non-canonical mode: a line editor
+	// is reading it key by key.
+	LineEditing bool `json:"-"`
+	// PendingInput is how many typed bytes are queued on the tty unread.
+	PendingInput int `json:"-"`
+	// ReadingTTY is true when the pane's own process is in the foreground and
+	// asleep in a read on its terminal: a prompt read in canonical mode, by a
+	// shell with no line editor or with its editor switched off.
+	ReadingTTY bool `json:"-"`
+}
+
+// fillInputState probes the pane's tty and records what it found. Each backend
+// supplies the path its own way; the probe and its meaning are the same for
+// all of them. A failed probe leaves InputKnown false.
+func fillInputState(state *PaneState, tty string) {
+	if state == nil || tty == "" {
+		return
+	}
+	lineEditing, pending, err := ttyInputState(tty)
+	if err != nil {
+		return
+	}
+	state.InputKnown = true
+	state.LineEditing = lineEditing
+	state.PendingInput = pending
+	if state.PanePID > 0 && state.ForegroundPID == state.PanePID {
+		state.ReadingTTY = readingTTY(state.PanePID)
+	}
 }
 
 // procInfo is the minimum a platform must report about a process for

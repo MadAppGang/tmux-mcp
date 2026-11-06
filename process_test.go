@@ -19,7 +19,7 @@ import (
 // silently making the caller's "real == effective" test vacuous.
 //
 // On an unsupported platform the assertion is the inverse and matters more: an
-// error, and -1 for both uids. That is what makes pane acquisition fail closed
+// error, and -1 for both uids. That is what makes pane reclaim fail closed
 // there — see the comment on process_other.go's processUIDs. A stub that
 // returned a plausible uid would turn the guard into a no-op that still reads
 // like a guard, so this branch is the regression test for the guard existing at
@@ -41,7 +41,7 @@ func TestProcessUIDsSelf(t *testing.T) {
 		}
 	default:
 		if !errors.Is(err, errUIDUnsupported) {
-			t.Fatalf("processUIDs on %s must report errUIDUnsupported so acquisition fails closed, got err=%v", runtime.GOOS, err)
+			t.Fatalf("processUIDs on %s must report errUIDUnsupported so reclaim fails closed, got err=%v", runtime.GOOS, err)
 		}
 		if real != -1 || effective != -1 {
 			t.Errorf("unsupported processUIDs returned (%d, %d); it must return (-1, -1) so an ignored error cannot match root", real, effective)

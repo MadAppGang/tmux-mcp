@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -446,21 +447,22 @@ func flattenPane(captured string) string {
 // TestWriteToDisplayClearRespectsPaneOwnership is the hazard that arrived with
 // the default target, in both directions.
 //
-// clear:true used to send C-u — kill line — before running `clear`, which is
-// correct on a pane the server created: the previous write is still unsubmitted
-// in the line editor and would otherwise be concatenated with the word "clear".
-// It became destructive the moment a bare clear:true could resolve to a pane
-// ADOPTED from the user, where that line is the command they were halfway
-// through typing and had not run.
+// clear:true sends C-u — kill line — before running `clear`, which is correct
+// on a pane the server created: the previous write is still unsubmitted in the
+// line editor and would otherwise be concatenated with the word "clear". It is
+// destructive on a pane the USER opened, where that line is the command they
+// were halfway through typing and had not run.
 //
-// The acquired subtest asserts all three properties of the replacement at once,
-// because any two of them can be satisfied by something wrong: the user's line
-// SURVIVES (so no C-u), the line was NOT SUBMITTED (so not the tempting
-// "skip the C-u but still send clear" repair, which appends "clear" to their
-// command and presses Enter on it), and the coaching text still ARRIVES (so the
-// tool was not quietly turned into a no-op on adopted panes). Submission is
-// checked against the filesystem rather than the screen: the pending command
-// creates a file, so "was it run?" has an answer that cannot be misread.
+// The acquired subtest is a slot 1 held by a legacy ownerAcquired record, the
+// mark an older version of this server left on a shell it adopted. The record
+// is written by hand. Such a pane is not typed into at all now: resolution
+// drops the record and opens a pane of its own. The subtest asserts all three
+// properties of that at once, because any two of them can be satisfied by
+// something wrong: the user's line SURVIVES (so no C-u), the line was NOT
+// SUBMITTED (so no "clear" appended and Enter pressed on it), and the coaching
+// text still ARRIVES, in a new pane of ours. Submission is checked against the
+// filesystem rather than the screen: the pending command creates a file, so
+// "was it run?" has an answer that cannot be misread.
 //
 // The created subtest is the other half. A fix that skipped the kill everywhere
 // would pass the first subtest and silently break the tool's actual contract —
@@ -476,9 +478,12 @@ func TestWriteToDisplayClearRespectsPaneOwnership(t *testing.T) {
 		usersPane := tmuxExec(t, "split-window", "-d", "-c", dir, "-t", self, "-P", "-F", "#{pane_id}")
 		waitForPaneIdle(t, usersPane)
 
-		// The user types a command and stops short of Enter. This is exactly the
-		// state canAcquire documents that it cannot see, which is why the pane is
-		// still adopted below — the point of the test, not a flaw in it.
+		// The legacy record: the user's pane as slot 1, adopted by an older server.
+		markLegacyAcquired(t, usersPane, slotDefault)
+
+		// The user types a command and stops short of Enter. Nothing outside
+		// the shell can see that line, which is why a pane the user opened is
+		// never typed into.
 		//
 		// The trailing SPACE is load-bearing. Without it, a "clear" appended to
 		// `touch <sentinel>` runs `touch <sentinel>clear`, which creates a
@@ -497,23 +502,33 @@ func TestWriteToDisplayClearRespectsPaneOwnership(t *testing.T) {
 		c.callToolJSON(t, "write-to-display", map[string]any{
 			"text": "COACH-TEXT", "clear": true,
 		}, &out)
-		if got := slotPaneID(t, self, 1); got != usersPane {
-			t.Fatalf("the fixture did not exercise adoption: slot 1 is %s, want the user's pane %s",
-				got, usersPane)
+		if got := slotPaneID(t, self, 1); got == usersPane {
+			t.Fatalf("slot 1 is still the user's pane %s; a legacy acquired record must not be "+
+				"typed into", usersPane)
+		}
+		if out["created"] != true {
+			t.Errorf("write-to-display reported created=%v; slot 1 is a new pane", out["created"])
 		}
 
 		sleep(300 * time.Millisecond)
-		flat := flattenPane(c.callToolText(t, "capture-pane", map[string]any{}))
-		if !strings.Contains(flat, flattenPane("touch "+sentinel)) {
-			t.Errorf("clear:true destroyed the user's half-typed line on an adopted pane; the "+
-				"pane holds:\n%s", flat)
+		users := flattenPane(tmuxExec(t, "capture-pane", "-p", "-t", usersPane))
+		if !strings.Contains(users, flattenPane("touch "+sentinel)) {
+			t.Errorf("clear:true destroyed the user's half-typed line; the pane holds:\n%s", users)
 		}
 		if _, err := os.Stat(sentinel); err == nil {
 			t.Errorf("clear:true SUBMITTED the user's line — %s exists, so the command they had "+
 				"deliberately not run was run for them", sentinel)
 		}
-		if !strings.Contains(flat, "COACH-TEXT") {
-			t.Errorf("clear:true swallowed the write on an adopted pane; the pane holds:\n%s", flat)
+		if strings.Contains(users, "COACH-TEXT") {
+			t.Errorf("the coaching text was typed into the user's pane:\n%s", users)
+		}
+		if flat := flattenPane(c.callToolText(t, "capture-pane", map[string]any{})); !strings.Contains(flat, "COACH-TEXT") {
+			t.Errorf("the coaching text did not reach slot 1; it holds:\n%s", flat)
+		}
+		for _, opt := range []string{paneOptSlot, paneOptOwner, paneOptWitness} {
+			if got := tmuxExec(t, "display-message", "-t", usersPane, "-p", "#{"+opt+"}"); got != "" {
+				t.Errorf("%s is still %q on the user's pane; the legacy record must be dropped", opt, got)
+			}
 		}
 	})
 
@@ -593,17 +608,19 @@ func TestClearDecisionNeverKillsALineOnEvidenceItDoesNotHave(t *testing.T) {
 //
 // resolveSlot resolves a slot under slotMu and RELEASES the lock before
 // returning. write-to-display({clear:true}) then acts on that pane with no lock
-// held. A concurrent close-pane on the same slot releases the adopted pane —
-// releaseAcquiredLocked wipes @mcp_pane/@mcp_owner/@mcp_slot and leaves the pane
-// alive, handed back to the user. Land it in that window and a clear which reads
-// the registry AGAIN sees no record at all, reads that as a pane nobody owns,
-// and sends C-u + `clear` + Enter into a shell the user is typing in: their line
-// destroyed, and Enter pressed on what is left.
+// held. A concurrent close-pane on the same slot can release a pane the user
+// opened — releaseAcquiredLocked wipes @mcp_pane/@mcp_owner/@mcp_slot and leaves
+// the pane alive, handed back to the user. Land it in that window and a clear
+// which reads the registry AGAIN sees no record at all, reads that as a pane
+// nobody owns, and sends C-u + `clear` + Enter into a shell the user is typing
+// in: their line destroyed, and Enter pressed on what is left.
 //
-// The state is what does the damage, so the state is what this test builds:
-// resolution really adopts the user's pane and hands back owner=acquired, the
-// registration is really wiped by the same call close-pane makes, and the user
-// really has an unsubmitted command in the pane. What is NOT reproduced is the
+// The state is what does the damage, so the state is what this test builds: a
+// target holding the user's pane with owner=acquired, a legacy registration on
+// that pane really wiped by the same call close-pane makes, and an unsubmitted
+// command really in the pane. Resolution no longer hands back an acquired pane,
+// so the target is built by hand; clearForDisplay is held to trusting whatever
+// owner it is given. What is NOT reproduced is the
 // interleaving — no goroutine loses a race here, because a test that has to win
 // a microsecond-wide window to fail is a test that reports green on a bad day.
 // Everything after the wipe is exactly what the losing thread would do, and the
@@ -624,23 +641,19 @@ func TestClearForDisplayTrustsTheOwnerCapturedUnderTheLock(t *testing.T) {
 	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-c", dir, "-t", self.target(), "-P", "-F", "#{pane_id}"))
 	waitForClientPaneIdle(t, sl.b, usersPane)
 
-	tgt16, err := sl.resolveHelper(ctx, slotDefault, kindUnstated)
-	if err != nil {
-		t.Fatalf("resolveHelper: %v", err)
+	// The legacy registration, and the target a handler holds when the lock goes
+	// away.
+	markLegacyAcquired(t, usersPane.target(), slotDefault)
+	if _, found := recordFor(t, sl, self, usersPane); !found {
+		t.Fatal("the hand-written record is not read back as one; the release below would wipe nothing")
 	}
-	pane, slot, created, owner := tgt16.Ref, tgt16.Slot, tgt16.Created, tgt16.Owner
-	if pane != usersPane || owner != ownerAcquired {
-		t.Fatalf("the fixture did not exercise adoption: slot 1 resolved to %s (owner %q), want the "+
-			"user's pane %s adopted as %q", pane.target(), owner, usersPane.target(), ownerAcquired)
-	}
-	// The target the handler is holding when the lock goes away.
-	tgt := paneTarget{Ref: pane, Slot: slot, Created: created, Owner: owner}
+	tgt := paneTarget{Ref: usersPane, Slot: slotDefault, Owner: ownerAcquired}
 
 	// The concurrent close-pane lands. This is the mutation, verbatim: the
 	// registration is erased and the pane is left alive, which is what "released
 	// back to the user" means.
 	if err := sl.b.ClearMarks(ctx, usersPane); err != nil {
-		t.Fatalf("release the adopted pane: %v", err)
+		t.Fatalf("release the user's pane: %v", err)
 	}
 	if _, found := recordFor(t, sl, self, usersPane); found {
 		t.Fatal("the pane still carries a registry record; a re-read would find it and this test " +
@@ -744,38 +757,47 @@ func TestClosePaneKillsAgentPane(t *testing.T) {
 
 // TestClosePaneReleasesAcquired is the half that matters.
 //
-// An adopted pane belongs to the user. Closing it must interrupt whatever it is
-// doing and give it back — pane intact, every marker removed — because killing it
-// is the one unrecoverable action in this design. All three markers go, not just
-// the slot: leaving @mcp_owner=acquired behind would retire the pane forever,
-// since the acquisition predicate requires the owner mark to be unset, and the
-// user would be left with an ordinary shell the agent mysteriously refuses to
-// touch again.
+// An ownerAcquired record names a pane the user opened, written by an older
+// version of this server that adopted idle shells. The record is written by
+// hand here because nothing in this version writes one. Closing such a pane
+// must give it back — pane intact, every marker removed — because killing it
+// is the one unrecoverable action in this design. All three markers go, not
+// just the slot: a leftover @mcp_owner=acquired would keep the pane looking
+// like ours to every later read of the registry.
 func TestClosePaneReleasesAcquired(t *testing.T) {
 	c, self := agentPaneFixture(t)
 
 	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
 	waitForPaneIdle(t, usersPane)
-
-	c.callToolJSON(t, "send-keys", map[string]any{"keys": "echo adopted", "enter": true},
-		&map[string]any{})
+	markLegacyAcquired(t, usersPane, slotDefault)
 	if got := slotPaneID(t, self, 1); got != usersPane {
-		t.Fatalf("the fixture did not exercise adoption: slot 1 is %s, want %s", got, usersPane)
+		t.Fatalf("the hand-written record is not read as slot 1: slot 1 is %s, want %s", got, usersPane)
 	}
-	waitForPaneIdle(t, usersPane)
 
 	entries := closedEntries(t, c, map[string]any{})
 	if len(entries) != 1 || entries[0]["action"] != actionReleased {
 		t.Fatalf("close-pane answered %v, want a single action:%q entry", entries, actionReleased)
 	}
 	if !paneExists(t, usersPane) {
-		t.Fatal("close-pane destroyed a pane the user opened; an adopted pane may only be released")
+		t.Fatal("close-pane destroyed a pane the user opened; an acquired record may only be released")
 	}
 	for _, opt := range []string{paneOptSlot, paneOptOwner, paneOptWitness} {
 		if got := tmuxExec(t, "display-message", "-t", usersPane, "-p", "#{"+opt+"}"); got != "" {
 			t.Errorf("%s is still set to %q on the released pane; all three markers must go", opt, got)
 		}
 	}
+}
+
+// markLegacyAcquired writes the three marks an older version of this server
+// left on a shell of the user's it had taken over as a slot, with owner
+// ownerAcquired. Nothing in this version writes that owner, so the tests that
+// pin how such a record is handled write it themselves, in the same order the
+// backend does: witness first, slot last.
+func markLegacyAcquired(t *testing.T, pane string, slot int) {
+	t.Helper()
+	tmuxExec(t, "set-option", "-p", "-t", pane, paneOptWitness, pane)
+	tmuxExec(t, "set-option", "-p", "-t", pane, paneOptOwner, ownerAcquired)
+	tmuxExec(t, "set-option", "-p", "-t", pane, paneOptSlot, strconv.Itoa(slot))
 }
 
 // TestClosePaneRefusesSelfPane is the regression for the one hole every other
@@ -920,18 +942,18 @@ func TestClosePaneReapsDeadPane(t *testing.T) {
 
 // TestClosePaneAllReleasesAndKills covers slot:"all", which is the one call an
 // agent is told to make at the end of a session. It has to do both jobs in one
-// pass — destroy what the server made, hand back what it borrowed — and it must
-// never touch the agent's own pane, which is the pane the request arrived
-// through.
+// pass — destroy what the server made, hand back what a legacy acquired record
+// says it borrowed — and it must never touch the agent's own pane, which is the
+// pane the request arrived through.
 func TestClosePaneAllReleasesAndKills(t *testing.T) {
 	c, self := agentPaneFixture(t)
 
-	// Slot 1: adopted from the user.
+	// Slot 1: a pane of the user's under a legacy acquired record.
 	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
 	waitForPaneIdle(t, usersPane)
-	c.callToolJSON(t, "open-pane", map[string]any{"slot": 1}, &map[string]any{})
+	markLegacyAcquired(t, usersPane, slotDefault)
 	if got := slotPaneID(t, self, 1); got != usersPane {
-		t.Fatalf("slot 1 resolved to %s, want the adopted pane %s", got, usersPane)
+		t.Fatalf("slot 1 is %s, want the user's pane %s", got, usersPane)
 	}
 
 	// Slot 2: created by the server.
@@ -948,7 +970,7 @@ func TestClosePaneAllReleasesAndKills(t *testing.T) {
 		bySlot[int(slot)] = action
 	}
 	if bySlot[1] != actionReleased {
-		t.Errorf("slot 1 (adopted pane %s) got action %q, want %q", usersPane, bySlot[1], actionReleased)
+		t.Errorf("slot 1 (the user's pane %s) got action %q, want %q", usersPane, bySlot[1], actionReleased)
 	}
 	if bySlot[2] != actionKilled {
 		t.Errorf("slot 2 (created pane %s) got action %q, want %q", madePane, bySlot[2], actionKilled)
@@ -976,8 +998,8 @@ func TestClosePaneAllReleasesAndKills(t *testing.T) {
 func TestListSlotsReportsWhatTheAgentHasOpen(t *testing.T) {
 	c, self := agentPaneFixture(t)
 
-	// A pane of the user's that we must not adopt: busy, so canAcquire refuses
-	// it, which keeps it out of the listing for a reason the test states.
+	// A pane of the user's, busy, and carrying no marks of ours. It is never a
+	// slot, so it stays out of the listing.
 	usersPane := tmuxExec(t, "split-window", "-d", "-t", self, "-P", "-F", "#{pane_id}")
 	tmuxExec(t, "send-keys", "-t", usersPane, "cat", "Enter")
 	waitForPaneBusy(t, usersPane)

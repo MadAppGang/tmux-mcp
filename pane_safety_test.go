@@ -190,7 +190,7 @@ func TestEveryPaneWeMakeIsAttributable(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	client := newTmuxClient("bash")
+	client := newTmuxClient()
 	backend := newTmuxBackend(client)
 	ctx := context.Background()
 
@@ -524,7 +524,7 @@ func TestOwnershipSurvivesSessionScopedOptionLeak(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	client := newTmuxClient("bash")
+	client := newTmuxClient()
 	ctx := context.Background()
 
 	name := uniqueSession(t)
@@ -600,7 +600,7 @@ func TestIsolatedServerIgnoresUserConfig(t *testing.T) {
 	// tmux resolves ~ from $HOME.
 	t.Setenv("HOME", home)
 
-	backend := newTmuxBackend(newTmuxClient("bash"))
+	backend := newTmuxBackend(newTmuxClient())
 	ctx := context.Background()
 	pane, err := backend.OpenIsolated(ctx)
 	if err != nil {
@@ -666,7 +666,7 @@ func TestDetachedSessionIsNotEightyColumns(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	backend := newTmuxBackend(newTmuxClient("bash"))
+	backend := newTmuxBackend(newTmuxClient())
 	ctx := context.Background()
 
 	pane, err := backend.OpenIsolated(ctx)

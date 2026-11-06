@@ -339,7 +339,7 @@ func TestRetiredArgumentsAreRejected(t *testing.T) {
 
 	// Control (b): the destructive half, which a pane count cannot see. close-pane
 	// with an ignored paneId defaults to slot 1 and KILLS it — or, on a pane
-	// adopted from the user, C-c's it and hands it back. The sentinel process is
+	// the user opened, C-c's it and hands it back. The sentinel process is
 	// what catches the second one: a release leaves the pane alive and only the
 	// process dies.
 	if !paneExists(t, pane) {
@@ -691,7 +691,7 @@ func TestScrubIDsKeepsTheSentence(t *testing.T) {
 	if testing.Short() {
 		t.Skip("the live half requires tmux")
 	}
-	_, err := newTmuxClient("bash").CapturePane(context.Background(), "%999999", 0, false)
+	_, err := newTmuxClient().CapturePane(context.Background(), "%999999", 0, false)
 	if err == nil {
 		t.Fatal("capturing a pane that does not exist succeeded; the control proves nothing")
 	}

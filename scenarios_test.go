@@ -380,7 +380,7 @@ func drainNotifications(c *mcpClient) {
 // paneStateNow reads one pane's process state, or fails the test.
 func paneStateNow(t *testing.T, paneID string) *PaneState {
 	t.Helper()
-	state, err := newTmuxClient("bash").GetPaneState(context.Background(), paneID)
+	state, err := newTmuxClient().GetPaneState(context.Background(), paneID)
 	if err != nil {
 		t.Fatalf("read the state of pane %s: %v", paneID, err)
 	}
@@ -388,7 +388,7 @@ func paneStateNow(t *testing.T, paneID string) *PaneState {
 }
 
 // waitForPaneIdle polls until the pane is an idle shell at its prompt — the
-// exact condition slot adoption checks. It mirrors paneIsIdleShell in
+// shape slot reclaim requires. It mirrors paneIsIdleShell in
 // backend_tmux.go: a shell foreground process that is also the pane's own
 // process (no child command running). It does NOT key off waitingForInput, which
 // is unreliable across platforms (an idle shell reports false on Linux, true on

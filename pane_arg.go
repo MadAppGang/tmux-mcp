@@ -415,8 +415,8 @@ func closeSlotProperty() mcp.ToolOption {
 		// half that was missing: see parseCloseSlotArg.
 		mcp.Description(`Which helper slot to close: 1 (the default), 2, 3, … or "all" to close `+
 			`every helper pane this server opened, visible and isolated alike. Panes the server `+
-			`created are killed; panes it adopted from the user are interrupted and released, `+
-			`never killed.`),
+			`created are killed; a pane the user opened is never killed — it is interrupted and `+
+			`released.`),
 	)
 }
 
@@ -556,11 +556,10 @@ func (s *slots) resolveSlotOrEphemeral(
 // never makes one.
 //
 // A read that creates is the defect this removes, and it was not a small one.
-// capture-pane({slot:3}) on an empty slot used to SPLIT the user's window, or
-// ADOPT one of their idle shells — writing three tmux options into a pane they
-// opened and renaming it — in order to answer a question about a pane that did
-// not exist. The answer was then a screenshot of a fresh prompt, which tells the
-// caller nothing and costs the user a pane they have to close.
+// capture-pane({slot:3}) on an empty slot used to SPLIT the user's window in
+// order to answer a question about a pane that did not exist. The answer was
+// then a screenshot of a fresh prompt, which tells the caller nothing and costs
+// the user a pane they have to close.
 //
 // Created is false and stays false. Reading tools do not report it at all (the
 // field is nil on the wire), and a value here would be a value nothing consumes.
