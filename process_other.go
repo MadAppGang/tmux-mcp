@@ -15,25 +15,26 @@ func fillPaneState(_ context.Context, state *PaneState) error {
 // than a uid. This is the difference between a guard and the appearance of one,
 // and it is the single most important line in this file.
 //
-// The uid check exists to stop the server adopting a pane whose shell belongs to
-// another user — a root shell the user left open in a corner of their window.
+// The uid check exists to stop the server reclaiming a pane whose shell belongs
+// to another user — a pane that carries our marks but whose shell is now root's,
+// for instance after an `exec sudo -s` typed into it.
 // A stub that returned a plausible value would defeat that check in the worst
 // possible way, because it would still *look* like a working guard in every
 // review: returning 0 would match a server running as root, and returning
 // os.Getuid() would match EVERYTHING, silently turning the comparison into a
 // tautology while the code around it reads as if it were deciding something.
 //
-// Returning an error makes acquisition fail closed here instead. canAcquire
+// Returning an error makes reclaim fail closed here instead. reclaimPaneLocked
 // treats any error as "no", resolution falls through to creating a fresh pane,
 // and the feature degrades to "always create" — correct everywhere, and merely
-// less thrifty on platforms nobody runs tmux on. Note that this needs no
-// runtime.GOOS check anywhere in the acquisition path: the only way to acquire a
+// less thrifty on platforms nobody runs a multiplexer on. Note that this needs
+// no runtime.GOOS check anywhere in the reclaim path: the only way to reclaim a
 // pane is to get a nil error back from a real implementation, so the platform
 // restriction is structural rather than remembered.
 //
 // -1 rather than 0 as the failure value is also deliberate. 0 is root, a real
 // uid: a caller that ignored the error and compared the value would, on a
-// root-owned process, conclude "same user" — the exact adoption this guard
+// root-owned process, conclude "same user" — the exact reclaim this guard
 // exists to refuse. -1 is not any user, so an ignored error can only ever
 // compare unequal.
 func processUIDs(_ int) (real, effective int, err error) {

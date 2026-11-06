@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"os"
 	"os/exec"
@@ -105,17 +106,16 @@ const headlessPrefix = "headless:"
 // lookup went with the explicit-paneId path — so "did this new read keep the
 // witness?" is a question with one place to look.
 //
-// There is exactly one further reader, paneOwnerMark, and it deliberately does
-// not apply the witness. It asks the opposite question — "is this pane wholly
-// unclaimed?" — where a leaked or unrecognised value must mean "hands off". The
-// witness exists to stop a leak making a pane look OURS; there it would make a
-// leak look like permission. See that function for why the inversion is safe.
+// No reader asks the opposite question — "is this pane wholly unclaimed?" —
+// any more. It existed to decide whether an unmarked pane could be adopted,
+// and nothing unmarked is ever taken now: a pane without a witnessed record is
+// the user's.
 const (
 	paneOptWitness = "@mcp_pane"
 	paneOptOwner   = "@mcp_owner"
 	paneOptSlot    = "@mcp_slot" // "1", "2", … — the default helper is slot 1
 	ownerAgent     = "agent"
-	ownerAcquired  = "acquired" // the user opened the pane; we adopted it
+	ownerAcquired  = "acquired" // the user opened the pane; an older server took it as a slot
 )
 
 // markOrder is the write order, expressed as DATA rather than as statement
@@ -137,7 +137,7 @@ const (
 // fourth: it is the NAME of the session an isolated pane lives in, so no path
 // that claims a pane in the user's window can write one — see namespacePrefix,
 // where the alternative (a fourth pane option, stamped by the same single
-// walker) would have landed a namespace on adopted USER panes.
+// walker) would have landed a namespace on USER panes taken as slots.
 var markOrder = []string{paneOptWitness, paneOptOwner, paneOptSlot}
 
 // tmuxClient wraps tmux CLI interactions.
@@ -148,12 +148,14 @@ var markOrder = []string{paneOptWitness, paneOptOwner, paneOptSlot}
 // with a live rationale beside it is worse than no lock: the next edit that
 // needs serialising here would take it, compile, read exactly like the design
 // document and protect nothing.
-type tmuxClient struct {
-	shellType string
-}
+//
+// It holds no shell type either. Running a command to completion is policy now
+// (execInPane), written once for every backend, and the wrapper that needs the
+// shell type is built there.
+type tmuxClient struct{}
 
-func newTmuxClient(shellType string) *tmuxClient {
-	return &tmuxClient{shellType: shellType}
+func newTmuxClient() *tmuxClient {
+	return &tmuxClient{}
 }
 
 // parseTarget splits a target ID into its socket and bare ID.
@@ -229,7 +231,7 @@ func (p paneRef) empty() bool { return p.id == "" }
 // ("%12" → 12). Policy may only COMPARE it; this is the one place that parses.
 //
 // It exists because three rules in helper_panes.go are about age: keep the
-// OLDEST pane when two servers race for a slot, consider adoption candidates
+// OLDEST pane when two servers race for a slot, consider reclaim candidates
 // oldest-first, and break geometry ties deterministically. Every one of them
 // used to parse "%12" itself, which is a tmux id in policy code.
 //
@@ -267,15 +269,40 @@ func (t *tmuxClient) runWithSocket(ctx context.Context, socket string, args ...s
 	cmd := exec.CommandContext(ctx, "tmux", full...)
 	out, err := cmd.Output()
 	if err != nil {
-		// Report against args, not full, so the subcommand name is args[0]
-		// regardless of how many global flags the socket prefixed.
-		subCmd := args[0]
+		detail := ""
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("tmux %s: %w: %s", subCmd, err, scrubIDs(strings.TrimSpace(string(exitErr.Stderr))))
+			detail = scrubIDs(strings.TrimSpace(string(exitErr.Stderr)))
 		}
-		return "", fmt.Errorf("tmux %s: %w", subCmd, err)
+		return "", multiplexerError(err, detail)
 	}
 	return strings.TrimRight(string(out), "\n"), nil
+}
+
+// multiplexerRefused opens every failed multiplexer call a caller can see.
+const multiplexerRefused = "the terminal multiplexer refused the request"
+
+// errMultiplexerMissing is a multiplexer binary that could not be started.
+var errMultiplexerMissing = errors.New("the terminal multiplexer could not be started")
+
+// multiplexerError turns a failed CLI call into an error that names neither
+// the multiplexer nor its subcommands. Both adapters use it. The agent's tools
+// are the same under every backend, so an error that said "tmux split-window"
+// or "herdr pane split" would tell it which one it runs under — and the
+// subcommand is no use to it anyway. The multiplexer's own explanation, with
+// ids already scrubbed, is kept: that is the part that says what went wrong.
+//
+// A binary that cannot be started is reported as such without its path, which
+// would name it.
+func multiplexerError(err error, detail string) error {
+	var execErr *exec.Error
+	var pathErr *fs.PathError
+	if errors.As(err, &execErr) || errors.As(err, &pathErr) {
+		return errMultiplexerMissing
+	}
+	if detail == "" {
+		return fmt.Errorf("%s: %w", multiplexerRefused, err)
+	}
+	return fmt.Errorf("%s: %w: %s", multiplexerRefused, err, detail)
 }
 
 // idInText matches a multiplexer id embedded anywhere in a sentence: %3 for a
@@ -377,8 +404,8 @@ func (t *tmuxClient) markPaneOwned(ctx context.Context, socket, paneID string) e
 // rather than as a fourth statement nobody re-derives the safety of.
 //
 // It returns on the FIRST failure, so a cancelled context or one transient tmux
-// error leaves a prefix of markOrder on the pane. Callers that claim a pane the
-// user owns must undo that prefix; see adoptCandidateLocked.
+// error leaves a prefix of markOrder on the pane. A caller whose claim fails
+// treats the pane as not claimed; see reclaimPaneLocked and resolveHelperLocked.
 //
 // slot <= 0 writes no slot marker at all rather than clearing one. A pane being
 // claimed for the first time has nothing to clear, and an unconditional unset
@@ -451,10 +478,8 @@ func (t *tmuxClient) setPaneSlot(ctx context.Context, paneID string, slot int) e
 //
 // It is used when releasing an acquired pane. Clearing all three, rather than
 // only the slot, is the truthful state: we no longer own the pane. Leaving
-// @mcp_owner=acquired behind would retire the pane forever, because the
-// acquisition predicate requires the owner option to be *unset* — the pane would
-// be both unusable by us and, to the user, an ordinary shell that the agent
-// mysteriously refuses to touch again.
+// @mcp_owner=acquired behind would keep the pane looking like ours to every
+// later read of the registry, while to the user it is an ordinary shell.
 //
 // paneID is the prefixed ID as responses report it; parseTarget routes it.
 func (t *tmuxClient) clearPaneRegistration(ctx context.Context, paneID string) error {
@@ -489,14 +514,7 @@ func (t *tmuxClient) setPaneTitle(ctx context.Context, paneID, title string) err
 // size is a percentage (0 means use tmux default of 50%).
 // Returns a CreatedPane with the new pane ID and its parent window ID.
 func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, size int) (*CreatedPane, error) {
-	socket, bareID := parseTarget(paneID)
-	// -d leaves the source pane active. Without it every split moves the user's
-	// cursor into the pane the agent just made, interrupting whatever they were
-	// typing — including, typically, their conversation with the agent.
-	args := []string{"split-window", "-d", "-t", bareID, "-P", "-F", "#{pane_id}\t#{window_id}"}
-	if direction == "horizontal" {
-		args = append(args, "-h")
-	}
+	length := ""
 	if size > 0 {
 		// "-l N%" and not "-p N". They mean the same thing, but -p is the
 		// deprecated spelling and modern tmux has dropped it: on tmux 3.4
@@ -511,7 +529,24 @@ func (t *tmuxClient) SplitPane(ctx context.Context, paneID, direction string, si
 		// every slot, which put the deprecated flag on the default path of every
 		// resolution. Local tmux was new enough to accept it and CI was not,
 		// which is exactly the split a version-sensitive flag produces.
-		args = append(args, "-l", strconv.Itoa(size)+"%")
+		length = strconv.Itoa(size) + "%"
+	}
+	return t.splitPaneLength(ctx, paneID, direction, length)
+}
+
+// splitPaneLength is SplitPane with the -l value given verbatim: "N%" for a
+// share of the anchor, "N" for a size in cells, "" for tmux's default.
+func (t *tmuxClient) splitPaneLength(ctx context.Context, paneID, direction, length string) (*CreatedPane, error) {
+	socket, bareID := parseTarget(paneID)
+	// -d leaves the source pane active. Without it every split moves the user's
+	// cursor into the pane the agent just made, interrupting whatever they were
+	// typing — including, typically, their conversation with the agent.
+	args := []string{"split-window", "-d", "-t", bareID, "-P", "-F", "#{pane_id}\t#{window_id}"}
+	if direction == "horizontal" {
+		args = append(args, "-h")
+	}
+	if length != "" {
+		args = append(args, "-l", length)
 	}
 	out, err := t.runWithSocket(ctx, socket, args...)
 	if err != nil {
@@ -572,105 +607,6 @@ func (t *tmuxClient) SendKeys(ctx context.Context, paneID, keys string, literal,
 		}
 	}
 	return nil
-}
-
-// ExecuteCommand runs a shell command synchronously in the given pane.
-// It wraps the command so output is tee'd to a temp file and the exit code is
-// written to a separate file, then uses "tmux wait-for" to block until the
-// command finishes. The context deadline controls the overall timeout.
-func (t *tmuxClient) ExecuteCommand(ctx context.Context, paneID, command string) (*execOutcome, error) {
-	socket, _ := parseTarget(paneID)
-
-	id := uuid.New().String()
-	outFile := fmt.Sprintf("/tmp/tmux-mcp-%s.out", id)
-	exitFile := fmt.Sprintf("/tmp/tmux-mcp-%s.exit", id)
-	waitChannel := "tmux-mcp-" + id
-
-	defer os.Remove(outFile)
-	defer os.Remove(exitFile)
-
-	wrapped := t.wrapCommand(command, outFile, exitFile, waitChannel)
-
-	// Send the wrapped command to the pane (literal=false so Enter sends a real Enter).
-	if err := t.SendKeys(ctx, paneID, wrapped, false, true); err != nil {
-		return nil, fmt.Errorf("send command: %w", err)
-	}
-
-	// Block until the command signals completion or the context is cancelled.
-	// The wait-for must target the same tmux server that the pane lives on, and
-	// goes through socketArgs because wait-for will itself start a server if
-	// none is running. See socketArgs.
-	waitArgs := append(socketArgs(socket), "wait-for", waitChannel)
-	waitErr := exec.CommandContext(ctx, "tmux", waitArgs...).Run()
-	if waitErr != nil {
-		if ctx.Err() != nil {
-			// Bug 2 fix: on timeout, return partial output instead of a bare error.
-			partialOutput := ""
-			if data, err := os.ReadFile(outFile); err == nil {
-				partialOutput = strings.TrimRight(string(data), "\n")
-			}
-			return &execOutcome{
-				Output:   partialOutput,
-				ExitCode: -1,
-				TimedOut: true,
-			}, nil
-		}
-		return nil, fmt.Errorf("wait-for: %w", waitErr)
-	}
-
-	outputBytes, err := os.ReadFile(outFile)
-	if err != nil {
-		return nil, fmt.Errorf("read output file: %w", err)
-	}
-
-	// Bug 3 fix: retry reading exit file to handle race with fast-completing commands.
-	var exitBytes []byte
-	for attempt := 0; attempt < 4; attempt++ {
-		exitBytes, err = os.ReadFile(exitFile)
-		if err == nil {
-			break
-		}
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("read exit file: %w", err)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read exit file: %w", err)
-	}
-
-	exitCode, _ := strconv.Atoi(strings.TrimSpace(string(exitBytes)))
-
-	return &execOutcome{
-		Output:   strings.TrimRight(string(outputBytes), "\n"),
-		ExitCode: exitCode,
-	}, nil
-}
-
-// wrapCommand builds a shell command that:
-//  1. Pipes stdout+stderr through tee into outFile (so it shows in the pane)
-//  2. Captures the exit code into exitFile
-//  3. Signals waitChannel via "tmux wait-for -S" when done
-func (t *tmuxClient) wrapCommand(command, outFile, exitFile, waitChannel string) string {
-	switch t.shellType {
-	case "fish":
-		// fish uses $pipestatus[1] (1-indexed) after a pipe, but pipestatus is
-		// only set inside a pipeline. Capture exit status before the pipe instead.
-		return fmt.Sprintf(
-			`begin; %s; set _exit $status; end 2>&1 | tee %s; echo $_exit > %s; tmux wait-for -S %s`,
-			command, outFile, exitFile, waitChannel,
-		)
-	case "zsh":
-		return fmt.Sprintf(
-			`{ %s } 2>&1 | tee %s; echo ${pipestatus[1]} > %s; tmux wait-for -S %s`,
-			command, outFile, exitFile, waitChannel,
-		)
-	default: // bash
-		return fmt.Sprintf(
-			`{ %s; } 2>&1 | tee %s; echo ${PIPESTATUS[0]} > %s; tmux wait-for -S %s`,
-			command, outFile, exitFile, waitChannel,
-		)
-	}
 }
 
 // KillPane kills a tmux pane.
@@ -803,7 +739,7 @@ func registryFormat() string {
 // itself, in the same read.
 //
 // An unrecognised owner is treated as "not ours" rather than as an error. A
-// later version may add owner kinds, and an old binary must never adopt, reuse
+// later version may add owner kinds, and an old binary must never reclaim, reuse
 // or kill a pane whose ownership semantics it does not implement — forward
 // compatibility here means doing nothing, not guessing.
 func parseRegistryLine(line, prefix string) (paneRecord, bool) {
@@ -880,33 +816,6 @@ func (t *tmuxClient) paneRegistryAround(ctx context.Context, target string) (map
 	return reg, nil
 }
 
-// paneOwnerMark returns the raw @mcp_owner value a pane renders, whatever it is.
-//
-// This is deliberately NOT a registry read, and it is the one place in the file
-// that is allowed not to be. Its question is the opposite of the registry's: not
-// "is this pane ours?" — which requires the witness, because a leaked option
-// could otherwise make the user's shells look like ours — but "is this pane
-// completely unclaimed?", where every answer other than the empty string means
-// "leave it alone".
-//
-// Reading it without the witness is therefore the conservative direction, and
-// closes two holes the witnessed read cannot. A pane marked by a NEWER version
-// of this binary carries an owner kind parseRegistryLine does not recognise, so
-// it is absent from the registry and would otherwise look unclaimed and be
-// adopted — exactly the forward-compatibility failure the registry comment warns
-// against. And an @mcp_owner leaked to session scope makes every pane in the
-// session answer here, which stops acquisition dead rather than enabling it:
-// wrong in the direction of doing nothing.
-func (t *tmuxClient) paneOwnerMark(ctx context.Context, paneID string) (string, error) {
-	socket, bareID := parseTarget(paneID)
-	out, err := t.runWithSocket(ctx, socket, "display-message", "-t", bareID, "-p",
-		fmt.Sprintf("#{%s}", paneOptOwner))
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out), nil
-}
-
 // ---- The isolated namespace ----
 
 // Isolated panes are namespaced by the NAME of the session they live in, not by
@@ -919,8 +828,8 @@ func (t *tmuxClient) paneOwnerMark(ctx context.Context, paneID string) (string, 
 //     witness, owner, slot — with one walker. No path that claims a pane in the
 //     USER'S window can write a namespace, because there is no namespace to
 //     write. The earlier design made it a fourth pane option stamped by that
-//     same single walker, which would have landed a namespace on every pane the
-//     adopter touched, including the user's own shells.
+//     same single walker, which would have landed a namespace on every pane
+//     that walker marked, including any of the user's own shells.
 //  2. Attribution is ATOMIC with creation. The session name is set by the same
 //     new-session command that makes the pane, so there is no window in which a
 //     live isolated pane exists that nobody can attribute. A pane option cannot
@@ -1070,7 +979,7 @@ func (t *tmuxClient) openIsolatedSession(ctx context.Context, session string) (s
 		return "", err
 	}
 	if out == "" {
-		return "", fmt.Errorf("tmux new-session reported no pane for session %q", session)
+		return "", fmt.Errorf("%s: no pane was reported for session %q", multiplexerRefused, session)
 	}
 	return headlessPrefix + out, nil
 }
@@ -1121,10 +1030,10 @@ func noIsolatedServer(err error) bool {
 // and returns both views of it.
 //
 // panes is EVERY pane in the namespace, marked or not: on this socket every pane
-// in our namespace is ours by construction — the same argument that abolishes
-// adoption there — so a pane whose marks are missing or partial is still ours to
-// close. Without that view, a process that died between creating a pane and
-// claiming it leaves a live shell no tool can see or reach.
+// in our namespace is ours by construction, so a pane whose marks are missing
+// or partial is still ours to close. Without that view, a process that died
+// between creating a pane and claiming it leaves a live shell no tool can see
+// or reach.
 //
 // records is the witnessed subset, parsed exactly as the visible registry is:
 // the same registryFormat, the same parseRegistryLine, the same rejection of a
@@ -1208,23 +1117,27 @@ func (t *tmuxClient) ownedPanesInWindow(ctx context.Context, windowID string) (m
 func (t *tmuxClient) GetPaneState(ctx context.Context, paneID string) (*PaneState, error) {
 	socket, bareID := parseTarget(paneID)
 	// Query pid, dead flag, and dead exit status in a single tmux call.
+	// The tty comes first so that the field that may legitimately be empty —
+	// pane_dead_status on a live pane — stays in the middle, where trimming the
+	// output cannot drop it.
 	out, err := t.runWithSocket(ctx, socket, "display-message", "-p", "-t", bareID,
-		"#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}")
+		"#{pane_tty}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}")
 	if err != nil {
 		return nil, fmt.Errorf("get pane state: %w", err)
 	}
 
-	// run() already strips trailing newlines; split on tab to get the three fields.
-	// Do NOT TrimSpace the whole string since the trailing tab (empty dead_status)
-	// would be stripped, yielding only 2 fields instead of 3.
-	parts := strings.SplitN(out, "\t", 3)
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("unexpected tmux output for pane state: %q", out)
+	// run() already strips trailing newlines; split on tab to get the four
+	// fields. Do NOT TrimSpace the whole string since the trailing tab (empty
+	// dead_status) would be stripped, yielding one field too few.
+	parts := strings.SplitN(out, "\t", 4)
+	if len(parts) != 4 {
+		return nil, fmt.Errorf("unexpected tmux output for pane state: %q", scrubIDs(out))
 	}
 
-	pidStr := strings.TrimSpace(parts[0])
-	deadFlag := strings.TrimSpace(parts[1])
-	deadStatusStr := strings.TrimSpace(parts[2])
+	tty := strings.TrimSpace(parts[0])
+	pidStr := strings.TrimSpace(parts[1])
+	deadFlag := strings.TrimSpace(parts[2])
+	deadStatusStr := strings.TrimSpace(parts[3])
 
 	// If the pane PID is empty the pane does not exist. This is a SENTINEL and
 	// not a sentence, because the adapter cannot write the sentence: the caller
@@ -1256,6 +1169,7 @@ func (t *tmuxClient) GetPaneState(ctx context.Context, paneID string) (*PaneStat
 		// determine the precise state.
 		state.IsAlive = true
 	}
+	fillInputState(state, tty)
 	return state, nil
 }
 
@@ -1274,6 +1188,29 @@ func paneIsIdleShell(state *PaneState) bool {
 	}
 	// The shell must be the foreground process (no child command running).
 	return state.ForegroundPID == state.PanePID
+}
+
+// detectProbeTimeout bounds each ancestry probe at startup, which runs before
+// the server answers its first request.
+const detectProbeTimeout = 2 * time.Second
+
+// tmuxPaneShellPID returns the pid of the shell tmux started in a pane, asked
+// of the tmux server named in $TMUX (its first comma-separated field is the
+// socket path). It is detection's half of the ancestry check: the pane is a
+// claim from the environment, and this is how the claim is tested.
+func tmuxPaneShellPID(tmuxEnv, pane string) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), detectProbeTimeout)
+	defer cancel()
+	var args []string
+	if socket, _, _ := strings.Cut(tmuxEnv, ","); socket != "" {
+		args = append(args, "-S", socket)
+	}
+	args = append(args, "display-message", "-p", "-t", pane, "#{pane_pid}")
+	out, err := exec.CommandContext(ctx, "tmux", args...).Output()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(out)))
 }
 
 // isShellProcess returns true if the command name is a known shell.
@@ -1320,7 +1257,7 @@ type placement struct {
 }
 
 // paneInfo is geometry and label, for the two decisions that need them: which
-// pane has the most room to give up, and what order to consider adoption
+// pane has the most room to give up, and what order to consider reclaim
 // candidates in. Seq is the same creation ordinal paneRecord carries, so both
 // discovery views rank panes the same way.
 type paneInfo struct {
@@ -1368,8 +1305,8 @@ type Backend interface {
 	// ---- Discovery ----
 
 	// Siblings lists every pane sharing a window with the given one, geometry
-	// included. A failure here DEGRADES rather than being fatal — no adoption,
-	// and the anchor falls back to self — which is why it is separate from
+	// included. A failure here DEGRADES rather than being fatal — slot 4 and up
+	// split the agent rather than a helper — which is why it is separate from
 	// Records, whose failure is fatal to a resolution.
 	Siblings(ctx context.Context, of paneRef) ([]paneInfo, error)
 
@@ -1394,12 +1331,6 @@ type Backend interface {
 	// "empty" and "I could not look" are opposite answers.
 	IsolatedPanes(ctx context.Context) ([]paneRef, error)
 
-	// OwnerMark asks the OPPOSITE question from Records and is deliberately not
-	// witnessed: not "is this pane ours?" but "is it wholly unclaimed?", where
-	// every answer other than the empty string means hands off. See
-	// paneOwnerMark's comment; the inversion is load-bearing.
-	OwnerMark(ctx context.Context, p paneRef) (string, error)
-
 	// ---- Registry writes ----
 
 	// Claim writes the ownership marks in the order the backend chooses.
@@ -1417,9 +1348,10 @@ type Backend interface {
 	SendKeys(ctx context.Context, p paneRef, keys string, literal, enter bool) error
 	Capture(ctx context.Context, p paneRef, lines int, colors bool) (string, error)
 	Screen(ctx context.Context, p paneRef) (screen, error)
-	Exec(ctx context.Context, p paneRef, command string) (*execOutcome, error)
 
-	// Foreground is the OS-level state of the pane's process.
+	// Foreground is the OS-level state of the pane's process, including the
+	// tty facts the readiness gate reads (InputKnown, LineEditing,
+	// PendingInput). It returns errPaneGone for a pane that no longer exists.
 	Foreground(ctx context.Context, p paneRef) (*PaneState, error)
 
 	// Bell reports the backend's CURRENT bell indication for the pane. It is not
@@ -1447,6 +1379,12 @@ type tmuxBackend struct {
 	// lifetime. See newNamespaceKey for why it is "<pid>-<nonce>" and why it
 	// does not read TMUX_PANE.
 	nsKey string
+
+	// noWindow makes Self answer errNoWindow whatever TMUX_PANE says. It is set
+	// when detection found the variable and could not believe it — a leak from
+	// an outer multiplexer — and on the instance herdr uses for isolated slots
+	// only. See detectBackend.
+	noWindow bool
 }
 
 // newTmuxBackend fixes the namespace and reclaims the orphans of servers that
@@ -1486,6 +1424,9 @@ var _ Backend = (*tmuxBackend)(nil)
 // accessor is what makes that set auditable — see
 // TestOnlyPolicyCodeKnowsOurOwnPane.
 func (b *tmuxBackend) Self(_ context.Context) (paneRef, error) {
+	if b.noWindow {
+		return paneRef{}, errNoWindow
+	}
 	id := os.Getenv("TMUX_PANE")
 	if id == "" {
 		return paneRef{}, errNoWindow
@@ -1493,8 +1434,28 @@ func (b *tmuxBackend) Self(_ context.Context) (paneRef, error) {
 	return newPaneRef(id), nil
 }
 
+// OpenBeside sizes the new pane in cells rather than passing the percentage
+// through, so that an odd split leaves the larger half with the anchor. "-l 50%"
+// gives the NEW pane the rounded-up half, and when the anchor is the agent's own
+// pane that one row is the difference between the agent keeping half its height
+// and losing it. The border between the two panes is a cell of the anchor's that
+// neither pane gets, which is why it is taken off first. If the anchor cannot be
+// measured the percentage is passed as it is.
 func (b *tmuxBackend) OpenBeside(ctx context.Context, place placement) (paneRef, error) {
-	cp, err := b.c.SplitPane(ctx, place.Anchor.target(), place.Axis.tmuxDirection(), place.SizePercent)
+	length := ""
+	if place.SizePercent > 0 {
+		length = strconv.Itoa(place.SizePercent) + "%"
+		if cols, rows, err := b.c.GetPaneDimensions(ctx, place.Anchor.target()); err == nil {
+			dim := rows
+			if place.Axis == splitBeside {
+				dim = cols
+			}
+			if cells := (dim - 1) * place.SizePercent / 100; cells >= 1 {
+				length = strconv.Itoa(cells)
+			}
+		}
+	}
+	cp, err := b.c.splitPaneLength(ctx, place.Anchor.target(), place.Axis.tmuxDirection(), length)
 	if err != nil {
 		return paneRef{}, err
 	}
@@ -1576,10 +1537,6 @@ func (b *tmuxBackend) IsolatedPanes(ctx context.Context) ([]paneRef, error) {
 	return panes, err
 }
 
-func (b *tmuxBackend) OwnerMark(ctx context.Context, p paneRef) (string, error) {
-	return b.c.paneOwnerMark(ctx, p.target())
-}
-
 // Claim splits the handle back into socket and bare id, which is the step that
 // used to happen in policy: markPaneOwnedAs takes them separately because its
 // original callers are mid-creation and hold both.
@@ -1606,13 +1563,6 @@ func (b *tmuxBackend) Capture(ctx context.Context, p paneRef, lines int, colors 
 
 func (b *tmuxBackend) Screen(ctx context.Context, p paneRef) (screen, error) {
 	return b.c.Screen(ctx, p.target())
-}
-
-func (b *tmuxBackend) Exec(ctx context.Context, p paneRef, command string) (*execOutcome, error) {
-	// No translation left to do: ExecuteCommand answers in execOutcome directly
-	// now that CommandResult is gone. That type carried a paneId json tag — the
-	// last one in the package — and the wire it served no longer exists.
-	return b.c.ExecuteCommand(ctx, p.target(), command)
 }
 
 func (b *tmuxBackend) Foreground(ctx context.Context, p paneRef) (*PaneState, error) {

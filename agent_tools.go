@@ -47,7 +47,7 @@ func registerAgentTools(s *server.MCPServer, sl *slots, emitter *ChannelEmitter)
 // close-pane is why that matters: it parses its own slot argument and never
 // calls resolveSlot, so an ignored paneId there does not merely type into the
 // wrong pane. It defaults to slot 1 and KILLS it, or C-c's and releases it if
-// the pane was adopted from the user. list-slots and notify resolve nothing at
+// the record says the user opened the pane. list-slots and notify resolve nothing at
 // all and would never be covered either.
 //
 // The rule is "a retired argument in a request is an error, and never ignored",
@@ -105,16 +105,18 @@ func watchResultToToolResult(r *WatchResult) (*mcp.CallToolResult, error) {
 
 func registerSendKeys(s *server.MCPServer, sl *slots) {
 	addAgenticTool(s, mcp.NewTool("send-keys",
-		// Two facts an agent needs before its first send-keys, and the second is
-		// the one nobody expects: this call can ADOPT a pane the user opened. The
-		// adoption rules refuse anything that is not an idle same-user shell, but
-		// "idle" is judged from the outside and cannot see text the user typed
-		// without pressing Enter — see canAcquire. Saying so here is the
-		// difference between a documented trade-off and a surprise.
+		// The pane comes from this server, never from the user: a shell the user
+		// opened is never taken over, however idle it looks. A pane this call
+		// opens is not typed into until its shell is reading; literal text typed
+		// at a line editor is checked, and the call fails rather than reporting
+		// success for text the shell did not take. Named keys, and anything sent
+		// to a busy pane, go straight through — see sendValidated.
 		mcp.WithDescription("Send keystrokes to a helper pane. By default the input is literal "+
 			"text. The pane is helper slot 1 unless you name another one — it is CREATED beside "+
-			"the agent if it does not exist yet, or ADOPTED from an idle unused shell already "+
-			"open in the same window, and it is never the agent's own pane."),
+			"the agent if it does not exist yet, and it is never the agent's own pane or one the "+
+			"user opened. A new pane is not typed into until its shell is ready, and text "+
+			"typed at a shell prompt is checked: the call fails if the shell did not take it. "+
+			"Key names (literal: false) are always sent at once, so C-c reaches a busy pane."),
 		mcp.WithString("keys",
 			mcp.Required(),
 			mcp.Description("Keys to send"),
@@ -143,8 +145,9 @@ func registerSendKeys(s *server.MCPServer, sl *slots) {
 		}
 		literal := req.GetBool("literal", true)
 		enter := req.GetBool("enter", false)
-		if err := sl.b.SendKeys(ctx, tgt.Ref, keys, literal, enter); err != nil {
-			return mcp.NewToolResultErrorFromErr("failed to send keys", err), nil
+		if err := sl.sendValidated(ctx, tgt.Ref, keys, literal, enter); err != nil {
+			return mcp.NewToolResultErrorFromErr("failed to send keys",
+				fmt.Errorf("slot %d: %w", tgt.Slot, err)), nil
 		}
 		return jsonResult(slotResolution{Slot: tgt.Slot, Created: creating(tgt.Created)})
 	})
@@ -208,9 +211,11 @@ func registerRunInREPL(s *server.MCPServer, sl *slots) {
 			initialCmd = initialState.ForegroundCmd
 		}
 
-		// Send the input with Enter.
-		if err := sl.b.SendKeys(ctx, pane, input, true, true); err != nil {
-			return mcp.NewToolResultErrorFromErr("failed to send input", err), nil
+		// Send the input with Enter. Into a running REPL this passes straight
+		// through; into a shell it is validated like any other typed line.
+		if err := sl.sendValidated(ctx, pane, input, true, true); err != nil {
+			return mcp.NewToolResultErrorFromErr("failed to send input",
+				fmt.Errorf("slot %d: %w", tgt.Slot, err)), nil
 		}
 
 		deadline := time.Now().Add(time.Duration(timeoutSecs) * time.Second)
@@ -287,8 +292,8 @@ func registerExecuteCommand(s *server.MCPServer, sl *slots) {
 		// it resolves like send-keys does.
 		mcp.WithDescription("Run a shell command in a helper pane and wait for it to complete. "+
 			"Returns the full output and the exit code. With no slot the command runs in helper "+
-			"slot 1, a pane beside the agent that is created or adopted on first use and reused "+
-			"after that — never the agent's own pane."),
+			"slot 1, a pane beside the agent that is created on first use and reused after that "+
+			"— never the agent's own pane or one the user opened."),
 		mcp.WithString("command",
 			mcp.Required(),
 			mcp.Description("Shell command to execute"),
@@ -329,9 +334,10 @@ func registerExecuteCommand(s *server.MCPServer, sl *slots) {
 			return runOneShot(ctx, sl, command)
 		}
 
-		outcome, err := sl.b.Exec(ctx, tgt.Ref, command)
+		outcome, err := sl.execInPane(ctx, tgt.Ref, command)
 		if err != nil {
-			return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
+			return mcp.NewToolResultErrorFromErr("failed to execute command",
+				fmt.Errorf("slot %d: %w", tgt.Slot, err)), nil
 		}
 		return jsonResult(execResult{
 			slotResolution: slotResolution{Slot: tgt.Slot, Created: creating(tgt.Created)},
@@ -377,8 +383,8 @@ const oneShotCleanupTimeout = 5 * time.Second
 // described a deliberate design as a crash.
 //
 // waitForShellReady is not optional. OpenIsolated takes no initial command, so
-// Exec would otherwise send into a shell that may still be sourcing its rc
-// files — keystrokes delivered then can be mangled or dropped outright, which
+// the command would otherwise be sent into a shell that may still be sourcing
+// its rc files — keystrokes delivered then can be dropped outright, which
 // produces the worst failure this server can have: a command that looks sent,
 // leaves a plausible pane, and never ran.
 //
@@ -398,9 +404,11 @@ func runOneShot(ctx context.Context, sl *slots, command string) (*mcp.CallToolRe
 		_ = sl.b.Close(closeCtx, pane)
 	}()
 
-	sl.waitForShellReady(ctx, pane)
+	if err := sl.waitForShellReady(ctx, pane, newPaneReadyTimeout); err != nil {
+		return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
+	}
 
-	outcome, err := sl.b.Exec(ctx, pane, command)
+	outcome, err := sl.execInPane(ctx, pane, command)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
 	}
@@ -496,8 +504,8 @@ func registerStartAndWatch(s *server.MCPServer, sl *slots, emitter *ChannelEmitt
 		// pattern, and reported as a timeout despite having succeeded.
 		baseline, _ := sl.b.Capture(ctx, pane, 0, false)
 
-		if err := sl.b.SendKeys(ctx, pane, command, true, true); err != nil {
-			return nil, fmt.Errorf("failed to send command: %w", err)
+		if err := sl.sendValidated(ctx, pane, command, true, true); err != nil {
+			return nil, fmt.Errorf("failed to send command: slot %d: %w", tgt.Slot, err)
 		}
 
 		// Passing the command lets the monitor drop the shell's echo of it, which
@@ -530,14 +538,14 @@ func registerWriteToDisplay(s *server.MCPServer, sl *slots) {
 		mcp.WithDescription("Write text to a helper pane as a side-channel coaching display. The "+
 			"user sees it in their terminal; the tool returns only the slot it wrote to, so the "+
 			"text does not enter the model's context. With no slot the text goes to helper slot 1, "+
-			"a pane beside the agent that is created or adopted on first use — never the agent's "+
-			"own pane."),
+			"a pane beside the agent that is created on first use — never the agent's own pane or "+
+			"one the user opened."),
 		mcp.WithString("text",
 			mcp.Required(),
 			mcp.Description("Text to display in the pane"),
 		),
 		mcp.WithBoolean("clear",
-			mcp.Description("Clear the pane before writing (default false). On a pane the server created this also wipes whatever is sitting unsubmitted in its line buffer, so each write replaces the last. On a pane adopted from the user it never does: a half-typed command line belongs to them, so the screen is redrawn around it and successive writes append instead."),
+			mcp.Description("Clear the pane before writing (default false). On a pane the server created this also wipes whatever is sitting unsubmitted in its line buffer, so each write replaces the last. On a pane the user opened it never does: a half-typed command line belongs to them, so the screen is redrawn around it and successive writes append instead."),
 		),
 		slotProperty(),
 		isolatedProperty(),
@@ -563,8 +571,9 @@ func registerWriteToDisplay(s *server.MCPServer, sl *slots) {
 			}
 		}
 
-		if err := sl.b.SendKeys(ctx, tgt.Ref, text, true, false); err != nil {
-			return mcp.NewToolResultErrorFromErr("failed to write to display", err), nil
+		if err := sl.sendValidated(ctx, tgt.Ref, text, true, false); err != nil {
+			return mcp.NewToolResultErrorFromErr("failed to write to display",
+				fmt.Errorf("slot %d: %w", tgt.Slot, err)), nil
 		}
 		return jsonResult(slotResolution{Slot: tgt.Slot, Created: creating(tgt.Created)})
 	})
@@ -584,10 +593,10 @@ func registerWriteToDisplay(s *server.MCPServer, sl *slots) {
 // That was safe while the tool demanded an explicit paneId aimed at a display
 // pane the agent had just split off. It stopped being safe the moment a bare
 // write-to-display({text, clear:true}) began resolving to slot 1, because slot 1
-// may be a pane ADOPTED from the user — and the line C-u destroys is then the
-// command they were halfway through typing. canAcquire says outright that it
-// cannot see unsubmitted input; this is that limitation with a destructive edge
-// on it.
+// could be a pane the USER opened — older versions of this server took idle
+// shells over as slots — and the line C-u destroys is then the command they were
+// halfway through typing. Nothing outside the shell can see unsubmitted input,
+// so the owner recorded for the pane is the only guide.
 //
 // # Why "skip the C-u but still send clear" is not the answer
 //
@@ -610,7 +619,7 @@ func registerWriteToDisplay(s *server.MCPServer, sl *slots) {
 // inert as a keystroke gets — and strictly less eventful than the coaching text
 // this function is clearing the way for.
 //
-// The cost is honest and documented in the `clear` parameter: on an adopted pane
+// The cost is honest and documented in the `clear` parameter: on the user's pane
 // our own previous text also survives, so repeated writes append rather than
 // replace. A display that grows is a worse display than one that refreshes, and
 // still better than a tool that erases the user's work to look tidy.
@@ -651,9 +660,9 @@ func registerWriteToDisplay(s *server.MCPServer, sl *slots) {
 //
 // # An isolated pane needs no special case, and that is the point
 //
-// Every isolated pane is ownerAgent — nothing is ever adopted on that socket,
-// because there is no user there to adopt from — so the destructive branch is
-// the one it takes, and correctly: there is no half-typed command line of
+// Every isolated pane is ownerAgent — nothing on that socket was opened by a
+// user — so the destructive branch is the one it takes, and correctly: there
+// is no half-typed command line of
 // anyone's to destroy. The rule is stated in terms of OWNERSHIP rather than
 // visibility, which is why the invisible case needed no clause of its own.
 func (s *slots) clearForDisplay(ctx context.Context, tgt paneTarget) error {
@@ -738,13 +747,13 @@ func registerCapturePane(s *server.MCPServer, sl *slots) {
 		// written out in full — screenshot-pane, pane-state, watch-pane and
 		// list-slots point here.
 		//
-		// The old reason is gone: a read no longer splits the user's window or
-		// adopts one of their shells, because a missing slot is an error now. The
-		// annotation still cannot go on, and what remains is smaller and sharper.
-		// A lookup REPAIRS the registry on its way past, exactly as resolution
-		// does: it clears a stale slot marker off this server's own pane
-		// (set-option), and duplicate healing can RELEASE an adopted loser, which
-		// sends C-c into a pane the user opened.
+		// A read does not split the user's window or open a pane, because a
+		// missing slot is an error. The annotation still cannot go on, for a
+		// smaller and sharper reason. A lookup REPAIRS the registry on its way
+		// past, exactly as resolution does: it clears a stale slot marker off this
+		// server's own pane (set-option), and duplicate healing can RELEASE a
+		// loser under an acquired record, which sends C-c into a pane the user
+		// opened.
 		//
 		// readOnlyHint is a licence for a client to skip confirmation, to
 		// prefetch, or to batch. None of those may sit on a call that can
@@ -794,8 +803,8 @@ func registerScreenshotPane(s *server.MCPServer, sl *slots) {
 			mcp.Enum("browser", "html"),
 		),
 		slotProperty(),
-		// No readOnlyHint: resolving a slot can split the user's window, adopt one
-		// of their shells and rename a pane. See capture-pane for the full reason.
+		// No readOnlyHint: a lookup repairs the registry on its way past and can
+		// send C-c into a pane it releases. See capture-pane for the full reason.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{NoCreate: true})
 		if err != nil {
@@ -915,8 +924,8 @@ func registerWatchPane(s *server.MCPServer, sl *slots, emitter *ChannelEmitter) 
 func registerClosePane(s *server.MCPServer, sl *slots) {
 	addAgenticTool(s, mcp.NewTool("close-pane",
 		mcp.WithDescription("Close a helper pane the agent is finished with. Panes this server "+
-			"created are killed; panes it adopted from the user are interrupted (C-c) and "+
-			"released, never killed. With no arguments it closes helper slot 1; slot:\"all\" "+
+			"created are killed; a pane the user opened is never killed — it is interrupted (C-c) "+
+			"and released. With no arguments it closes helper slot 1; slot:\"all\" "+
 			"closes every helper pane this server opened, visible and isolated alike. Closing a "+
 			"slot that was never opened is not an error."),
 		closeSlotProperty(),
@@ -947,14 +956,14 @@ func registerClosePane(s *server.MCPServer, sl *slots) {
 func registerListSlots(s *server.MCPServer, sl *slots) {
 	addAgenticTool(s, mcp.NewTool("list-slots",
 		mcp.WithDescription("List the helper slots this agent has open, with what is running in "+
-			"each. origin is \"created\" for a pane this server opened and \"adopted\" for one it "+
-			"took over from an idle shell of the user's, and isolated tells the panes nobody can "+
+			"each. origin is \"created\" for a pane this server opened and \"adopted\" for a "+
+			"shell of the user's that an earlier version took over, and isolated tells the panes nobody can "+
 			"see from the ones beside the user. Panes belonging to other agents, and the user's "+
 			"own panes, are not listed — this is what THIS agent has, not what is on screen."),
 		// No readOnlyHint, and here the reason is not the one capture-pane gives.
 		// Reading the registry is mildly MUTATING by design: it clears a stale
 		// slot marker off this server's own pane and heals duplicate claims,
-		// which can send C-c into an adopted pane it is releasing. See
+		// which can send C-c into a pane of the user's it is releasing. See
 		// listSlotsLocked.
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		// list-slots answers for every slot, so a slot argument is a caller

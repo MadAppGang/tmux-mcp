@@ -91,7 +91,7 @@ func isolatedFixture(t *testing.T) (*slots, *tmuxBackend) {
 	if testing.Short() {
 		t.Skip("requires tmux")
 	}
-	b := newTmuxBackend(newTmuxClient("bash"))
+	b := newTmuxBackend(newTmuxClient())
 	t.Cleanup(func() {
 		panes, err := b.IsolatedPanes(context.Background())
 		if err != nil {
@@ -583,17 +583,20 @@ func assertSees(t *testing.T, c *mcpClient, slot int, want, mustNotSee string) {
 // TestIsolatedNeverAdopts pins an ABSENCE, which is why it needs the mirror
 // below more than most tests need a control.
 //
-// Adoption exists to reuse a shell the USER left idle in the window they are
-// looking at. The isolated socket has no user and no window, and every pane on
-// it was made by an agent — so a predicate that could adopt there would be a
-// predicate that could type into ANOTHER SERVER'S pane, with the namespace
-// filter as the only thing preventing it. It must not become the only thing.
+// An idle shell with none of our marks is never taken as a slot, on either
+// side. On the isolated socket the case is sharper: there is no user and no
+// window, every pane was made by some agent, and a predicate that took an
+// unmarked pane there would be one that could type into ANOTHER SERVER'S pane,
+// with the namespace filter as the only thing preventing it. It must not become
+// the only thing.
 //
 // # The mirror
 //
-// The same shape on the VISIBLE side must ADOPT. Without it, this test passes
-// just as well when the adoption machinery is broken everywhere, and the
-// abstention it is asserting would be an accident rather than a decision.
+// On the VISIBLE side, an idle pane that DOES carry our marks and holds no slot
+// must be reclaimed, while an unmarked one beside it is left alone. Without
+// that, this test passes just as well when resolution can take no existing pane
+// at all, and the abstention it asserts would be an accident rather than a
+// decision.
 func TestIsolatedNeverAdopts(t *testing.T) {
 	sl, self := slotFixture(t)
 	b := backendOf(t, sl)
@@ -634,15 +637,22 @@ func TestIsolatedNeverAdopts(t *testing.T) {
 	// not about.
 	usersPane := newPaneRef(tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}"))
 	waitForClientPaneIdle(t, sl.b, usersPane)
+	ours := tmuxExec(t, "split-window", "-d", "-t", self.target(), "-P", "-F", "#{pane_id}")
+	tmuxExec(t, "set-option", "-p", "-t", ours, paneOptWitness, ours)
+	tmuxExec(t, "set-option", "-p", "-t", ours, paneOptOwner, ownerAgent)
+	waitForClientPaneIdle(t, sl.b, newPaneRef(ours))
 
 	visible, err := sl.resolveHelper(ctx, 8, kindVisible)
 	if err != nil {
 		t.Fatalf("resolve visible slot 8: %v", err)
 	}
-	if visible.Ref != usersPane || visible.Owner != ownerAcquired {
-		t.Fatalf("visible slot 8 resolved to %s (owner %q) rather than adopting the user's idle "+
-			"shell %s: the adoption machinery is not running, so the isolated abstention above "+
-			"proves nothing", visible.Ref.target(), visible.Owner, usersPane.target())
+	if visible.Ref == usersPane {
+		t.Fatalf("visible slot 8 took the user's unmarked idle shell %s", usersPane.target())
+	}
+	if visible.Ref != newPaneRef(ours) || visible.Owner != ownerAgent {
+		t.Fatalf("visible slot 8 resolved to %s (owner %q) rather than reclaiming our unslotted "+
+			"pane %s: resolution is not taking existing panes at all, so the isolated abstention "+
+			"above proves nothing", visible.Ref.target(), visible.Owner, ours)
 	}
 }
 
@@ -830,7 +840,7 @@ func TestOrphanedNamespacesAreReapedByPidLiveness(t *testing.T) {
 
 	// Construction is when the sweep runs: before the server answers its first
 	// request, and never again.
-	_ = newTmuxBackend(newTmuxClient("bash"))
+	_ = newTmuxBackend(newTmuxClient())
 
 	if isolatedPaneExists(t, orphan) {
 		t.Errorf("the namespace of a dead process survived (%s): its shells stay alive, invisible "+
@@ -1080,7 +1090,7 @@ func valueForMark(t *testing.T, mark string, pane paneRef, slot int) string {
 // never had.
 //
 // Three rules are about AGE: keep the oldest pane when two servers race for a
-// slot, consider adoption candidates oldest-first, and break geometry ties
+// slot, consider reclaim candidates oldest-first, and break geometry ties
 // deterministically. All three rank panes by this ordinal, and sorting pane ids
 // as STRINGS is wrong in a way that only appears after a window has passed ten
 // panes — at which point "keep the oldest" starts keeping the newest, silently,

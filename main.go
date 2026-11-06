@@ -38,28 +38,26 @@ func resolveVersion() string {
 	return version
 }
 
-// backendTmux is the only accepted value of -backend in v2.0.0.
-const backendTmux = "tmux"
-
 func main() {
 	shellType := flag.String("shell-type", "bash", "Shell type for exit code capture (bash/zsh/fish)")
 	channelMode := flag.Bool("channel", false, "Enable Claude Code channel mode: push terminal events as channel notifications")
 	showVersion := flag.Bool("version", false, "Print the version and exit")
 
-	// -backend selects the multiplexer. "tmux" is the only accepted value in
-	// v2.0.0. The flag exists ahead of a second backend so the surface a
-	// consumer pins does not change when one lands: a config file that already
-	// says --backend=tmux keeps working, and nothing about the tool surface
-	// depends on the answer.
+	// -backend selects the multiplexer: auto (the default), tmux or herdr.
+	// Nothing about the tool surface depends on the answer — the same tools,
+	// arguments and results under every backend — so an agent cannot tell
+	// which one it is under, and a config that says --backend=tmux keeps
+	// working.
 	//
-	// There is no environment detection to do. Every agent runtime starts this
-	// server from inside a pane, and with nothing set the answer is still tmux —
-	// invisible slots need no window and work outside it, so refusing to start
-	// would remove the one mode that still functions there.
+	// auto is detectBackend's rule: the multiplexer whose pane this process
+	// runs in, with process ancestry deciding between the two when both have
+	// left their variables in the environment. With nothing detected the answer
+	// is still tmux — invisible slots need no window and work outside it, so
+	// refusing to start would remove the one mode that still functions there.
 	//
 	// $MAGMUX_SOCK is RESERVED and deliberately not implemented: detecting it now
 	// would hand a caller a backend that does not exist.
-	backendName := flag.String("backend", backendTmux, "Multiplexer backend (tmux)")
+	backendName := flag.String("backend", backendAuto, "Multiplexer backend: auto, tmux or herdr")
 
 	flag.Parse()
 
@@ -68,18 +66,34 @@ func main() {
 		return
 	}
 
-	if *backendName != backendTmux {
-		log.Fatalf("unknown backend %q: this build implements %q", *backendName, backendTmux)
+	if !validBackendFlag(*backendName) {
+		log.Fatal(errUnknownBackend(*backendName))
 	}
 
 	// The policy layer holds the port and nothing else, so no handler can reach
-	// a tmux command even by accident.
+	// a multiplexer command even by accident.
 	//
-	// Constructing the backend also fixes this server's isolated namespace and
-	// reclaims the namespaces of servers that are gone — see
-	// reapOrphanedNamespaces. That replaces the stale-socket cleanup this line
-	// used to perform, which ran kill-server on a socket other servers share.
-	sl := newSlots(newTmuxBackend(newTmuxClient(*shellType)))
+	// Constructing a tmux backend also fixes this server's isolated namespace
+	// and reclaims the namespaces of servers that are gone — see
+	// reapOrphanedNamespaces. Under herdr the same happens for the tmux
+	// namespace that serves isolated slots, when tmux is installed.
+	var backend Backend
+	switch detectFromProcess(*backendName) {
+	case detectedHerdr:
+		hb, err := newHerdrBackend()
+		if err != nil {
+			log.Fatalf("herdr backend: %v", err)
+		}
+		backend = hb
+	case detectedTmux:
+		backend = newTmuxBackend(newTmuxClient())
+	default:
+		tb := newTmuxBackend(newTmuxClient())
+		tb.noWindow = true
+		backend = tb
+	}
+	sl := newSlots(backend)
+	sl.shell = *shellType
 
 	// Resource capabilities are NOT advertised: this server registers no
 	// resources. The two it used to serve were tmux://sessions and the

@@ -1,13 +1,21 @@
 package main
 
-import "errors"
+import (
+	"errors"
+	"path/filepath"
+	"strings"
+)
 
 // errUIDUnsupported is what processUIDs returns on a platform where we cannot
 // resolve a process's owner. See process_other.go for why that is an error and
 // not a value — it is the difference between a guard and the appearance of one.
 var errUIDUnsupported = errors.New("process uid lookup is unsupported on this platform")
 
-// PaneState captures the OS-level state of a tmux pane's process.
+// PaneState captures the OS-level state of a pane's process.
+//
+// The last three fields describe the pane's tty rather than its process, and
+// they are kept off the wire: pane-state's response shape does not change, and
+// they exist for the readiness gate, not for the agent. See ttyInputState.
 type PaneState struct {
 	PanePID         int    `json:"panePid"`
 	ForegroundPID   int    `json:"foregroundPid"`
@@ -15,6 +23,162 @@ type PaneState struct {
 	IsAlive         bool   `json:"isAlive"`
 	WaitingForInput bool   `json:"waitingForInput"`
 	ExitCode        int    `json:"exitCode,omitempty"`
+
+	// InputKnown is true when the tty probe answered, so the two fields after
+	// it are facts rather than zero values. Every gate that relies on them
+	// checks it first, and a probe that failed reads as "not ready".
+	InputKnown bool `json:"-"`
+	// LineEditing is true when the tty is in non-canonical mode: a line editor
+	// is reading it key by key.
+	LineEditing bool `json:"-"`
+	// PendingInput is how many typed bytes are queued on the tty unread.
+	PendingInput int `json:"-"`
+	// ReadingTTY is true when the pane's own process is in the foreground and
+	// asleep in a read on its terminal: a prompt read in canonical mode, by a
+	// shell with no line editor or with its editor switched off.
+	ReadingTTY bool `json:"-"`
+	// EditorOff is true when the pane's own shell has a line editor but its
+	// command line started it without one (see editorSwitchedOff), so a prompt
+	// read in canonical mode is what it does at rest.
+	EditorOff bool `json:"-"`
+}
+
+// fillInputState probes the pane's tty and records what it found. Each backend
+// supplies the path its own way; the probe and its meaning are the same for
+// all of them. A failed probe leaves InputKnown false.
+func fillInputState(state *PaneState, tty string) {
+	if state == nil || tty == "" {
+		return
+	}
+	lineEditing, pending, err := ttyInputState(tty)
+	if err != nil {
+		return
+	}
+	state.InputKnown = true
+	state.LineEditing = lineEditing
+	state.PendingInput = pending
+	if state.PanePID > 0 && state.ForegroundPID == state.PanePID {
+		state.ReadingTTY = readingTTY(state.PanePID)
+		if hasLineEditor(state.ForegroundCmd) {
+			if argv, err := processArgs(state.PanePID); err == nil {
+				state.EditorOff = editorSwitchedOff(argv)
+			}
+		}
+	}
+}
+
+// editorSwitchedOff reports whether a shell's command line leaves it without
+// its line editor: bash --noediting, or zsh with its ZLE option unset. Such a
+// shell reads its prompt in canonical mode although its name says it has an
+// editor.
+//
+// The options are applied in order and the last one wins, as the shell itself
+// applies them: zsh +Z -Z starts with ZLE on. Only the options before the
+// first operand count; anything after it belongs to a script or a -c string,
+// and a shell given one is not reading a prompt at all.
+func editorSwitchedOff(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	switch strings.TrimPrefix(filepath.Base(argv[0]), "-") {
+	case "bash":
+		return bashEditingOff(argv[1:])
+	case "zsh":
+		return zshZLEOff(argv[1:])
+	}
+	return false
+}
+
+// bashEditingOff reads bash's options. Nothing on its command line turns
+// editing back on once --noediting has turned it off.
+func bashEditingOff(args []string) bool {
+	off := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if endOfOptions(arg) {
+			break
+		}
+		switch arg {
+		case "--noediting":
+			off = true
+		case "-c":
+			return false
+		case "-o", "+o", "-O", "+O", "--rcfile", "--init-file":
+			i++
+		}
+	}
+	return off
+}
+
+// zshZLEOff reads zsh's options: -Z and +Z, --zle and --nozle, and letters
+// grouped behind one sign (+fZ). In a group, o takes an option name — the rest
+// of the argument when anything follows it (-oNO_ZLE), the next argument when
+// nothing does (-o nozle, -fo nozle) — and ends the group, so letters in the
+// name are not read as options.
+func zshZLEOff(args []string) bool {
+	off := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if endOfOptions(arg) {
+			break
+		}
+		if strings.HasPrefix(arg, "--") {
+			switch zshOptionName(arg[2:]) {
+			case "zle":
+				off = false
+			case "nozle":
+				off = true
+			}
+			continue
+		}
+		unset := arg[0] == '+'
+	letters:
+		for j := 1; j < len(arg); j++ {
+			switch arg[j] {
+			case 'Z':
+				off = unset
+			case 'c':
+				return false
+			case 'o':
+				name := arg[j+1:]
+				if name == "" {
+					if i+1 >= len(args) {
+						return off
+					}
+					i++
+					name = args[i]
+				}
+				off = zleOffAfter(name, unset, off)
+				break letters
+			}
+		}
+	}
+	return off
+}
+
+// zleOffAfter applies one named option to the ZLE state: under -o, "zle"
+// turns the editor on and "nozle" turns it off, and +o is the reverse. Any
+// other name leaves the state as it was.
+func zleOffAfter(name string, unset, off bool) bool {
+	switch zshOptionName(name) {
+	case "zle":
+		return unset
+	case "nozle":
+		return !unset
+	}
+	return off
+}
+
+// endOfOptions reports whether an argument ends a shell's options: "--", a
+// lone "-", or an operand, an empty one included.
+func endOfOptions(arg string) bool {
+	return arg == "" || arg == "--" || arg == "-" || (arg[0] != '-' && arg[0] != '+')
+}
+
+// zshOptionName is an option name the way zsh compares them: case and
+// underscores do not count, and neither do dashes in a long option.
+func zshOptionName(s string) string {
+	return strings.NewReplacer("_", "", "-", "").Replace(strings.ToLower(s))
 }
 
 // procInfo is the minimum a platform must report about a process for

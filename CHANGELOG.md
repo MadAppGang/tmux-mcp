@@ -5,6 +5,54 @@ All notable changes to tmux-mcp are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-11-06
+
+Same tools, same arguments, same result shapes. Three slot defects are fixed, and the
+server now runs under herdr as well as tmux.
+
+### Fixed
+
+- **The first command into a new pane is no longer lost to the shell's startup.** A
+  pane counted as ready as soon as its shell was in the foreground, which is already true
+  while zsh is still sourcing its rc file, and the wait gave up after two seconds. A new or
+  reclaimed pane is now typed into only once its line editor is reading input: the tty has
+  left canonical mode and has no unread bytes. Shells without a line editor are recognised
+  by a settled prompt. Text typed at a prompt is checked to have been read, and the call
+  fails, rather than reporting success, when the shell did not take it.
+  `execute-command` never types a command twice: when its start marker does not appear, the
+  call fails with "the command was not confirmed to start, and it was not sent again".
+  Known line-editor shells (zsh, bash, fish, tcsh) count as ready only on a positive
+  signal; a zsh with `unsetopt zle` in its rc is never ready on macOS and those calls fail
+  after their wait instead of losing the command.
+- **An idle helper pane is reused instead of piling up.** A pane this server made that
+  lost its slot number (a duplicate-slot race, a failed slot write, a pane from 1.x) was
+  never reused and never adopted, so every call opened another one. Such a pane is now
+  reclaimed for the requested slot when it is an idle shell, and put back in the server's
+  working directory.
+- **Slots open where the placement rule says.** Slot 1 beside the agent, slot 2 under
+  slot 1 (beside the agent when there is no slot 1), slot 3 under the agent, slot 4 and up
+  by splitting the largest helper along its longer side. Slot 1 used to adopt any idle
+  shell in the window, which moved every later slot off the rule.
+
+### Changed
+
+- **A pane the user opened is never taken.** Adopting an idle, unmarked shell is gone:
+  only panes this server made can be reused or reclaimed, and a busy pane, a TUI or a shell
+  still starting up never is. Panes adopted by earlier versions are released, never
+  killed, by `close-pane`, and are no longer typed into.
+- **send-keys:** key names (`literal: false`) are always sent at once, so `C-c` reaches a
+  busy pane.
+- Error text no longer names the multiplexer.
+
+### Added
+
+- **herdr backend.** The server detects at startup whether it runs in a tmux pane or a
+  herdr pane (`TMUX_PANE`, or `HERDR_ENV=1` with `HERDR_PANE_ID`). When both are present,
+  the nearest one in its own process ancestry wins. `--backend auto|tmux|herdr` overrides
+  the choice. Under herdr, slot records live in
+  `$XDG_STATE_HOME/tmux-mcp/herdr/<sha256 of HERDR_SOCKET_PATH>.json`. Isolated slots still
+  use a private tmux server. See [Running under herdr](README.md#running-under-herdr).
+
 ## [2.0.0] — 2026-09-04
 
 **Breaking, on every axis. There is no compatibility path — see [Migration](#migration).**

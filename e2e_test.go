@@ -105,6 +105,25 @@ func isolateTmux() (func(), error) {
 	os.Setenv("ZDOTDIR", zdotDir)
 	os.Unsetenv("TMUX")
 	os.Unsetenv("TMUX_PANE")
+	// The same reasoning holds for herdr: a suite run from inside a herdr pane
+	// inherits that pane's identity and socket, and a server under test must
+	// never find the developer's real herdr session through them. The herdr
+	// scenarios start their own named session and hand its variables to one
+	// child at a time.
+	for _, v := range herdrEnvVars {
+		os.Unsetenv(v)
+	}
+	// Under herdr the registry is a state file under $XDG_STATE_HOME, one per
+	// herdr server. Every herdr scenario starts a server of its own, so without
+	// this each run would leave its files in the developer's real state
+	// directory.
+	stateDir, err := os.MkdirTemp("", "tmux-mcp-state-*")
+	if err != nil {
+		os.RemoveAll(tmuxTmp)
+		os.RemoveAll(zdotDir)
+		return nil, fmt.Errorf("create XDG_STATE_HOME: %w", err)
+	}
+	os.Setenv("XDG_STATE_HOME", stateDir)
 
 	// Start the private server with no config, via a keepalive session that holds
 	// it open for the whole run. Config is read once, at server start, so every
@@ -114,6 +133,7 @@ func isolateTmux() (func(), error) {
 	if out, err := exec.Command("tmux", "-f", os.DevNull, "new-session", "-d", "-s", keepalive).CombinedOutput(); err != nil {
 		os.RemoveAll(tmuxTmp)
 		os.RemoveAll(zdotDir)
+		os.RemoveAll(stateDir)
 		return nil, fmt.Errorf("start clean tmux server: %w: %s", err, out)
 	}
 
@@ -129,6 +149,7 @@ func isolateTmux() (func(), error) {
 		_ = exec.Command("tmux", append(socketArgs(headlessSocket), "kill-server")...).Run()
 		os.RemoveAll(tmuxTmp)
 		os.RemoveAll(zdotDir)
+		os.RemoveAll(stateDir)
 	}
 	return cleanup, nil
 }

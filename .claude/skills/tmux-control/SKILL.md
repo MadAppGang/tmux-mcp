@@ -31,8 +31,10 @@ If your tools include `open-pane`, `execute-command`, `start-and-watch`,
 better road for the ordinary case. It gives you a pane beside the user, keeps
 the same pane under the same **slot** number across calls, watches processes
 with OS-level triggers instead of screen-scraping, refuses to touch the user's
-panes or your own, and cleans up after itself. Everything below you would have
-to get right by hand.
+panes or your own, waits for a new pane's shell before typing and confirms the
+keys landed, and cleans up after itself. Everything below you would have to get
+right by hand. The same tools work when the agent runs inside herdr instead of
+tmux; this page is about tmux only.
 
 Come here when the job genuinely needs tmux itself, which tmux-mcp deliberately
 does not expose:
