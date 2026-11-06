@@ -30,6 +30,10 @@ func TestTmuxSaysGone(t *testing.T) {
 		{"can't find pane: <pane>", true},
 		{"can't find pane <pane>", true},
 		{"some warning\nno server running on /tmp/x", true},
+		{"error connecting to /x (Permission denied)", false},
+		{"error connecting to /x (Operation timed out)", false},
+		{"error connecting to /x", false},
+		{"error connecting to /x (no such file or directory)", false},
 		{"", false},
 		{"unknown option -- z", false},
 		{"invalid format", false},
@@ -150,5 +154,44 @@ func TestIsolatedShellThatExitsOnFailure(t *testing.T) {
 				t.Errorf("the next isolated call into the slot = %q, want a fresh pane running echo again", texts)
 			}
 		})
+	}
+}
+
+// TestUnreachableServerIsNotGone takes the private tmux server's socket
+// directory away from this process for two seconds while a command runs. Every
+// pane read then fails with Permission denied, which says nothing about the
+// pane: the shell lives on, and the call must wait for the command to finish.
+//
+// REGRESSION: every "error connecting to" counted as a server that was gone, so Permission denied ended a running command with -1 and a false shell-exited note
+func TestUnreachableServerIsNotGone(t *testing.T) {
+	c, self := agentPaneFixture(t)
+	socketDir := filepath.Dir(tmuxExec(t, "display-message", "-p", "-t", self, "#{socket_path}"))
+	info, err := os.Stat(socketDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode := info.Mode().Perm()
+	t.Cleanup(func() { _ = os.Chmod(socketDir, mode) })
+	runExec(t, c, map[string]any{"command": "true"})
+
+	denied := make(chan error, 1)
+	go func() {
+		time.Sleep(time.Second)
+		if err := os.Chmod(socketDir, 0); err != nil {
+			denied <- err
+			return
+		}
+		time.Sleep(2 * time.Second)
+		denied <- os.Chmod(socketDir, mode)
+	}()
+	out, texts := runExec(t, c, map[string]any{"command": "printf 'before\\n'; sleep 4; printf 'after\\n'"})
+	if err := <-denied; err != nil {
+		t.Fatalf("the fixture could not change the socket directory: %v", err)
+	}
+	if out.ExitCode != 0 || !strings.Contains(out.Output, "before") || !strings.Contains(out.Output, "after") {
+		t.Errorf("exit code %d, output %q; want 0 with before and after", out.ExitCode, out.Output)
+	}
+	if len(texts) > 1 {
+		t.Errorf("the call carried notes for a pane that never went away: %q", texts[1:])
 	}
 }

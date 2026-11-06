@@ -319,25 +319,41 @@ type goneError struct{ error }
 func (g goneError) Unwrap() []error { return []error{g.error, errTmuxGone} }
 
 // tmuxGonePrefixes are the lines tmux prints when a pane, or the server it was
-// on, does not exist: a socket with no server ("no server running on"), one
-// that cannot be reached ("error connecting to ... (No such file or
-// directory)", "(Connection refused)"), a server that went away mid-command,
-// and a pane id that names nothing. Each is matched at the start of a line, so
-// a message that merely quotes one of them elsewhere does not count.
+// on, does not exist: a socket with no server, a server that went away
+// mid-command, and a pane id that names nothing ("can't find pane", which tmux
+// says only of a pane target that resolves to no pane). Each is matched at the
+// start of a line, so a message that merely quotes one elsewhere does not
+// count.
 var tmuxGonePrefixes = []string{
 	"no server running on ",
-	"error connecting to ",
 	"server exited unexpectedly",
 	"lost server",
 	"can't find pane",
 }
 
+// tmuxConnectGoneReasons are the reasons, in tmux's own words, for which a
+// failed connection means there is no server: its socket is gone, or nothing
+// listens on it. Any other reason — Permission denied above all — says the
+// server may well be alive and only out of reach for now.
+var tmuxConnectGoneReasons = []string{
+	"(No such file or directory)",
+	"(Connection refused)",
+}
+
 // tmuxSaysGone reports whether tmux's stderr says the pane or its server no
-// longer exists. Anything else — a transient failure, a bad argument — does
-// not, and callers that poll keep polling.
+// longer exists. Anything else — a transient failure, a bad argument, a socket
+// this process may not reach — does not, and callers that poll keep polling.
 func tmuxSaysGone(detail string) bool {
 	for _, line := range strings.Split(detail, "\n") {
 		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "error connecting to ") {
+			for _, reason := range tmuxConnectGoneReasons {
+				if strings.HasSuffix(line, " "+reason) {
+					return true
+				}
+			}
+			continue
+		}
 		for _, prefix := range tmuxGonePrefixes {
 			if strings.HasPrefix(line, prefix) {
 				return true
