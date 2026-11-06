@@ -29,6 +29,11 @@ Same tools, same arguments, same result shapes.
   now ends the call with `exitCode: -1` and `timedOut: false`, and a second text item says
   the exit status could not be read. A long-running command still runs as long as it
   runs.
+- **A shell that exits with its command ends the wait.** Under errexit with pipefail, a
+  failing command fails the wrapper's pipeline and the pane's shell exits, as it would if
+  the command had been typed directly, so no prompt ever came back and the call waited.
+  The call now notices the shell is gone, returns the status the command left, and adds a
+  text item saying the pane's shell exited; the next call into the slot opens a new pane.
 
 ## [2.1.0] — 2026-11-06
 

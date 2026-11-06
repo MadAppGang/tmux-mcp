@@ -420,12 +420,19 @@ func runOneShot(ctx context.Context, sl *slots, command string) (*mcp.CallToolRe
 }
 
 // execToolResult is execute-command's result: the JSON every caller reads,
-// and, when the exit status could not be read, the reason as a second text.
-// The JSON keeps its shape; the reason rides beside it.
+// then a text for each thing the JSON cannot say — the exit status could not
+// be read, the pane's shell exited. The JSON keeps its shape; the notes ride
+// beside it.
 func execToolResult(v any, outcome *execOutcome) (*mcp.CallToolResult, error) {
 	res, err := jsonResult(v)
-	if err == nil && res != nil && !res.IsError && outcome.StatusUnreadable {
+	if err != nil || res == nil || res.IsError {
+		return res, err
+	}
+	if outcome.StatusUnreadable {
 		res.Content = append(res.Content, mcp.NewTextContent(statusUnreadableNote))
+	}
+	if outcome.ShellExited {
+		res.Content = append(res.Content, mcp.NewTextContent(shellExitedNote))
 	}
 	return res, err
 }

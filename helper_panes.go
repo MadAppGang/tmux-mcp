@@ -1980,13 +1980,22 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 		case exitUnreadable:
 			return unreadableOutcome(outFile), nil
 		}
+		state, err := s.b.Foreground(ctx, pane)
+		// A shell that exited has ended the pipeline with it — errexit on a
+		// failed pipeline does that — so the output is complete, and whatever
+		// status was written is all there will be.
+		if shellGone(state, err) {
+			outcome := finishedOutcome(outFile, statusFile, exitFile)
+			outcome.ShellExited = true
+			return outcome, nil
+		}
 		// A command that started and whose shell is back at its prompt has
-		// finished; a status it has not written by now will not come.
-		if s.finishedAtPrompt(ctx, pane, startFile) {
+		// finished; a status it has not moved into place by now will not come.
+		if err == nil && commandStarted(startFile) && backAtPrompt(state) {
 			if promptSince.IsZero() {
 				promptSince = time.Now()
 			} else if time.Since(promptSince) >= exitStatusGrace {
-				return unreadableOutcome(outFile), nil
+				return finishedOutcome(outFile, statusFile, exitFile), nil
 			}
 		} else {
 			promptSince = time.Time{}
@@ -2007,29 +2016,59 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 // unreadableOutcome is the result for a command that finished without a status
 // that can be read: exit code -1, whatever output it left, and the reason.
 func unreadableOutcome(outFile string) *execOutcome {
-	partial := ""
-	if data, err := os.ReadFile(outFile); err == nil {
-		partial = strings.TrimRight(string(data), "\n")
-	}
-	return &execOutcome{Output: partial, ExitCode: -1, StatusUnreadable: true}
+	return &execOutcome{Output: readOutput(outFile), ExitCode: -1, StatusUnreadable: true}
 }
 
 // statusUnreadableNote is the text a result with StatusUnreadable carries.
 const statusUnreadableNote = "the command finished, but its exit status could not be read; " +
 	"exitCode -1 does not say whether it failed"
 
-// finishedAtPrompt reports whether a command has started and its shell is
-// reading at a prompt again, which is the shell's word that the pipeline is
-// over. Only a positive or quiet reading counts: a pane the probe cannot read
-// never reports this, and its wait ends on the status or on its timeout.
-func (s *slots) finishedAtPrompt(ctx context.Context, pane paneRef, startFile string) bool {
-	if _, err := os.Stat(startFile); err != nil {
-		return false
+// shellExitedNote is the text a result with ShellExited carries.
+const shellExitedNote = "the pane's shell exited when the command ended, so the pane is gone; " +
+	"the next call into this slot opens a new one"
+
+// finishedOutcome is the result for a command whose pipeline is over but whose
+// exit file was not read on the way: the exit file if it has appeared since,
+// otherwise the status file the wrapper writes before moving it, and an
+// unreadable status only when neither holds a number. The status file is
+// still there when the move never ran — the shell exited first, or a command
+// that replaced the wrapper's EXIT trap was stopped by errexit after the trap
+// had written it.
+func finishedOutcome(outFile, statusFile, exitFile string) *execOutcome {
+	for _, path := range []string{exitFile, statusFile} {
+		if code, state := readExitFile(path); state == exitWritten {
+			return &execOutcome{Output: readOutput(outFile), ExitCode: code}
+		}
 	}
-	state, err := s.b.Foreground(ctx, pane)
+	return unreadableOutcome(outFile)
+}
+
+// readOutput is whatever the command's output file holds, or "".
+func readOutput(outFile string) string {
+	data, err := os.ReadFile(outFile)
 	if err != nil {
-		return false
+		return ""
 	}
+	return strings.TrimRight(string(data), "\n")
+}
+
+// shellGone reports whether a pane's shell has exited: the pane is gone, or
+// still shown with its process dead.
+func shellGone(state *PaneState, err error) bool {
+	return errors.Is(err, errPaneGone) || (err == nil && state != nil && !state.IsAlive)
+}
+
+// commandStarted reports whether the wrapper's start marker exists.
+func commandStarted(startFile string) bool {
+	_, err := os.Stat(startFile)
+	return err == nil
+}
+
+// backAtPrompt reports whether a shell is reading at a prompt, which after a
+// command has started is the shell's word that the pipeline is over. Only a
+// positive or quiet reading counts: a pane the probe cannot read never reports
+// this, and its wait ends on the status, the shell exiting, or the timeout.
+func backAtPrompt(state *PaneState) bool {
 	switch readPrompt(state) {
 	case promptEditing, promptCanonical, promptQuiet:
 		return true

@@ -1275,6 +1275,9 @@ type execOutcome struct {
 	// StatusUnreadable is set when the command finished but left no exit
 	// status that could be read; ExitCode is then -1.
 	StatusUnreadable bool
+	// ShellExited is set when the pane's shell exited with the command, as
+	// errexit makes it do on a failed pipeline. The pane is gone.
+	ShellExited bool
 }
 
 // Backend is the port. Policy calls only this; only this file implements it.

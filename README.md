@@ -543,7 +543,9 @@ process cannot be read, or the program is not one of those shells:
 
 When a command finishes without a status that can be read, `execute-command` returns
 `exitCode: -1` with `timedOut: false`, and a second text item in the result says the exit
-status could not be read.
+status could not be read. When the pane's shell exits with the command — errexit with
+pipefail does that on a failure — the call returns the status the command left and adds
+a text item saying the shell exited; the next call into that slot opens a new pane.
 
 `--backend` selects the multiplexer. The default, `auto`, detects it at startup (see
 [Running under herdr](#running-under-herdr)); `tmux` or `herdr` forces one. The tools are

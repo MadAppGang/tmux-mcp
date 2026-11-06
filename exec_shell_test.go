@@ -245,6 +245,59 @@ func TestCommandWithItsOwnExitTrap(t *testing.T) {
 	})
 }
 
+// TestShellThatExitsOnFailure runs a failing command in shells with errexit
+// and pipefail set. The failure fails the wrapper's pipeline, and the shell
+// exits as it would if the command had been typed directly. The call must see
+// that, return the command's status with a note that the shell exited, and the
+// next call into the slot must get a fresh pane.
+//
+// REGRESSION: a shell that exited on a failed pipeline left the call waiting for a prompt that never came
+func TestShellThatExitsOnFailure(t *testing.T) {
+	bash, err := lookBash()
+	if err != nil {
+		t.Skip(err)
+	}
+	for _, tc := range []struct{ name, command, rc string }{
+		{"bash -e -o pipefail", "exec " + bash + " --noprofile --norc -e -o pipefail", ""},
+		{"zsh with errexit and pipefail", "", "setopt errexit pipefail\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := agentPaneFixture(t)
+			if tc.command != "" {
+				useDefaultCommand(t, tc.command)
+			} else {
+				installZshrc(t, tc.rc)
+			}
+
+			started := time.Now()
+			out, texts := runExec(t, c, map[string]any{"command": "false; printf 'should-not-run\\n'"})
+			if took := time.Since(started); took > 10*time.Second {
+				t.Errorf("the call took %v to notice the shell had exited", took.Round(time.Millisecond))
+			}
+			if out.ExitCode != 1 {
+				t.Errorf("exit code %d, want 1 (%q)", out.ExitCode, texts)
+			}
+			if strings.Contains(out.Output, "should-not-run") {
+				t.Errorf("the command kept running after false: %q", out.Output)
+			}
+			if !strings.Contains(strings.Join(texts[1:], "\n"), "shell exited") {
+				t.Errorf("the call did not say the pane's shell exited: %q", texts)
+			}
+
+			next, texts := runExec(t, c, map[string]any{"command": "echo again"})
+			var created struct {
+				Created bool `json:"created"`
+			}
+			if err := json.Unmarshal([]byte(texts[0]), &created); err != nil {
+				t.Fatalf("decode %s: %v", texts[0], err)
+			}
+			if !created.Created || next.ExitCode != 0 || strings.TrimSpace(next.Output) != "again" {
+				t.Errorf("the next call into the slot = %q, want a fresh pane running echo again", texts)
+			}
+		})
+	}
+}
+
 // ---- A status that cannot be read ends the wait ----
 
 // spoilExitFile finds the exit file of the command running in a pane — from
