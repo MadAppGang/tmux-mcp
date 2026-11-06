@@ -110,8 +110,11 @@ func bashEditingOff(args []string) bool {
 	return off
 }
 
-// zshZLEOff reads zsh's options: -Z and +Z, --zle and --nozle, -o and +o with
-// an option name, and letters grouped behind one sign (+fZ).
+// zshZLEOff reads zsh's options: -Z and +Z, --zle and --nozle, and letters
+// grouped behind one sign (+fZ). In a group, o takes an option name — the rest
+// of the argument when anything follows it (-oNO_ZLE), the next argument when
+// nothing does (-o nozle, -fo nozle) — and ends the group, so letters in the
+// name are not read as options.
 func zshZLEOff(args []string) bool {
 	off := false
 	for i := 0; i < len(args); i++ {
@@ -119,35 +122,49 @@ func zshZLEOff(args []string) bool {
 		if endOfOptions(arg) {
 			break
 		}
-		switch {
-		case strings.HasPrefix(arg, "--"):
+		if strings.HasPrefix(arg, "--") {
 			switch zshOptionName(arg[2:]) {
 			case "zle":
 				off = false
 			case "nozle":
 				off = true
 			}
-		case arg == "-o" || arg == "+o":
-			if i+1 >= len(args) {
-				return off
-			}
-			i++
-			switch zshOptionName(args[i]) {
-			case "zle":
-				off = arg == "+o"
-			case "nozle":
-				off = arg == "-o"
-			}
-		default:
-			for _, letter := range arg[1:] {
-				switch letter {
-				case 'Z':
-					off = arg[0] == '+'
-				case 'c':
-					return false
+			continue
+		}
+		unset := arg[0] == '+'
+	letters:
+		for j := 1; j < len(arg); j++ {
+			switch arg[j] {
+			case 'Z':
+				off = unset
+			case 'c':
+				return false
+			case 'o':
+				name := arg[j+1:]
+				if name == "" {
+					if i+1 >= len(args) {
+						return off
+					}
+					i++
+					name = args[i]
 				}
+				off = zleOffAfter(name, unset, off)
+				break letters
 			}
 		}
+	}
+	return off
+}
+
+// zleOffAfter applies one named option to the ZLE state: under -o, "zle"
+// turns the editor on and "nozle" turns it off, and +o is the reverse. Any
+// other name leaves the state as it was.
+func zleOffAfter(name string, unset, off bool) bool {
+	switch zshOptionName(name) {
+	case "zle":
+		return unset
+	case "nozle":
+		return !unset
 	}
 	return off
 }
