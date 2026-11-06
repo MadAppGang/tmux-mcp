@@ -123,6 +123,80 @@ func TestHerdrExitStatusFollowsThePanesShell(t *testing.T) {
 	requireExitCodes(t, c, 1)
 }
 
+// ---- The status does not cut the output short ----
+
+// TestBackgroundOutputIsKept is a command that leaves a background job
+// writing to its output after the command itself is done. The job holds the
+// pipe to tee open, and its output belongs to the result as much as the
+// foreground's does.
+//
+// REGRESSION: the status was written before tee finished, so the call returned without what a background job printed later
+func TestBackgroundOutputIsKept(t *testing.T) {
+	bash, err := lookBash()
+	if err != nil {
+		t.Skip(err)
+	}
+	for _, tc := range []struct{ name, command string }{
+		{"zsh", ""},
+		{"bash", "exec " + bash + " --norc --noprofile"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := agentPaneFixture(t)
+			if tc.command != "" {
+				useDefaultCommand(t, tc.command)
+			} else {
+				requireZshPanes(t)
+			}
+			out, _ := runExec(t, c, map[string]any{
+				"command": "(sleep 3; printf 'late\\n') & printf 'early\\n'",
+			})
+			if !strings.Contains(out.Output, "early") || !strings.Contains(out.Output, "late") {
+				t.Errorf("output %q, want both early and late", out.Output)
+			}
+			if out.ExitCode != 0 {
+				t.Errorf("exit code %d, want 0", out.ExitCode)
+			}
+		})
+	}
+}
+
+// TestErrexitShellReportsTheStatus runs a failing command in shells with
+// errexit set. errexit must not take the status write down with the command.
+//
+// REGRESSION: under errexit a failing command ended the wrapper before it wrote its status, so false was reported as an unreadable -1
+func TestErrexitShellReportsTheStatus(t *testing.T) {
+	bash, err := lookBash()
+	if err != nil {
+		t.Skip(err)
+	}
+	for _, tc := range []struct{ name, command, rc string }{
+		{"bash -e", "exec " + bash + " --noprofile --norc -e", ""},
+		{"zsh with errexit", "", "setopt errexit\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.rc != "" {
+				installZshrc(t, tc.rc)
+			}
+			c, _ := agentPaneFixture(t)
+			if tc.command != "" {
+				useDefaultCommand(t, tc.command)
+			}
+			for _, want := range []struct {
+				command string
+				code    int
+			}{{"false", 1}, {"exit 42", 42}, {"true", 0}} {
+				out, texts := runExec(t, c, map[string]any{"command": want.command})
+				if out.ExitCode != want.code {
+					t.Errorf("%s returned exit code %d, want %d", want.command, out.ExitCode, want.code)
+				}
+				if len(texts) > 1 {
+					t.Errorf("%s carried a note: %q", want.command, texts[1:])
+				}
+			}
+		})
+	}
+}
+
 // ---- A status that cannot be read ends the wait ----
 
 // spoilExitFile finds the exit file of the command running in a pane — from
@@ -175,10 +249,11 @@ func teeOutFile(rootPID string) string {
 	return ""
 }
 
-// TestUnreadableExitStatusEndsTheWait spoils the exit file of a running
-// command: once with a junk line it cannot overwrite, once with a directory
-// where the file should be, so no status line ever comes. Both commands
-// finish, so the call must end promptly with exit code -1 and say why.
+// TestUnreadableExitStatusEndsTheWait spoils the status of a running command:
+// once with a junk line in the status file that the shell cannot overwrite,
+// and which the wrapper then moves into place, once with a directory where the
+// exit file should be, so no status line ever comes. Both commands finish, so
+// the call must end promptly with exit code -1 and say why.
 //
 // REGRESSION: an exit file that never held a number kept execute-command polling forever
 func TestUnreadableExitStatusEndsTheWait(t *testing.T) {
@@ -187,17 +262,29 @@ func TestUnreadableExitStatusEndsTheWait(t *testing.T) {
 		spoil func(string) error
 	}{
 		{"a junk status line", func(path string) error {
-			if err := os.WriteFile(path, []byte("junk\n"), 0o644); err != nil {
+			if err := os.WriteFile(path+".tmp", []byte("junk\n"), 0o644); err != nil {
 				return err
 			}
-			return os.Chmod(path, 0o444)
+			return os.Chmod(path+".tmp", 0o444)
 		}},
 		{"no status line", func(path string) error { return os.Mkdir(path, 0o755) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, self := agentPaneFixture(t)
 			runExec(t, c, map[string]any{"command": "true"})
-			spoiled := spoilExitFile(t, slotPaneID(t, self, 1), tc.spoil)
+			var exitFile string
+			spoiled := spoilExitFile(t, slotPaneID(t, self, 1), func(path string) error {
+				exitFile = path
+				return tc.spoil(path)
+			})
+			// The directory keeps what was moved into it, so nothing else
+			// removes it; the junk file is removed by the call itself.
+			t.Cleanup(func() {
+				if exitFile != "" {
+					_ = os.RemoveAll(exitFile)
+					_ = os.Remove(exitFile + ".tmp")
+				}
+			})
 
 			started := time.Now()
 			out, texts := runExec(t, c, map[string]any{"command": "sleep 2"})

@@ -1909,13 +1909,11 @@ func (s *slots) awaitConsumed(ctx context.Context, pane paneRef, stillEditing bo
 // Timing for execInPane. execStartTimeout is how long a command typed into a
 // ready shell is given to begin before the shell is looked at again;
 // execPollInterval is how often the exit file is checked. exitStatusGrace is
-// how long a shell back at its prompt is given to have written a status, and
-// outputSettleTimeout bounds the wait for tee to finish after it has.
+// how long a shell back at its prompt is given to have written a status.
 const (
-	execStartTimeout    = 3 * time.Second
-	execPollInterval    = 50 * time.Millisecond
-	exitStatusGrace     = 2 * time.Second
-	outputSettleTimeout = 2 * time.Second
+	execStartTimeout = 3 * time.Second
+	execPollInterval = 50 * time.Millisecond
+	exitStatusGrace  = 2 * time.Second
 )
 
 // execInPane runs one shell command in a pane and waits for it to finish.
@@ -1952,8 +1950,10 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 	id := uuid.New().String()
 	base := filepath.Join("/tmp", "tmux-mcp-"+id)
 	startFile, outFile, exitFile := base+".start", base+".out", base+".exit"
+	statusFile := exitFile + ".tmp"
 	defer os.Remove(startFile)
 	defer os.Remove(outFile)
+	defer os.Remove(statusFile)
 	defer os.Remove(exitFile)
 
 	if s.shellOwnsTTY(ctx, pane) {
@@ -1962,7 +1962,7 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 		}
 	}
 	shell := wrapperShell(s.paneShell(ctx, pane), s.shell)
-	wrapped := wrapCommand(shell, command, startFile, outFile, exitFile)
+	wrapped := wrapCommand(shell, command, startFile, outFile, statusFile, exitFile)
 	if err := s.sendValidated(ctx, pane, wrapped, true, true); err != nil {
 		return nil, fmt.Errorf("send command: %w", err)
 	}
@@ -1972,14 +1972,12 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 	for {
 		switch code, state := readExitFile(exitFile); state {
 		case exitWritten:
-			s.awaitPipelineEnd(ctx, pane)
 			out, err := os.ReadFile(outFile)
 			if err != nil {
 				return nil, fmt.Errorf("read output file: %w", err)
 			}
 			return &execOutcome{Output: strings.TrimRight(string(out), "\n"), ExitCode: code}, nil
 		case exitUnreadable:
-			s.awaitPipelineEnd(ctx, pane)
 			return unreadableOutcome(outFile), nil
 		}
 		// A command that started and whose shell is back at its prompt has
@@ -2037,19 +2035,6 @@ func (s *slots) finishedAtPrompt(ctx context.Context, pane paneRef, startFile st
 		return true
 	}
 	return false
-}
-
-// awaitPipelineEnd waits, for at most outputSettleTimeout, until the pane's
-// own process owns the tty again. The status is written inside the pipeline,
-// while tee may still be copying the last of the output, and tee has written
-// everything once the pipeline has handed the tty back.
-func (s *slots) awaitPipelineEnd(ctx context.Context, pane paneRef) {
-	deadline := time.Now().Add(outputSettleTimeout)
-	for !s.shellOwnsTTY(ctx, pane) && time.Now().Before(deadline) {
-		if !sleepCtx(ctx, execPollInterval) {
-			return
-		}
-	}
 }
 
 // errNotStarted is execute-command's answer when its command never started.
@@ -2151,27 +2136,38 @@ func wrapperShell(real, flag string) string {
 
 // wrapCommand builds the line execInPane types: mark the start, run the command
 // with stdout and stderr through tee into outFile (so it also shows in the
-// pane), and write the command's own exit status, not tee's, into exitFile.
+// pane), write the command's own exit status, not tee's, into statusFile, and
+// move that to exitFile once the whole pipeline has finished.
 //
 // The status is taken inside the group, before the pipe, so the form needs
 // nothing but $? and works in every POSIX shell — bash, zsh, sh, dash, ksh —
 // whatever their pipeline-status arrays are called. The command runs through
 // eval, quoted as one word, so that one ending in a comment or in & still
 // leaves the status write as a command of its own, and the whole wrapper stays
-// one line. The eval runs in a subshell of its own, so a command that calls
-// exit ends that subshell and its status is still written; the group is a
-// pipeline's subshell already, so nothing else about the command changes. fish has neither $? nor { }, so it gets begin/end and $status.
-// printf with an empty format is the one way to create an empty file that all
-// of them accept.
-func wrapCommand(shell, command, startFile, outFile, exitFile string) string {
+// one line. The eval runs in a subshell, as the condition of an if: a command
+// that calls exit ends only that subshell, and errexit never fires in a
+// condition, so the status is written either way. Each branch redirects only
+// its own echo, so the command's output still goes to tee.
+//
+// exitFile appears only after tee has exited, which is after everything that
+// held the pipe open — a background job the command started included — is
+// done, so the output file is complete once exitFile exists. The move is one
+// rename, so exitFile never holds a partial line. It is spelled `command \mv`
+// so that neither a function nor an alias named mv runs instead; ksh93 expands
+// an alias after `command`, and the backslash stops that.
+//
+// fish has neither $? nor { }, so it gets begin/end and $status; there an
+// alias is a function, which `command` already skips. printf with an empty
+// format is the one way to create an empty file that all of them accept.
+func wrapCommand(shell, command, startFile, outFile, statusFile, exitFile string) string {
 	if shell == "fish" {
 		return fmt.Sprintf(
-			`printf '' > %s; begin; %s; echo $status > %s; end 2>&1 | tee %s`,
-			startFile, command, exitFile, outFile,
+			`printf '' > %s; begin; %s; echo $status > %s; end 2>&1 | tee %s; command mv %s %s`,
+			startFile, command, statusFile, outFile, statusFile, exitFile,
 		)
 	}
 	return fmt.Sprintf(
-		`printf '' > %s; { (eval %s); echo $? > %s; } 2>&1 | tee %s`,
-		startFile, shellQuote(command), exitFile, outFile,
+		`printf '' > %s; { if (eval %s); then echo 0 > %s; else echo $? > %s; fi; } 2>&1 | tee %s; command \mv %s %s`,
+		startFile, shellQuote(command), statusFile, statusFile, outFile, statusFile, exitFile,
 	)
 }

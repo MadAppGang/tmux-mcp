@@ -524,9 +524,11 @@ tmux-mcp [--shell-type bash|zsh|fish] [--backend auto|tmux|herdr] [--channel] [-
 ```
 
 `execute-command` captures a command's exit status with a wrapper spelled for the shell
-the pane really runs, read from the pane's own process: one POSIX form, `$?` taken
-before the pipe to `tee`, for bash, zsh, sh, dash and ksh, and `$status` for fish. The
-flag does not have to match your panes.
+the pane really runs, read from the pane's own process: one POSIX form for bash, zsh, sh,
+dash and ksh, and `$status` for fish. The command runs as the condition of an `if`, so
+`exit` and errexit cannot skip the status, and the status is published only once `tee`
+has exited, so the output includes what a background job printed after the command
+returned. The flag does not have to match your panes.
 
 `--shell-type` is the fallback, used only when a pane's shell cannot be identified — the
 process cannot be read, or the program is not one of those shells:
