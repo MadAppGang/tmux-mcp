@@ -39,7 +39,9 @@ func resolveVersion() string {
 }
 
 func main() {
-	shellType := flag.String("shell-type", "bash", "Shell type for exit code capture (bash/zsh/fish)")
+	shellType := flag.String("shell-type", "bash",
+		"Fallback shell for execute-command's exit-status wrapper (bash/zsh/fish), "+
+			"used only when a pane's own shell cannot be identified")
 	channelMode := flag.Bool("channel", false, "Enable Claude Code channel mode: push terminal events as channel notifications")
 	showVersion := flag.Bool("version", false, "Print the version and exit")
 

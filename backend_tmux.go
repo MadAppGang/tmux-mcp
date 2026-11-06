@@ -273,6 +273,9 @@ func (t *tmuxClient) runWithSocket(ctx context.Context, socket string, args ...s
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			detail = scrubIDs(strings.TrimSpace(string(exitErr.Stderr)))
 		}
+		if tmuxSaysGone(detail) {
+			return "", goneError{multiplexerError(err, detail)}
+		}
 		return "", multiplexerError(err, detail)
 	}
 	return strings.TrimRight(string(out), "\n"), nil
@@ -303,6 +306,61 @@ func multiplexerError(err error, detail string) error {
 		return fmt.Errorf("%s: %w", multiplexerRefused, err)
 	}
 	return fmt.Errorf("%s: %w: %s", multiplexerRefused, err, detail)
+}
+
+// errTmuxGone marks a tmux error that says the pane, or the whole server it
+// lived on, no longer exists. errors.Is finds it on such an error; the error's
+// text is unchanged.
+var errTmuxGone = errors.New("the pane or its server no longer exists")
+
+// goneError is a tmux error that also carries errTmuxGone.
+type goneError struct{ error }
+
+func (g goneError) Unwrap() []error { return []error{g.error, errTmuxGone} }
+
+// tmuxGonePrefixes are the lines tmux prints when a pane, or the server it was
+// on, does not exist: a socket with no server, a server that went away
+// mid-command, and a pane id that names nothing ("can't find pane", which tmux
+// says only of a pane target that resolves to no pane). Each is matched at the
+// start of a line, so a message that merely quotes one elsewhere does not
+// count.
+var tmuxGonePrefixes = []string{
+	"no server running on ",
+	"server exited unexpectedly",
+	"lost server",
+	"can't find pane",
+}
+
+// tmuxConnectGoneReasons are the reasons, in tmux's own words, for which a
+// failed connection means there is no server: its socket is gone, or nothing
+// listens on it. Any other reason — Permission denied above all — says the
+// server may well be alive and only out of reach for now.
+var tmuxConnectGoneReasons = []string{
+	"(No such file or directory)",
+	"(Connection refused)",
+}
+
+// tmuxSaysGone reports whether tmux's stderr says the pane or its server no
+// longer exists. Anything else — a transient failure, a bad argument, a socket
+// this process may not reach — does not, and callers that poll keep polling.
+func tmuxSaysGone(detail string) bool {
+	for _, line := range strings.Split(detail, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "error connecting to ") {
+			for _, reason := range tmuxConnectGoneReasons {
+				if strings.HasSuffix(line, " "+reason) {
+					return true
+				}
+			}
+			continue
+		}
+		for _, prefix := range tmuxGonePrefixes {
+			if strings.HasPrefix(line, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // idInText matches a multiplexer id embedded anywhere in a sentence: %3 for a
@@ -1122,6 +1180,11 @@ func (t *tmuxClient) GetPaneState(ctx context.Context, paneID string) (*PaneStat
 	// output cannot drop it.
 	out, err := t.runWithSocket(ctx, socket, "display-message", "-p", "-t", bareID,
 		"#{pane_tty}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}")
+	if errors.Is(err, errTmuxGone) {
+		// The pane is gone, or the server it lived on exited — which is what an
+		// isolated server does when its last pane's shell exits.
+		return nil, errPaneGone
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get pane state: %w", err)
 	}
@@ -1272,6 +1335,12 @@ type execOutcome struct {
 	Output   string
 	ExitCode int
 	TimedOut bool
+	// StatusUnreadable is set when the command finished but left no exit
+	// status that could be read; ExitCode is then -1.
+	StatusUnreadable bool
+	// ShellExited is set when the pane's shell exited with the command, as
+	// errexit makes it do on a failed pipeline. The pane is gone.
+	ShellExited bool
 }
 
 // Backend is the port. Policy calls only this; only this file implements it.

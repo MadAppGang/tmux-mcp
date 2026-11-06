@@ -339,12 +339,12 @@ func registerExecuteCommand(s *server.MCPServer, sl *slots) {
 			return mcp.NewToolResultErrorFromErr("failed to execute command",
 				fmt.Errorf("slot %d: %w", tgt.Slot, err)), nil
 		}
-		return jsonResult(execResult{
+		return execToolResult(execResult{
 			slotResolution: slotResolution{Slot: tgt.Slot, Created: creating(tgt.Created)},
 			Output:         outcome.Output,
 			ExitCode:       outcome.ExitCode,
 			TimedOut:       outcome.TimedOut,
-		})
+		}, outcome)
 	})
 }
 
@@ -412,11 +412,29 @@ func runOneShot(ctx context.Context, sl *slots, command string) (*mcp.CallToolRe
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
 	}
-	return jsonResult(oneShotResult{
+	return execToolResult(oneShotResult{
 		Output:   outcome.Output,
 		ExitCode: outcome.ExitCode,
 		TimedOut: outcome.TimedOut,
-	})
+	}, outcome)
+}
+
+// execToolResult is execute-command's result: the JSON every caller reads,
+// then a text for each thing the JSON cannot say — the exit status could not
+// be read, the pane's shell exited. The JSON keeps its shape; the notes ride
+// beside it.
+func execToolResult(v any, outcome *execOutcome) (*mcp.CallToolResult, error) {
+	res, err := jsonResult(v)
+	if err != nil || res == nil || res.IsError {
+		return res, err
+	}
+	if outcome.StatusUnreadable {
+		res.Content = append(res.Content, mcp.NewTextContent(statusUnreadableNote))
+	}
+	if outcome.ShellExited {
+		res.Content = append(res.Content, mcp.NewTextContent(shellExitedNote))
+	}
+	return res, err
 }
 
 // ---- start-and-watch ----
