@@ -19,3 +19,5 @@ func ttyOfPID(int) (string, error) { return "", errTTYUnsupported }
 func parentPID(int) (int, error) { return 0, errTTYUnsupported }
 
 func readingTTY(int) bool { return false }
+
+func processArgs(int) ([]string, error) { return nil, errTTYUnsupported }

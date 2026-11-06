@@ -1,6 +1,10 @@
 package main
 
-import "errors"
+import (
+	"errors"
+	"path/filepath"
+	"strings"
+)
 
 // errUIDUnsupported is what processUIDs returns on a platform where we cannot
 // resolve a process's owner. See process_other.go for why that is an error and
@@ -33,6 +37,10 @@ type PaneState struct {
 	// asleep in a read on its terminal: a prompt read in canonical mode, by a
 	// shell with no line editor or with its editor switched off.
 	ReadingTTY bool `json:"-"`
+	// EditorOff is true when the pane's own shell has a line editor but its
+	// command line started it without one (see editorSwitchedOff), so a prompt
+	// read in canonical mode is what it does at rest.
+	EditorOff bool `json:"-"`
 }
 
 // fillInputState probes the pane's tty and records what it found. Each backend
@@ -51,7 +59,68 @@ func fillInputState(state *PaneState, tty string) {
 	state.PendingInput = pending
 	if state.PanePID > 0 && state.ForegroundPID == state.PanePID {
 		state.ReadingTTY = readingTTY(state.PanePID)
+		if hasLineEditor(state.ForegroundCmd) {
+			if argv, err := processArgs(state.PanePID); err == nil {
+				state.EditorOff = editorSwitchedOff(argv)
+			}
+		}
 	}
+}
+
+// editorSwitchedOff reports whether a shell's command line starts it without
+// its line editor: bash --noediting, or zsh with its ZLE option unset (+Z,
+// --nozle, -o nozle, +o zle). Such a shell reads its prompt in canonical mode
+// although its name says it has an editor. Only the options before the first
+// operand count; anything after it belongs to a script or a -c string.
+func editorSwitchedOff(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	shell := strings.TrimPrefix(filepath.Base(argv[0]), "-")
+	args := argv[1:]
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" || arg == "-" || (arg[0] != '-' && arg[0] != '+') {
+			return false
+		}
+		switch shell {
+		case "bash":
+			switch arg {
+			case "--noediting":
+				return true
+			case "-c":
+				return false
+			case "-o", "+o", "-O", "+O", "--rcfile", "--init-file":
+				i++
+			}
+		case "zsh":
+			switch {
+			case strings.HasPrefix(arg, "--"):
+				if zshOptionName(arg[2:]) == "nozle" {
+					return true
+				}
+			case arg == "-o" || arg == "+o":
+				if i+1 < len(args) {
+					i++
+					name := zshOptionName(args[i])
+					if (arg == "-o" && name == "nozle") || (arg == "+o" && name == "zle") {
+						return true
+					}
+				}
+			case arg[0] == '+' && strings.ContainsRune(arg[1:], 'Z'):
+				return true
+			case strings.ContainsRune(arg[1:], 'c'):
+				return false
+			}
+		}
+	}
+	return false
+}
+
+// zshOptionName is an option name the way zsh compares them: case and
+// underscores do not count, and neither do dashes in a long option.
+func zshOptionName(s string) string {
+	return strings.NewReplacer("_", "", "-", "").Replace(strings.ToLower(s))
 }
 
 // procInfo is the minimum a platform must report about a process for

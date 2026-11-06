@@ -3,6 +3,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -108,4 +111,34 @@ func parentPID(pid int) (int, error) {
 		return 0, fmt.Errorf("sysctl kern.proc.pid %d: %w", pid, err)
 	}
 	return int(kp.Eproc.Ppid), nil
+}
+
+// processArgs returns a process's command line, from kern.procargs2: the
+// argument count, the executable path and its NUL padding, then each argument
+// NUL-terminated. Both architectures macOS runs on are little-endian.
+func processArgs(pid int) ([]string, error) {
+	buf, err := unix.SysctlRaw("kern.procargs2", pid)
+	if err != nil {
+		return nil, fmt.Errorf("sysctl kern.procargs2 %d: %w", pid, err)
+	}
+	if len(buf) < 4 {
+		return nil, errors.New("kern.procargs2 is truncated")
+	}
+	argc := int(binary.LittleEndian.Uint32(buf[:4]))
+	rest := buf[4:]
+	end := bytes.IndexByte(rest, 0)
+	if end < 0 {
+		return nil, errors.New("kern.procargs2 has no executable path")
+	}
+	rest = bytes.TrimLeft(rest[end:], "\x00")
+	args := make([]string, 0, argc)
+	for len(args) < argc && len(rest) > 0 {
+		end = bytes.IndexByte(rest, 0)
+		if end < 0 {
+			end = len(rest)
+		}
+		args = append(args, string(rest[:end]))
+		rest = rest[min(end+1, len(rest)):]
+	}
+	return args, nil
 }

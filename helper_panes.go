@@ -455,6 +455,7 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequ
 	// the user's, however idle it looks. See reclaimPaneLocked.
 	if pane, ok := s.reclaimPaneLocked(ctx, reg, slot, self); ok {
 		if err := s.resetReclaimed(ctx, pane); err != nil {
+			s.unslotReclaimed(ctx, pane)
 			return paneTarget{}, fmt.Errorf("slot %d: %w", slot, err)
 		}
 		return s.helperResult(pane, self, slot, true, ownerAgent, false)
@@ -474,16 +475,39 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequ
 		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
 	if err := s.b.Claim(ctx, pane, ownerAgent, slot); err != nil && !s.carriesRecord(ctx, self, pane) {
-		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
-		defer cancel()
-		_ = s.b.Close(undoCtx, pane)
+		s.closeUnused(ctx, pane)
 		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
 	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
-	if err := s.waitForShellReady(ctx, pane); err != nil {
+	if err := s.waitForShellReady(ctx, pane, newPaneReadyTimeout); err != nil {
+		s.closeUnused(ctx, pane)
 		return paneTarget{}, fmt.Errorf("slot %d: %w", slot, err)
 	}
 	return s.helperResult(pane, self, slot, true, ownerAgent, false)
+}
+
+// closeUnused closes a pane this call opened and is not handing out: one that
+// carries no record, or whose shell never became ready. Kept, the second kind
+// would hold the slot, and the next call would reuse it without waiting and
+// type into an rc that discards what it is sent.
+//
+// It runs on a context detached from the caller's, because the likeliest
+// reason to be here is that the caller's context has ended, and a close issued
+// on a dead context does not run.
+func (s *slots) closeUnused(ctx context.Context, pane paneRef) {
+	undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
+	defer cancel()
+	_ = s.b.Close(undoCtx, pane)
+}
+
+// unslotReclaimed gives a reclaimed pane whose reset failed back its unslotted
+// state, on a detached context for the reason closeUnused gives. The pane was
+// not handed out, so it must not answer to the slot; it stays ours and can be
+// reclaimed again once it is reading.
+func (s *slots) unslotReclaimed(ctx context.Context, pane paneRef) {
+	undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
+	defer cancel()
+	_ = s.b.SetSlot(undoCtx, pane, 0)
 }
 
 // slotOccupied reports whether any record in a registry claims the slot, dead or
@@ -535,13 +559,12 @@ func (s *slots) createIsolatedLocked(ctx context.Context, slot int, self paneRef
 		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
 	if err := s.b.Claim(ctx, pane, ownerAgent, slot); err != nil {
-		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialMarkUndoTimeout)
-		defer cancel()
-		_ = s.b.Close(undoCtx, pane)
+		s.closeUnused(ctx, pane)
 		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
 	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
-	if err := s.waitForShellReady(ctx, pane); err != nil {
+	if err := s.waitForShellReady(ctx, pane, newPaneReadyTimeout); err != nil {
+		s.closeUnused(ctx, pane)
 		return paneTarget{}, fmt.Errorf("slot %d: %w", slot, err)
 	}
 	return s.helperResult(pane, self, slot, true, ownerAgent, true)
@@ -749,11 +772,11 @@ func (s *slots) closeCandidateLocked(
 // marks — the user's shell, a pane restored by tmux-resurrect, a released
 // helper — is never a candidate, however idle it looks. Among ours: owner
 // "agent" (an ownerAcquired record names a pane the user opened), no slot,
-// alive, not this server's own pane, the shell at a line-editing prompt with
-// nothing queued (paneIsReadyShell), and the same user as this server. A pane
-// running anything — a dev server, an editor, cat — is left alone, because
-// typing into it would feed that program; so is one still sourcing its rc,
-// because the line editor is not reading yet.
+// alive, not this server's own pane, the shell provably reading at a prompt
+// with nothing queued (paneIsReclaimable), and the same user as this server. A
+// pane running anything — a dev server, an editor, cat, a loop of builtins — is
+// left alone, because typing into it would feed that program; so is one still
+// sourcing its rc, because the line editor is not reading yet.
 //
 // Panes are considered oldest first, so the choice is deterministic. A pane
 // whose slot write fails is skipped rather than returned: a pane handed back
@@ -775,7 +798,7 @@ func (s *slots) reclaimPaneLocked(
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Seq < candidates[j].Seq })
 	for _, rec := range candidates {
 		state, err := s.b.Foreground(ctx, rec.Ref)
-		if err != nil || !paneIsReadyShell(state) || !sameUIDAsAgent(state) {
+		if err != nil || !paneIsReclaimable(state) || !sameUIDAsAgent(state) {
 			continue
 		}
 		if err := s.b.SetSlot(ctx, rec.Ref, slot); err != nil {
@@ -1545,9 +1568,12 @@ func (s *slots) listingFor(ctx context.Context, rec paneRecord, isolated bool) s
 
 // Timing for the readiness gate and the landing checks.
 //
-// shellReadyTimeout covers a heavy interactive rc (powerlevel10k, nvm, conda)
-// with room to spare; a shell slower than that fails the call with a message
-// naming the slot rather than having keys typed into a terminal nobody reads.
+// newPaneReadyTimeout is how long a pane this call opened is given to finish
+// its rc: a heavy interactive one (powerlevel10k, nvm, conda, a slow network
+// mount) with room to spare. A shell slower than that fails the call with a
+// message naming the slot, and the pane is closed rather than having keys
+// typed into a terminal nobody reads. shellReadyTimeout is the shorter wait
+// execute-command gives a pane it already holds, whose rc is long finished.
 // opaqueBudget bounds the wait for a pane the probe cannot read. promptSettle
 // and editorOffSettle are how long a screen must stay unchanged to count as a
 // prompt when no positive answer exists; see settleFor. inputLandingTimeout is
@@ -1555,6 +1581,7 @@ func (s *slots) listingFor(ctx context.Context, rec paneRecord, isolated bool) s
 // sent: it consumes keys in microseconds, so two seconds only ever runs out
 // when nothing is reading at all.
 const (
+	newPaneReadyTimeout = 30 * time.Second
 	shellReadyTimeout   = 10 * time.Second
 	opaqueBudget        = 3 * time.Second
 	promptSettle        = 300 * time.Millisecond
@@ -1580,15 +1607,25 @@ var (
 // reading: the shell in the foreground (paneIsIdleShell), its tty in
 // non-canonical mode, and nothing typed and still unread.
 //
-// It is reclaim's predicate, and it is strict on purpose: a pane is only taken
-// on a positive answer. A shell with no line editor of its own never leaves
-// canonical mode, so for those the mode is not required and only the empty
-// queue is.
+// A shell with no line editor of its own never leaves canonical mode, so for
+// those the mode is not required and only the empty queue is. That makes this
+// a statement about what the pane looks like, not proof it is reading: dash
+// running a loop of builtins looks the same. paneIsReclaimable is the proof.
 func paneIsReadyShell(s *PaneState) bool {
 	if !paneIsIdleShell(s) || !s.InputKnown || s.PendingInput != 0 {
 		return false
 	}
 	return s.LineEditing || !hasLineEditor(s.ForegroundCmd)
+}
+
+// paneIsReclaimable is reclaim's predicate, and it takes only a positive
+// answer: paneIsReadyShell, and the kernel saying the shell is reading — a line
+// editor holding the tty out of canonical mode, or the shell asleep in a read
+// on it where the platform reports that (Linux). A canonical-mode shell gives
+// no such answer on macOS, so there it is never reclaimed; a new pane is opened
+// instead, which costs a pane and never types into a busy one.
+func paneIsReclaimable(s *PaneState) bool {
+	return paneIsReadyShell(s) && (s.LineEditing || s.ReadingTTY)
 }
 
 // hasLineEditor reports whether a shell reads its prompt through a line editor
@@ -1614,10 +1651,12 @@ const (
 	// promptCanonical: the kernel reports the pane's own process asleep in a
 	// read on its tty (Linux shows this; macOS does not).
 	promptCanonical
-	// promptQuiet: a shell this probe knows is in the foreground, asleep, with
-	// its tty canonical and nothing queued. That is a prompt read without a line
-	// editor — or an rc waiting on a timer. Only a settled screen tells them
-	// apart; see waitForShellReady.
+	// promptQuiet: a shell that reads its prompt in canonical mode — one with
+	// no line editor, or one whose command line switched its editor off — is in
+	// the foreground, asleep, with nothing queued. That is a prompt, or an rc
+	// waiting on a timer, and only a settled screen tells them apart; see
+	// waitForShellReady. A shell whose editor is on is never quiet: asleep in
+	// canonical mode, it is still in its rc, however still its screen is.
 	promptQuiet
 	// promptOpaque: the pane's own process is in the foreground, but the probe
 	// cannot give a positive answer about it: the platform has no probe, the
@@ -1648,7 +1687,7 @@ func readPrompt(s *PaneState) promptReading {
 		return promptCanonical
 	case !isShellProcess(s.ForegroundCmd):
 		return promptOpaque
-	case s.WaitingForInput:
+	case s.WaitingForInput && (!hasLineEditor(s.ForegroundCmd) || s.EditorOff):
 		return promptQuiet
 	}
 	return promptNotYet
@@ -1660,12 +1699,10 @@ func atPrompt(r promptReading) bool { return r == promptEditing || r == promptCa
 // settleFor is how long a pane's screen must stay unchanged, with something on
 // it, before a reading that has no positive answer counts as a prompt.
 //
-// A shell that normally runs a line editor and is sitting canonical and quiet
-// is most often still in its rc — waiting on a timer or a slow network call —
-// so it is given the long settle: an rc that has drawn nothing never settles at
-// all, and one that drew a banner has to stay silent for two seconds. A shell
-// with no line editor, or a program the probe does not know, is given the
-// short one.
+// A shell started with its line editor switched off is given the long settle,
+// because its rc may be as heavy as anyone's. A shell with no line editor, or
+// a program the probe does not know, is given the short one. An empty screen
+// never settles at all.
 func settleFor(r promptReading, cmd string) time.Duration {
 	if r == promptQuiet && hasLineEditor(cmd) {
 		return editorOffSettle
@@ -1687,20 +1724,24 @@ func settleFor(r promptReading, cmd string) time.Duration {
 // tty into non-canonical mode for good; an rc that reads a key or two (`read
 // -k`) flips it for an instant, and a single sample can land in that instant.
 //
-// Without a positive answer, a pane still counts as ready once nothing is
-// queued and its screen, with a prompt or anything else on it, has not changed
-// for settleFor. That is how a shell with its line editor switched off (bash
-// --noediting, zsh under TERM=dumb) or with none (dash) is recognised, since a
-// canonical read is invisible to the probe on macOS. A pane the probe cannot
+// A shell whose line editor is on has only the positive answer. Its editor
+// clears ICANON the moment it reads, so until then it is in its rc, and a
+// screen that stopped changing — a banner, then a timer — proves nothing.
+//
+// A shell that reads in canonical mode has no positive answer on macOS, where
+// a canonical read is invisible to the probe. That is a shell with no line
+// editor (dash), or one whose command line switched it off (bash --noediting,
+// zsh +Z). It counts as ready once nothing is queued and its screen, with
+// something on it, has not changed for settleFor. A pane the probe cannot
 // read at all — no probe on this platform, a probe that failed, a program it
 // does not know — is used after opaqueBudget at the latest, as it was before
-// the probe existed. Only a shell the probe can read, and that never settles,
-// is an error.
+// the probe existed. Any other pane that is not reading by the end of budget,
+// or when ctx ends, is an error.
 //
 // A pane that vanishes ends the wait at once: no amount of waiting brings it
 // back.
-func (s *slots) waitForShellReady(ctx context.Context, pane paneRef) error {
-	deadline := time.Now().Add(shellReadyTimeout)
+func (s *slots) waitForShellReady(ctx context.Context, pane paneRef, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
 	streak := 0
 	var opaqueSince, settledSince time.Time
 	var lastScreen string
@@ -1893,9 +1934,14 @@ const (
 // can take Enter for itself and leave the line where it was. So the start
 // marker is watched, and if it has not appeared after execStartTimeout while
 // the shell is back at a prompt with nothing running, the command provably
-// never began, and it is sent once more — after C-u, so that a copy still in
-// the buffer is not run together with the new one. C-u is safe here: every pane
-// execute-command types into is one this server owns, so the line is ours.
+// never began, and it may be sent once more.
+//
+// A copy may still be in the editor's buffer, and a second copy typed after
+// it would run both. So the line is cleared first (see clearHeldLine) and the
+// screen is read back: the re-send goes out only when the command's id is no
+// longer on the prompt's lines. When it is still there, nothing is sent and
+// the call says the command could not be confirmed. Clearing is safe: every
+// pane execute-command types into is one this server owns, so the line is ours.
 //
 // Only then. Any sign that it started — the marker, or a foreground that is not
 // the shell — rules the re-send out, because running somebody's command twice is
@@ -1911,7 +1957,7 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 	defer os.Remove(exitFile)
 
 	if s.shellOwnsTTY(ctx, pane) {
-		if err := s.waitForShellReady(ctx, pane); err != nil {
+		if err := s.waitForShellReady(ctx, pane, shellReadyTimeout); err != nil {
 			return nil, err
 		}
 	}
@@ -1932,8 +1978,12 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 		}
 		if !resent && time.Now().After(startBy) && s.neverStarted(ctx, pane, startFile) {
 			resent = true
-			if err := s.b.SendKeys(ctx, pane, "C-u", false, false); err != nil {
+			gone, err := s.clearHeldLine(ctx, pane, id)
+			if err != nil {
 				return nil, fmt.Errorf("send command: %w", err)
+			}
+			if !gone {
+				return nil, errNotResent
 			}
 			if err := s.sendValidated(ctx, pane, wrapped, true, true); err != nil {
 				return nil, fmt.Errorf("send command: %w", err)
@@ -1947,6 +1997,51 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 			return &execOutcome{Output: partial, ExitCode: -1, TimedOut: true}, nil
 		}
 	}
+}
+
+// errNotResent is execute-command's answer when its command never started and
+// the copy it typed could not be shown to be gone from the prompt.
+var errNotResent = errors.New("could not confirm the command started; it was not re-sent")
+
+// heldLineRows is how many of the screen's last non-empty rows count as the
+// prompt's: a two-line prompt and the row a long line wraps onto.
+const heldLineRows = 3
+
+// clearHeldLine empties the line the editor holds — C-e to its end, then C-u,
+// so the kill covers the whole line wherever a widget left the cursor — and
+// reports whether the screen then shows the command's id gone from the
+// prompt's rows. The screen is read until the id is gone or
+// inputLandingTimeout runs out, so a redraw that has not happened yet only
+// delays the answer.
+func (s *slots) clearHeldLine(ctx context.Context, pane paneRef, id string) (bool, error) {
+	for _, key := range []string{"C-e", "C-u"} {
+		if err := s.b.SendKeys(ctx, pane, key, false, false); err != nil {
+			return false, err
+		}
+	}
+	deadline := time.Now().Add(inputLandingTimeout)
+	for {
+		screen, err := s.b.Capture(ctx, pane, 0, false)
+		if err == nil && !promptHolds(screen, id) {
+			return true, nil
+		}
+		if time.Now().After(deadline) || !sleepCtx(ctx, readyPollInterval) {
+			return false, nil
+		}
+	}
+}
+
+// promptHolds reports whether id appears in the last heldLineRows non-empty
+// rows of a screen, read as one line so that an id split by wrapping is found.
+func promptHolds(screen, id string) bool {
+	var rows []string
+	lines := strings.Split(screen, "\n")
+	for i := len(lines) - 1; i >= 0 && len(rows) < heldLineRows; i-- {
+		if row := strings.TrimRight(lines[i], " "); row != "" {
+			rows = append([]string{row}, rows...)
+		}
+	}
+	return strings.Contains(strings.Join(rows, ""), id)
 }
 
 // shellOwnsTTY reports whether the pane's own process is in the foreground, so

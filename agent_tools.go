@@ -404,7 +404,7 @@ func runOneShot(ctx context.Context, sl *slots, command string) (*mcp.CallToolRe
 		_ = sl.b.Close(closeCtx, pane)
 	}()
 
-	if err := sl.waitForShellReady(ctx, pane); err != nil {
+	if err := sl.waitForShellReady(ctx, pane, newPaneReadyTimeout); err != nil {
 		return mcp.NewToolResultErrorFromErr("failed to execute command", err), nil
 	}
 

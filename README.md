@@ -124,7 +124,10 @@ Four properties are worth knowing.
   carries the server's marks; a shell the user opened carries none, so it is never taken,
   however idle it looks. A reclaimed pane must be an idle shell at its prompt, owned by
   the same user, with nothing waiting in its input — a TUI, a running command or a shell
-  still starting up is never taken. A reclaimed pane is put back in the server's working
+  still starting up is never taken. The server has to see the shell reading, so a shell
+  that reads its prompt in canonical mode (`dash`, `bash --noediting`) is never reclaimed
+  on macOS, where that read cannot be seen: a busy one looks the same as an idle one, and
+  a new pane is opened instead. A reclaimed pane is put back in the server's working
   directory and its screen is cleared, so `created: true` means a fresh slot in a fresh
   directory — not a fresh shell process: variables an earlier agent exported, or a
   virtualenv it activated, may still be set. The pane the server itself runs in is
@@ -132,11 +135,17 @@ Four properties are worth knowing.
 - **Typing waits for the shell, and checks that it landed.** A pane a call has just
   created or reclaimed is not typed into until its shell is reading input, so a slow
   `.zshrc` cannot swallow the first command; `execute-command` waits the same way before
-  every command. Where the shell has a line editor, `send-keys`, `run-in-repl`,
+  every command. A shell with a line editor (zsh, bash, fish) counts as reading only once
+  its editor has taken the terminal, however still its screen is. A new pane gets 30
+  seconds for that; one that does not get there is closed and the call fails, so a retry
+  starts from a fresh pane rather than typing into the one still starting. Where the shell has a line editor, `send-keys`, `run-in-repl`,
   `write-to-display` and `start-and-watch` send the text, confirm the editor took it, then
   send Enter and confirm that too; a call whose text was not taken fails rather than
-  reporting success. A shell without a line editor (`bash --noediting`, `dash`) or one the
-  server does not recognise is used once its screen has settled. Key names sent with
+  reporting success. A shell without a line editor (`dash`), one started with it switched
+  off (`bash --noediting`, `zsh +Z`) or one the server does not recognise is used once its
+  screen has settled. When `execute-command`'s command never started, it is typed once
+  more, but only after the line is cleared and the screen shows the first copy gone;
+  otherwise the call fails with "could not confirm the command started; it was not re-sent". Key names sent with
   `literal: false` — `C-c`, `Escape`, `Enter` — are never held back or checked, so an
   interrupt always reaches a busy pane.
 - **`created` tells you when a slot changed underneath you.** Every creating call answers
@@ -654,6 +663,7 @@ go test ./...          # full suite (tmux must be running)
 | `reclaim_test.go` | An unmarked user shell is never taken; a busy or TUI pane is never reclaimed; slot 1 survives a server restart |
 | `placement_test.go` | The placement table, slot by slot |
 | `shell_input_test.go` | Shells without a line editor or with an unknown name, C-c into a busy shell, named keys and multi-line text never reported as unsent, a single run on re-send, a reclaimed pane's directory, a new pane with no record |
+| `strict_readiness_test.go` | A banner then a quiet rc is not a prompt; a slow rc never loses a retried command; a pane that never gets ready is closed; a failed reclaim is unslotted; the re-send runs at most once; canonical shells are never reclaimed |
 | `detect_test.go`, `detect_probe_test.go` | The detection rule: both claims present, and a lone claim the ancestry check disproves or cannot run |
 | `backend_herdr_test.go`, `herdr_send_test.go` | The same scenarios against a private herdr session (skipped without herdr); text starting with a dash |
 | `herdr_registry_test.go`, `herdr_unit_test.go` | The state file's witness, locking, snapshot under the lock, write-only-on-change and corrupt-file recovery; key-name mapping; error text naming no multiplexer |

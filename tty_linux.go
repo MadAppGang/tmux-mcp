@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/prometheus/procfs"
@@ -100,4 +102,17 @@ func parentPID(pid int) (int, error) {
 		return 0, fmt.Errorf("read proc stat %d: %w", pid, err)
 	}
 	return stat.PPID, nil
+}
+
+// processArgs returns a process's command line from /proc/PID/cmdline, where
+// each argument is NUL-terminated.
+func processArgs(pid int) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	return strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00"), nil
 }
