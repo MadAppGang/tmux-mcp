@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "profiles": {
+    "default": {
+      "name": "Default",
+      "marketplaces": {
+        "magus": {
+          "source": "github",
+          "repo": "MadAppGang/magus"
+        },
+        "claude-plugins-official": {
+          "source": "github",
+          "repo": "anthropics/claude-plugins-official"
+        }
+      },
+      "plugins": {
+        "multimodel@magus": "latest",
+        "dev@magus": "latest",
+        "browser-use@magus": "latest",
+        "designer@magus": "latest",
+        "terminal@magus": "latest",
+        "explanatory-output-style@claude-plugins-official": "latest",
+        "gopls-lsp@claude-plugins-official": "latest",
+        "claudish@magus": "latest",
+        "mnemex@magus": "latest",
+        "skill-creator@claude-plugins-official": "latest",
+        "madbench@magus": "latest"
+      },
+      "createdAt": "2026-11-06T04:54:39.245Z",
+      "updatedAt": "2026-11-06T04:56:57.358Z"
+    }
+  },
+  "default": "default"
+}

@@ -57,3 +57,11 @@ gtd/sessions/
 
 # Added by claudeup
 # Local claudemem indexes are generated from the repo and should not be committed.
+
+# magus: generated profile config (source of truth: .claude/profiles.json)
+.claude/profiles/
+.claude/.magus-backups/
+.claude/settings.json
+.claude/models.json
+.mcp.json
+/logs

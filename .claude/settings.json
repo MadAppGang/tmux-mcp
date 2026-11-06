@@ -1,6 +1,5 @@
 {
   "enabledPlugins": {
-    "code-analysis@magus": true,
     "multimodel@magus": true,
     "dev@magus": true,
     "browser-use@magus": true,
@@ -8,27 +7,24 @@
     "terminal@magus": true,
     "explanatory-output-style@claude-plugins-official": true,
     "gopls-lsp@claude-plugins-official": true,
-    "kanban@magus": true,
     "claudish@magus": true,
     "mnemex@magus": true,
     "skill-creator@claude-plugins-official": true,
     "madbench@magus": true
   },
   "installedPluginVersions": {
-    "code-analysis@magus": "5.3.1",
-    "multimodel@magus": "3.3.0",
-    "dev@magus": "2.9.0",
+    "multimodel@magus": "5.9.1",
+    "dev@magus": "9.6.1",
     "statusline@magus": "2.1.2",
-    "browser-use@magus": "1.1.3",
-    "designer@magus": "0.4.1",
-    "terminal@magus": "4.1.4",
+    "browser-use@magus": "1.10.0",
+    "designer@magus": "0.11.1",
+    "terminal@magus": "5.5.0",
     "explanatory-output-style@claude-plugins-official": "0.0.0",
     "gopls-lsp@claude-plugins-official": "1.0.0",
     "gtd@magus": "2.0.1",
-    "kanban@magus": "1.6.0",
-    "claudish@magus": "1.0.0",
-    "mnemex@magus": "1.0.0",
+    "claudish@magus": "2.14.0",
+    "mnemex@magus": "1.2.0",
     "skill-creator@claude-plugins-official": "0.0.0",
-    "madbench@magus": "0.1.1"
+    "madbench@magus": "0.12.5"
   }
 }
