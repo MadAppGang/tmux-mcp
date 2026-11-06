@@ -67,54 +67,95 @@ func fillInputState(state *PaneState, tty string) {
 	}
 }
 
-// editorSwitchedOff reports whether a shell's command line starts it without
-// its line editor: bash --noediting, or zsh with its ZLE option unset (+Z,
-// --nozle, -o nozle, +o zle). Such a shell reads its prompt in canonical mode
-// although its name says it has an editor. Only the options before the first
-// operand count; anything after it belongs to a script or a -c string.
+// editorSwitchedOff reports whether a shell's command line leaves it without
+// its line editor: bash --noediting, or zsh with its ZLE option unset. Such a
+// shell reads its prompt in canonical mode although its name says it has an
+// editor.
+//
+// The options are applied in order and the last one wins, as the shell itself
+// applies them: zsh +Z -Z starts with ZLE on. Only the options before the
+// first operand count; anything after it belongs to a script or a -c string,
+// and a shell given one is not reading a prompt at all.
 func editorSwitchedOff(argv []string) bool {
 	if len(argv) == 0 {
 		return false
 	}
-	shell := strings.TrimPrefix(filepath.Base(argv[0]), "-")
-	args := argv[1:]
+	switch strings.TrimPrefix(filepath.Base(argv[0]), "-") {
+	case "bash":
+		return bashEditingOff(argv[1:])
+	case "zsh":
+		return zshZLEOff(argv[1:])
+	}
+	return false
+}
+
+// bashEditingOff reads bash's options. Nothing on its command line turns
+// editing back on once --noediting has turned it off.
+func bashEditingOff(args []string) bool {
+	off := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if arg == "--" || arg == "-" || (arg[0] != '-' && arg[0] != '+') {
-			return false
+		if endOfOptions(arg) {
+			break
 		}
-		switch shell {
-		case "bash":
-			switch arg {
-			case "--noediting":
-				return true
-			case "-c":
-				return false
-			case "-o", "+o", "-O", "+O", "--rcfile", "--init-file":
-				i++
+		switch arg {
+		case "--noediting":
+			off = true
+		case "-c":
+			return false
+		case "-o", "+o", "-O", "+O", "--rcfile", "--init-file":
+			i++
+		}
+	}
+	return off
+}
+
+// zshZLEOff reads zsh's options: -Z and +Z, --zle and --nozle, -o and +o with
+// an option name, and letters grouped behind one sign (+fZ).
+func zshZLEOff(args []string) bool {
+	off := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if endOfOptions(arg) {
+			break
+		}
+		switch {
+		case strings.HasPrefix(arg, "--"):
+			switch zshOptionName(arg[2:]) {
+			case "zle":
+				off = false
+			case "nozle":
+				off = true
 			}
-		case "zsh":
-			switch {
-			case strings.HasPrefix(arg, "--"):
-				if zshOptionName(arg[2:]) == "nozle" {
-					return true
+		case arg == "-o" || arg == "+o":
+			if i+1 >= len(args) {
+				return off
+			}
+			i++
+			switch zshOptionName(args[i]) {
+			case "zle":
+				off = arg == "+o"
+			case "nozle":
+				off = arg == "-o"
+			}
+		default:
+			for _, letter := range arg[1:] {
+				switch letter {
+				case 'Z':
+					off = arg[0] == '+'
+				case 'c':
+					return false
 				}
-			case arg == "-o" || arg == "+o":
-				if i+1 < len(args) {
-					i++
-					name := zshOptionName(args[i])
-					if (arg == "-o" && name == "nozle") || (arg == "+o" && name == "zle") {
-						return true
-					}
-				}
-			case arg[0] == '+' && strings.ContainsRune(arg[1:], 'Z'):
-				return true
-			case strings.ContainsRune(arg[1:], 'c'):
-				return false
 			}
 		}
 	}
-	return false
+	return off
+}
+
+// endOfOptions reports whether an argument ends a shell's options: "--", a
+// lone "-", or an operand, an empty one included.
+func endOfOptions(arg string) bool {
+	return arg == "" || arg == "--" || arg == "-" || (arg[0] != '-' && arg[0] != '+')
 }
 
 // zshOptionName is an option name the way zsh compares them: case and

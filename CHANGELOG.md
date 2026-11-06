@@ -19,8 +19,11 @@ server now runs under herdr as well as tmux.
   left canonical mode and has no unread bytes. Shells without a line editor are recognised
   by a settled prompt. Text typed at a prompt is checked to have been read, and the call
   fails, rather than reporting success, when the shell did not take it.
-  `execute-command` writes a start marker and re-sends once, after clearing the line, only
-  when the command provably never started.
+  `execute-command` never types a command twice: when its start marker does not appear, the
+  call fails with "the command was not confirmed to start, and it was not sent again".
+  Known line-editor shells (zsh, bash, fish, tcsh) count as ready only on a positive
+  signal; a zsh with `unsetopt zle` in its rc is never ready on macOS and those calls fail
+  after their wait instead of losing the command.
 - **An idle helper pane is reused instead of piling up.** A pane this server made that
   lost its slot number (a duplicate-slot race, a failed slot write, a pane from 1.x) was
   never reused and never adopted, so every call opened another one. Such a pane is now

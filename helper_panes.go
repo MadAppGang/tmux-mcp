@@ -1926,26 +1926,21 @@ const (
 // another program owns the tty, the line is for that program, and it is sent as
 // it always has been.
 //
-// # The one re-send
+// # A command that did not start is reported, never typed again
 //
 // The wrapper is typed through sendValidated, so a line editor has taken every
-// byte and the Enter. That still does not prove the command started: an rc file
-// can discard a line its editor had already accepted, and a completion widget
-// can take Enter for itself and leave the line where it was. So the start
+// byte and the Enter. That still does not prove the command started: a widget
+// can take Enter for itself and leave the line in the buffer. So the start
 // marker is watched, and if it has not appeared after execStartTimeout while
-// the shell is back at a prompt with nothing running, the command provably
-// never began, and it may be sent once more.
+// the shell is back at a prompt with nothing running, the call fails with
+// errNotStarted.
 //
-// A copy may still be in the editor's buffer, and a second copy typed after
-// it would run both. So the line is cleared first (see clearHeldLine) and the
-// screen is read back: the re-send goes out only when the command's id is no
-// longer on the prompt's lines. When it is still there, nothing is sent and
-// the call says the command could not be confirmed. Clearing is safe: every
-// pane execute-command types into is one this server owns, so the line is ours.
-//
-// Only then. Any sign that it started — the marker, or a foreground that is not
-// the shell — rules the re-send out, because running somebody's command twice is
-// worse than reporting that it did not finish.
+// The command is not sent a second time. A copy may still be in the editor's
+// buffer, and no keystroke empties a line under every keymap, widget and pane
+// width, so a second copy could run alongside the first. Running somebody's
+// command twice is worse than reporting that it was not confirmed. Any sign
+// that it started — the marker, or a foreground that is not the shell — keeps
+// the call waiting for the exit file instead.
 //
 // A context that ends first returns timedOut with whatever output exists.
 func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*execOutcome, error) {
@@ -1967,7 +1962,6 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 	}
 
 	startBy := time.Now().Add(execStartTimeout)
-	resent := false
 	for {
 		if code, ok := readExitFile(exitFile); ok {
 			out, err := os.ReadFile(outFile)
@@ -1976,18 +1970,8 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 			}
 			return &execOutcome{Output: strings.TrimRight(string(out), "\n"), ExitCode: code}, nil
 		}
-		if !resent && time.Now().After(startBy) && s.neverStarted(ctx, pane, startFile) {
-			resent = true
-			gone, err := s.clearHeldLine(ctx, pane, id)
-			if err != nil {
-				return nil, fmt.Errorf("send command: %w", err)
-			}
-			if !gone {
-				return nil, errNotResent
-			}
-			if err := s.sendValidated(ctx, pane, wrapped, true, true); err != nil {
-				return nil, fmt.Errorf("send command: %w", err)
-			}
+		if time.Now().After(startBy) && s.neverStarted(ctx, pane, startFile) {
+			return nil, errNotStarted
 		}
 		if !sleepCtx(ctx, execPollInterval) {
 			partial := ""
@@ -1999,50 +1983,11 @@ func (s *slots) execInPane(ctx context.Context, pane paneRef, command string) (*
 	}
 }
 
-// errNotResent is execute-command's answer when its command never started and
-// the copy it typed could not be shown to be gone from the prompt.
-var errNotResent = errors.New("could not confirm the command started; it was not re-sent")
-
-// heldLineRows is how many of the screen's last non-empty rows count as the
-// prompt's: a two-line prompt and the row a long line wraps onto.
-const heldLineRows = 3
-
-// clearHeldLine empties the line the editor holds — C-e to its end, then C-u,
-// so the kill covers the whole line wherever a widget left the cursor — and
-// reports whether the screen then shows the command's id gone from the
-// prompt's rows. The screen is read until the id is gone or
-// inputLandingTimeout runs out, so a redraw that has not happened yet only
-// delays the answer.
-func (s *slots) clearHeldLine(ctx context.Context, pane paneRef, id string) (bool, error) {
-	for _, key := range []string{"C-e", "C-u"} {
-		if err := s.b.SendKeys(ctx, pane, key, false, false); err != nil {
-			return false, err
-		}
-	}
-	deadline := time.Now().Add(inputLandingTimeout)
-	for {
-		screen, err := s.b.Capture(ctx, pane, 0, false)
-		if err == nil && !promptHolds(screen, id) {
-			return true, nil
-		}
-		if time.Now().After(deadline) || !sleepCtx(ctx, readyPollInterval) {
-			return false, nil
-		}
-	}
-}
-
-// promptHolds reports whether id appears in the last heldLineRows non-empty
-// rows of a screen, read as one line so that an id split by wrapping is found.
-func promptHolds(screen, id string) bool {
-	var rows []string
-	lines := strings.Split(screen, "\n")
-	for i := len(lines) - 1; i >= 0 && len(rows) < heldLineRows; i-- {
-		if row := strings.TrimRight(lines[i], " "); row != "" {
-			rows = append([]string{row}, rows...)
-		}
-	}
-	return strings.Contains(strings.Join(rows, ""), id)
-}
+// errNotStarted is execute-command's answer when its command never started.
+// The line may still be in the editor's buffer, so the agent is told to look
+// before running it again.
+var errNotStarted = errors.New("the command was not confirmed to start, and it was not sent again; " +
+	"look at the pane before running it again")
 
 // shellOwnsTTY reports whether the pane's own process is in the foreground, so
 // that what is typed there goes to the shell rather than to a program it runs.

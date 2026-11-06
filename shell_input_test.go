@@ -187,32 +187,6 @@ const swallowFirstEnterZshrc = "typeset -gi _swallowed=0\n" +
 	"zle -N _first_enter\n" +
 	"bindkey '^M' _first_enter\n"
 
-// TestExecuteCommandResendDoesNotRunTwice is the one re-send execute-command
-// makes when its command never started. Here the first Enter was taken by a
-// widget, so the wrapped line is still in the editor's buffer when the re-send
-// comes. The command must run once.
-//
-// REGRESSION: the re-send typed the command onto a line still holding the first copy, and the combined line ran it twice
-func TestExecuteCommandResendDoesNotRunTwice(t *testing.T) {
-	installZshrc(t, swallowFirstEnterZshrc)
-	c, _ := agentPaneFixture(t)
-
-	out := filepath.Join(t.TempDir(), "runs")
-	res := callTool(t, c, "execute-command", map[string]any{
-		"command": "echo once >> " + out, "timeoutSeconds": 15,
-	})
-	if res.IsError {
-		t.Fatalf("execute-command failed: %s", res.text(t, "execute-command"))
-	}
-	data, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatalf("the command never ran: %v", err)
-	}
-	if runs := strings.Count(string(data), "once"); runs != 1 {
-		t.Fatalf("the command ran %d times, want exactly once:\n%s", runs, data)
-	}
-}
-
 // installZshrc writes rc as the suite's private .zshrc for the rest of the test.
 func installZshrc(t *testing.T, rc string) {
 	t.Helper()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -63,6 +64,17 @@ func TestEditorSwitchedOffByArgv(t *testing.T) {
 		{[]string{"-zsh"}, false},
 		{[]string{"zsh", "-Z"}, false},
 		{[]string{"zsh", "script.zsh", "+Z"}, false},
+		{[]string{"zsh", "+Z", "-Z", "-i"}, false},
+		{[]string{"zsh", "-Z", "+Z"}, true},
+		{[]string{"zsh", "+fZ", "-Z"}, false},
+		{[]string{"zsh", "--nozle", "--zle"}, false},
+		{[]string{"zsh", "--zle", "--no-zle"}, true},
+		{[]string{"zsh", "-o", "nozle", "-o", "zle"}, false},
+		{[]string{"zsh", "+o", "zle", "-Z"}, false},
+		{[]string{"zsh", "+o", "nozle"}, false},
+		{[]string{"zsh", "-Z", "-o", "nozle"}, true},
+		{[]string{"bash", "--noediting", "-i"}, true},
+		{[]string{"zsh", "", "+Z"}, false},
 		{[]string{"fish"}, false},
 		{nil, false},
 	}
@@ -70,6 +82,31 @@ func TestEditorSwitchedOffByArgv(t *testing.T) {
 		if got := editorSwitchedOff(tc.argv); got != tc.want {
 			t.Errorf("editorSwitchedOff(%q) = %v, want %v", tc.argv, got, tc.want)
 		}
+	}
+}
+
+// TestEditorTurnedBackOnStillWaits is a zsh whose command line switches its
+// line editor off and then on again, so the last option wins and the editor is
+// on. Its rc draws a banner and waits, and the command typed into it must
+// still run.
+//
+// REGRESSION: the first +Z on a command line counted as the editor being off, so a settled banner was taken for a prompt and the command was discarded
+func TestEditorTurnedBackOnStillWaits(t *testing.T) {
+	zsh, err := exec.LookPath("zsh")
+	if err != nil {
+		t.Skip("zsh is not installed")
+	}
+	c, _ := agentPaneFixture(t)
+	installZshrc(t, bannerThenQuietZshrc)
+	useDefaultCommand(t, "exec "+zsh+" +Z -Z -i")
+
+	marker := filepath.Join(t.TempDir(), "M")
+	res := callTool(t, c, "send-keys", map[string]any{"keys": "echo M > " + marker, "enter": true})
+	if res.IsError {
+		t.Fatalf("send-keys into a new pane failed: %s", res.text(t, "send-keys"))
+	}
+	if !waitForFile(marker, 10*time.Second) {
+		t.Fatal("send-keys reported success, but the command it typed never ran")
 	}
 }
 
@@ -170,39 +207,47 @@ func TestReclaimedPaneThatFailsIsUnslotted(t *testing.T) {
 	}
 }
 
-// ---- The re-send never runs a command twice ----
+// ---- A command that did not start is never typed again ----
 
 // swallowFirstEnterHomeZshrc is swallowFirstEnterZshrc with one more thing
 // the widget does on the press it swallows: it moves the cursor to the start
-// of the line, so a kill to the start of the line removes nothing.
+// of the line.
 const swallowFirstEnterHomeZshrc = "typeset -gi _swallowed=0\n" +
 	"_first_enter() { if (( ! _swallowed )); then _swallowed=1; zle beginning-of-line; return 0; fi; zle .accept-line; }\n" +
 	"zle -N _first_enter\n" +
 	"bindkey '^M' _first_enter\n"
 
-// TestResendAfterCursorMovedRunsAtMostOnce is the re-send after a widget took
-// the first Enter and left the cursor at the start of the line. The command
-// may run once, or the call may report that it could not tell; it must never
-// run twice.
+// TestUnstartedCommandIsNeverSentTwice is execute-command's command left in
+// the editor's buffer because a widget took the first Enter: plainly, with the
+// cursor moved to the start of the line, and in vi mode. The command must run
+// at most once, and the call must say it could not confirm the start and did
+// not send it again.
 //
-// REGRESSION: C-u alone left the first copy in the buffer when the cursor was at the start, and the re-send ran the command twice
-func TestResendAfterCursorMovedRunsAtMostOnce(t *testing.T) {
-	installZshrc(t, swallowFirstEnterHomeZshrc)
-	c, _ := agentPaneFixture(t)
+// REGRESSION: execute-command re-sent a command that had not started, and a line still holding the first copy ran it twice
+func TestUnstartedCommandIsNeverSentTwice(t *testing.T) {
+	for _, tc := range []struct{ name, rc string }{
+		{"the first Enter swallowed", swallowFirstEnterZshrc},
+		{"the cursor moved to the start", swallowFirstEnterHomeZshrc},
+		{"in vi mode", "bindkey -v\n" + swallowFirstEnterHomeZshrc},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installZshrc(t, tc.rc)
+			c, _ := agentPaneFixture(t)
 
-	out := filepath.Join(t.TempDir(), "runs")
-	res := callTool(t, c, "execute-command", map[string]any{
-		"command": "echo once >> " + out, "timeoutSeconds": 15,
-	})
-	text := res.text(t, "execute-command")
-	sleep(time.Second)
-	data, _ := os.ReadFile(out)
-	runs := strings.Count(string(data), "once")
-	if runs > 1 {
-		t.Fatalf("the command ran %d times, want at most once (call said: %s)", runs, text)
-	}
-	if !res.IsError && runs != 1 {
-		t.Fatalf("execute-command reported success, but the command ran %d times: %s", runs, text)
+			out := filepath.Join(t.TempDir(), "runs")
+			res := callTool(t, c, "execute-command", map[string]any{
+				"command": "echo once >> " + out, "timeoutSeconds": 15,
+			})
+			text := res.text(t, "execute-command")
+			sleep(time.Second)
+			data, _ := os.ReadFile(out)
+			if runs := strings.Count(string(data), "once"); runs > 1 {
+				t.Fatalf("the command ran %d times, want at most once (call said: %s)", runs, text)
+			}
+			if !res.IsError || !strings.Contains(text, "not confirmed to start") || !strings.Contains(text, "not sent again") {
+				t.Fatalf("execute-command did not report an unconfirmed start that was not sent again: %s", text)
+			}
+		})
 	}
 }
 
@@ -257,26 +302,5 @@ func TestCanonicalShellIsNeverReclaimed(t *testing.T) {
 			}
 			tmuxExec(t, "send-keys", "-t", pane, "C-c")
 		})
-	}
-}
-
-// TestPromptHoldsFindsAWrappedId pins the read-back the re-send depends on: an
-// id on the prompt's rows is found even when wrapping split it, and an id only
-// in older output is not on the prompt.
-func TestPromptHoldsFindsAWrappedId(t *testing.T) {
-	const id = "0b6e-4f1c"
-	cases := []struct {
-		name, screen string
-		want         bool
-	}{
-		{"on the prompt line", "old output\n% printf > /tmp/tmux-mcp-0b6e-4f1c.start\n\n", true},
-		{"split by wrapping", "% printf > /tmp/tmux-mcp-0b6e\n-4f1c.exit\n", true},
-		{"cleared", "% printf > /tmp/tmux-mcp-0b6e-4f1c.start\nline 2\nline 3\nline 4\n% \n", false},
-		{"empty screen", "", false},
-	}
-	for _, tc := range cases {
-		if got := promptHolds(tc.screen, id); got != tc.want {
-			t.Errorf("%s: promptHolds = %v, want %v", tc.name, got, tc.want)
-		}
 	}
 }
