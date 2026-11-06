@@ -34,6 +34,9 @@ Same tools, same arguments, same result shapes.
   the command had been typed directly, so no prompt ever came back and the call waited.
   The call now notices the shell is gone, returns the status the command left, and adds a
   text item saying the pane's shell exited; the next call into the slot opens a new pane.
+  That includes the last pane of an isolated slot, whose private server exits with it: a
+  server that is no longer running now counts as a pane that is gone, under tmux and
+  herdr alike.
 
 ## [2.1.0] — 2026-11-06
 

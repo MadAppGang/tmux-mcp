@@ -273,6 +273,9 @@ func (t *tmuxClient) runWithSocket(ctx context.Context, socket string, args ...s
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			detail = scrubIDs(strings.TrimSpace(string(exitErr.Stderr)))
 		}
+		if tmuxSaysGone(detail) {
+			return "", goneError{multiplexerError(err, detail)}
+		}
 		return "", multiplexerError(err, detail)
 	}
 	return strings.TrimRight(string(out), "\n"), nil
@@ -303,6 +306,45 @@ func multiplexerError(err error, detail string) error {
 		return fmt.Errorf("%s: %w", multiplexerRefused, err)
 	}
 	return fmt.Errorf("%s: %w: %s", multiplexerRefused, err, detail)
+}
+
+// errTmuxGone marks a tmux error that says the pane, or the whole server it
+// lived on, no longer exists. errors.Is finds it on such an error; the error's
+// text is unchanged.
+var errTmuxGone = errors.New("the pane or its server no longer exists")
+
+// goneError is a tmux error that also carries errTmuxGone.
+type goneError struct{ error }
+
+func (g goneError) Unwrap() []error { return []error{g.error, errTmuxGone} }
+
+// tmuxGonePrefixes are the lines tmux prints when a pane, or the server it was
+// on, does not exist: a socket with no server ("no server running on"), one
+// that cannot be reached ("error connecting to ... (No such file or
+// directory)", "(Connection refused)"), a server that went away mid-command,
+// and a pane id that names nothing. Each is matched at the start of a line, so
+// a message that merely quotes one of them elsewhere does not count.
+var tmuxGonePrefixes = []string{
+	"no server running on ",
+	"error connecting to ",
+	"server exited unexpectedly",
+	"lost server",
+	"can't find pane",
+}
+
+// tmuxSaysGone reports whether tmux's stderr says the pane or its server no
+// longer exists. Anything else — a transient failure, a bad argument — does
+// not, and callers that poll keep polling.
+func tmuxSaysGone(detail string) bool {
+	for _, line := range strings.Split(detail, "\n") {
+		line = strings.TrimSpace(line)
+		for _, prefix := range tmuxGonePrefixes {
+			if strings.HasPrefix(line, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // idInText matches a multiplexer id embedded anywhere in a sentence: %3 for a
@@ -1122,6 +1164,11 @@ func (t *tmuxClient) GetPaneState(ctx context.Context, paneID string) (*PaneStat
 	// output cannot drop it.
 	out, err := t.runWithSocket(ctx, socket, "display-message", "-p", "-t", bareID,
 		"#{pane_tty}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}")
+	if errors.Is(err, errTmuxGone) {
+		// The pane is gone, or the server it lived on exited — which is what an
+		// isolated server does when its last pane's shell exits.
+		return nil, errPaneGone
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get pane state: %w", err)
 	}

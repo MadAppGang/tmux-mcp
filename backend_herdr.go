@@ -653,6 +653,13 @@ func (b *herdrBackend) shellPID(ctx context.Context, pane string) (int, error) {
 		} `json:"process_info"`
 	}
 	if err := b.runJSON(ctx, &res, "pane", "process-info", "--pane", pane); err != nil {
+		// A server that is not running — its socket gone, or nothing answering
+		// on it — has no panes, so for this read the pane is gone. Other calls
+		// keep the error as it is.
+		var he *herdrError
+		if errors.As(err, &he) && he.Code == "server_not_running" {
+			return 0, errPaneGone
+		}
 		return 0, err
 	}
 	if res.ProcessInfo.ShellPID <= 0 {

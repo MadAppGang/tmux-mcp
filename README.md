@@ -687,6 +687,7 @@ go test ./...          # full suite (tmux must be running)
 | `placement_test.go` | The placement table, slot by slot |
 | `shell_input_test.go` | Shells without a line editor or with an unknown name, C-c into a busy shell, named keys and multi-line text never reported as unsent, a reclaimed pane's directory, a new pane with no record |
 | `exec_shell_test.go` | The exit status follows the pane's real shell under tmux and herdr, whatever `--shell-type` says; an unreadable status ends the wait with -1 |
+| `server_gone_test.go` | A multiplexer server that is gone counts as a pane that is gone, under tmux and herdr; an isolated slot whose shell exits with its last pane ends its call |
 | `strict_readiness_test.go` | A banner then a quiet rc is not a prompt; a slow rc never loses a retried command; a pane that never gets ready is closed; a failed reclaim is unslotted; an unstarted command is never typed twice; an editor switched back on still waits; canonical shells are never reclaimed |
 | `detect_test.go`, `detect_probe_test.go` | The detection rule: both claims present, and a lone claim the ancestry check disproves or cannot run |
 | `backend_herdr_test.go`, `herdr_send_test.go` | The same scenarios against a private herdr session (skipped without herdr); text starting with a dash |
