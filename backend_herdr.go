@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +39,11 @@ import (
 type herdrBackend struct {
 	bin string
 	reg *herdrRegistry
+
+	// layouts holds the agent stamps and the grid modes, in a file of its own
+	// that older binaries never rewrite. See herdrLayoutStore. It is nil in a
+	// backend built only to probe a pane, and then nothing is stamped.
+	layouts *herdrLayoutStore
 
 	// iso serves isolated slots, or is nil when tmux is not installed.
 	iso *tmuxBackend
@@ -72,7 +79,11 @@ func newHerdrBackend() (*herdrBackend, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &herdrBackend{bin: herdrBin(), reg: &herdrRegistry{path: path}}
+	b := &herdrBackend{
+		bin:     herdrBin(),
+		reg:     &herdrRegistry{path: path},
+		layouts: &herdrLayoutStore{path: herdrLayoutPath(path)},
+	}
 	if wd, err := os.Getwd(); err == nil {
 		b.cwd = wd
 	}
@@ -189,24 +200,62 @@ type herdrGeometry struct {
 	Height int `json:"height"`
 }
 
-// layout returns every pane in the tab around a pane, with geometry.
-func (b *herdrBackend) layout(ctx context.Context, of string) (map[string]herdrGeometry, error) {
+// herdrTabLayout is a tab as herdr lays it out: its area, whether a pane in it
+// is zoomed, which pane in it has the tab's focus, and every pane's rectangle
+// in cells.
+type herdrTabLayout struct {
+	TabID   string
+	Area    herdrGeometry
+	Zoomed  bool
+	Focused string
+	Panes   map[string]herdrGeometry
+}
+
+// herdrLayoutJSON is herdr's layout object, which `pane layout` answers and
+// every move carries for the tabs it touched.
+type herdrLayoutJSON struct {
+	TabID         string        `json:"tab_id"`
+	Area          herdrGeometry `json:"area"`
+	Zoomed        bool          `json:"zoomed"`
+	FocusedPaneID string        `json:"focused_pane_id"`
+	Panes         []struct {
+		PaneID string        `json:"pane_id"`
+		Rect   herdrGeometry `json:"rect"`
+	} `json:"panes"`
+}
+
+func (l herdrLayoutJSON) tab() herdrTabLayout {
+	tab := herdrTabLayout{
+		TabID:   l.TabID,
+		Area:    l.Area,
+		Zoomed:  l.Zoomed,
+		Focused: l.FocusedPaneID,
+		Panes:   make(map[string]herdrGeometry, len(l.Panes)),
+	}
+	for _, p := range l.Panes {
+		tab.Panes[p.PaneID] = p.Rect
+	}
+	return tab
+}
+
+// tabLayout reads the tab around a pane.
+func (b *herdrBackend) tabLayout(ctx context.Context, of string) (herdrTabLayout, error) {
 	var res struct {
-		Layout struct {
-			Panes []struct {
-				PaneID string        `json:"pane_id"`
-				Rect   herdrGeometry `json:"rect"`
-			} `json:"panes"`
-		} `json:"layout"`
+		Layout herdrLayoutJSON `json:"layout"`
 	}
 	if err := b.runJSON(ctx, &res, "pane", "layout", "--pane", of); err != nil {
+		return herdrTabLayout{}, err
+	}
+	return res.Layout.tab(), nil
+}
+
+// layout returns every pane in the tab around a pane, with geometry.
+func (b *herdrBackend) layout(ctx context.Context, of string) (map[string]herdrGeometry, error) {
+	tab, err := b.tabLayout(ctx, of)
+	if err != nil {
 		return nil, err
 	}
-	panes := make(map[string]herdrGeometry, len(res.Layout.Panes))
-	for _, p := range res.Layout.Panes {
-		panes[p.PaneID] = p.Rect
-	}
-	return panes, nil
+	return tab.Panes, nil
 }
 
 // livePanes maps every pane the herdr server has to its terminal id. It is the
@@ -327,17 +376,14 @@ func (b *herdrBackend) Close(ctx context.Context, p paneRef) error {
 // ---- Discovery ----
 
 // Siblings lists the panes in the agent's tab, which is herdr's equivalent of a
-// tmux window: the panes the user sees together.
+// tmux window: the panes the user sees together. Positions are relative to the
+// tab's area, as they are to the window under tmux.
 func (b *herdrBackend) Siblings(ctx context.Context, of paneRef) ([]paneInfo, error) {
-	panes, err := b.layout(ctx, of.target())
+	tab, err := b.tabLayout(ctx, of.target())
 	if err != nil {
 		return nil, err
 	}
-	infos := make([]paneInfo, 0, len(panes))
-	for id, r := range panes {
-		infos = append(infos, paneInfo{Ref: newPaneRef(id), Width: r.Width, Height: r.Height, Seq: herdrSeq(id)})
-	}
-	return infos, nil
+	return herdrPaneInfos(tab), nil
 }
 
 // Records is the witnessed registry of the tab around a pane: the state file's
@@ -352,13 +398,25 @@ func (b *herdrBackend) Records(ctx context.Context, of paneRef) (map[paneRef]pan
 	if err != nil {
 		return nil, err
 	}
+	// A failed read of the layout store costs the stamps, which leaves every
+	// helper out of the grid and changes nothing else.
+	stamps := map[string]herdrAgentStamp{}
+	if file, err := b.layouts.read(); err == nil {
+		for _, a := range file.Agents {
+			stamps[a.PaneID] = a
+		}
+	}
 	reg := make(map[paneRef]paneRecord, len(entries))
 	for _, e := range entries {
 		if _, inTab := tab[e.PaneID]; !inTab {
 			continue
 		}
 		ref := newPaneRef(e.PaneID)
-		reg[ref] = paneRecord{Ref: ref, Owner: e.Owner, Slot: e.Slot, Seq: herdrSeq(e.PaneID)}
+		rec := paneRecord{Ref: ref, Owner: e.Owner, Slot: e.Slot, Seq: herdrSeq(e.PaneID)}
+		if a, ok := stamps[e.PaneID]; ok && a.TerminalID == e.TerminalID && a.Agent != "" {
+			rec.Agent = newPaneRef(a.Agent)
+		}
+		reg[ref] = rec
 	}
 	return reg, nil
 }
@@ -696,6 +754,447 @@ func (b *herdrBackend) SetTitle(ctx context.Context, p paneRef, title string) er
 func (b *herdrBackend) Notify(ctx context.Context, message string, _ time.Duration) error {
 	_, err := b.run(ctx, "notification", "show", message)
 	return err
+}
+
+// ---- The agent grid ----
+
+// herdrGridTolerance is how far a pane may land from its planned edge under
+// herdr. Its splits take a ratio rather than a size in cells, and a ratio is
+// rounded once per split on the way down the tree.
+const herdrGridTolerance = 2
+
+// Window describes the tab around a pane. herdr draws no border between panes,
+// so the gap is zero, and its splits take a ratio rather than a size in cells,
+// so a pane may land a cell further off than under tmux.
+func (b *herdrBackend) Window(ctx context.Context, of paneRef) (windowInfo, error) {
+	tab, err := b.tabLayout(ctx, of.target())
+	if err != nil {
+		return windowInfo{}, err
+	}
+	info := windowInfo{
+		Width: tab.Area.Width, Height: tab.Area.Height,
+		Gap: 0, Tolerance: herdrGridTolerance,
+		Zoomed: tab.Zoomed,
+	}
+	pane, err := b.paneGet(ctx, of.target())
+	if err != nil {
+		return windowInfo{}, err
+	}
+	file, err := b.layouts.read()
+	if err != nil {
+		return windowInfo{}, err
+	}
+	for _, t := range file.Tabs {
+		if t.TabID == tab.TabID && t.AgentPaneID == pane.PaneID && t.AgentTerminalID == pane.TerminalID &&
+			t.Layout == string(layoutGrid) {
+			info.Grid = true
+		}
+	}
+	return info, nil
+}
+
+// SetGridMode records or removes this agent's mode for its tab, and drops
+// every record herdr no longer confirms on the way past.
+func (b *herdrBackend) SetGridMode(ctx context.Context, of paneRef, on bool) error {
+	pane, err := b.paneGet(ctx, of.target())
+	if err != nil {
+		return err
+	}
+	live, err := b.livePanes(ctx)
+	if err != nil {
+		return err
+	}
+	return b.layouts.update(func(f *herdrLayoutFile) {
+		f.prune(live)
+		tabs := f.Tabs[:0]
+		for _, t := range f.Tabs {
+			if t.AgentPaneID != pane.PaneID {
+				tabs = append(tabs, t)
+			}
+		}
+		f.Tabs = tabs
+		if on {
+			f.Tabs = append(f.Tabs, herdrTabMode{
+				TabID: pane.TabID, AgentPaneID: pane.PaneID, AgentTerminalID: pane.TerminalID,
+				Layout: string(layoutGrid),
+			})
+		}
+	})
+}
+
+// SetAgentPane records which agent a helper belongs to, witnessed by the
+// helper's terminal id. Isolated panes are never stamped: they are in no tab.
+func (b *herdrBackend) SetAgentPane(ctx context.Context, p, agent paneRef) error {
+	if isolatedRef(p) {
+		return nil
+	}
+	pane, err := b.paneGet(ctx, p.target())
+	if err != nil {
+		return err
+	}
+	live, err := b.livePanes(ctx)
+	if err != nil {
+		return err
+	}
+	return b.layouts.update(func(f *herdrLayoutFile) {
+		f.prune(live)
+		agents := f.Agents[:0]
+		for _, a := range f.Agents {
+			if a.PaneID != pane.PaneID {
+				agents = append(agents, a)
+			}
+		}
+		f.Agents = agents
+		if !agent.empty() {
+			f.Agents = append(f.Agents, herdrAgentStamp{
+				PaneID: pane.PaneID, TerminalID: pane.TerminalID, Agent: agent.target(),
+			})
+		}
+	})
+}
+
+// herdrFocusHidden is Arrange declining a tab whose focus is on a slot pane
+// while the tab is not the one the user is looking at. Rebuilding the tab takes
+// that pane out of it for a moment, which hands the tab's focus to the agent,
+// and putting it back would bring the tab into view.
+const herdrFocusHidden gridRefusal = "the cursor is in a slot pane of a window that is not in view, " +
+	"so no pane was moved or resized"
+
+// Arrange lays the tab out as the plan says, by rebuilding it.
+//
+// herdr can only add a pane beside or below another one, and a move within one
+// tab changes nothing (herdr answers that the pane is already in that tab). So
+// the slot panes are moved out to a tab of their own and moved back one at a
+// time in the order herdrMoves gives, which splits the agent's pane and then
+// the slots that are already back, each at the ratio its planned size needs.
+// The agent's pane never moves: it is what the first slot is placed beside.
+// The holding tab closes by itself once its last pane has left it.
+//
+// Every move passes --no-focus, so the user's focus stays where it was, with
+// one exception herdr leaves no way around: a focused pane that leaves its tab
+// hands the tab's focus to another pane in it. When the focused pane is a slot,
+// the tab is rebuilt only while it is in view, and focus is put back on that
+// pane afterwards with a step from a neighbour into it. In a tab out of view
+// that step would bring the tab into view, so nothing is moved there at all.
+//
+// A tab that already matches the plan within the tolerance is left alone,
+// which spares the user the holding tab's flicker. A tab whose panes are not
+// exactly the agent and the slots has changed since the caller looked, and is
+// left alone too. If a move fails half way, the panes still out are put back
+// beside the others, so no slot is left in the holding tab; the error says the
+// grid was not applied, and the caller measures what is there.
+func (b *herdrBackend) Arrange(ctx context.Context, agent paneRef, slots []paneRef, plan gridPlan) (map[paneRef]paneRef, error) {
+	if len(plan.Cells) != len(slots) {
+		return nil, errWindowChanged
+	}
+	agentID := agent.target()
+	tab, err := b.tabLayout(ctx, agentID)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(slots))
+	for i, s := range slots {
+		ids[i] = s.target()
+	}
+	if !herdrTabHolds(tab, agentID, ids) {
+		return nil, errWindowChanged
+	}
+	if !gridMismatch(plan, append([]paneRef{agent}, slots...), herdrPaneInfos(tab), herdrGridTolerance, borderOff) {
+		return nil, nil
+	}
+	focused := ""
+	if slices.Contains(ids, tab.Focused) {
+		focused = tab.Focused
+		visible, err := b.tabInView(ctx, tab.TabID)
+		if err != nil {
+			return nil, err
+		}
+		if !visible {
+			return nil, herdrFocusHidden
+		}
+	}
+
+	r := &herdrRebuild{b: b, tab: tab.TabID, agent: agentID, ids: ids, orig: slices.Clone(ids)}
+	err = r.run(ctx, plan)
+	if focused != "" {
+		b.refocus(context.WithoutCancel(ctx), agentID, r.now(focused))
+	}
+	return r.renamed, err
+}
+
+// herdrTabHolds reports whether the tab holds the agent and the slots and no
+// other pane.
+func herdrTabHolds(tab herdrTabLayout, agent string, slots []string) bool {
+	if len(tab.Panes) != len(slots)+1 {
+		return false
+	}
+	for _, id := range append([]string{agent}, slots...) {
+		if _, ok := tab.Panes[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// herdrPaneInfos is the tab's panes as Siblings reports them, relative to the
+// tab's area.
+func herdrPaneInfos(tab herdrTabLayout) []paneInfo {
+	infos := make([]paneInfo, 0, len(tab.Panes))
+	for id, r := range tab.Panes {
+		infos = append(infos, paneInfo{
+			Ref: newPaneRef(id),
+			X:   r.X - tab.Area.X, Y: r.Y - tab.Area.Y,
+			Width: r.Width, Height: r.Height,
+			Seq: herdrSeq(id),
+		})
+	}
+	return infos
+}
+
+// tabInView reports whether a tab is the one the user is looking at: the
+// active tab of the focused workspace.
+func (b *herdrBackend) tabInView(ctx context.Context, tabID string) (bool, error) {
+	var res struct {
+		Tab struct {
+			Focused bool `json:"focused"`
+		} `json:"tab"`
+	}
+	if err := b.runJSON(ctx, &res, "tab", "get", tabID); err != nil {
+		return false, err
+	}
+	return res.Tab.Focused, nil
+}
+
+// herdrRebuild is one rebuild of a tab: where every slot pane is, and what it
+// is called now.
+type herdrRebuild struct {
+	b     *herdrBackend
+	tab   string // the agent's tab
+	agent string // the agent's pane, which never moves
+	ids   []string
+	orig  []string // ids as the caller named them, cell for cell
+	hold  string   // the holding tab, once there is one
+	out   []bool   // which cells are in the holding tab
+
+	// holdLayout is the holding tab as the last move into it left it.
+	holdLayout herdrTabLayout
+
+	renamed map[paneRef]paneRef
+}
+
+// herdrMoveResult is the part of a move's answer the rebuild reads.
+type herdrMoveResult struct {
+	MoveResult struct {
+		Changed      bool            `json:"changed"`
+		Reason       string          `json:"reason"`
+		Pane         herdrPane       `json:"pane"`
+		TargetLayout herdrLayoutJSON `json:"target_layout"`
+		CreatedTab   struct {
+			TabID string `json:"tab_id"`
+		} `json:"created_tab"`
+	} `json:"move_result"`
+}
+
+func (r *herdrRebuild) run(ctx context.Context, plan gridPlan) error {
+	r.out = make([]bool, len(r.ids))
+	for i := range r.ids {
+		if err := r.moveOut(ctx, i); err != nil {
+			r.putBack(ctx)
+			return err
+		}
+	}
+	for _, m := range herdrMoves(plan) {
+		target := r.agent
+		if m.Target >= 0 {
+			target = r.ids[m.Target]
+		}
+		ratio := strconv.FormatFloat(m.Ratio, 'f', 6, 64)
+		if _, err := r.move(ctx, m.Cell,
+			"--tab", r.tab, "--split", m.Dir, "--target-pane", target, "--ratio", ratio); err != nil {
+			r.putBack(ctx)
+			return err
+		}
+		r.out[m.Cell] = false
+	}
+	return nil
+}
+
+// moveOut moves one slot pane into the holding tab, opening it with the first.
+// Each pane goes beside or below the largest pane already there, so none of
+// them is squeezed below the size herdr can split.
+func (r *herdrRebuild) moveOut(ctx context.Context, i int) error {
+	var (
+		res herdrMoveResult
+		err error
+	)
+	if r.hold == "" {
+		res, err = r.move(ctx, i, "--new-tab")
+		if err == nil {
+			r.hold = res.MoveResult.CreatedTab.TabID
+			if r.hold == "" {
+				r.hold = res.MoveResult.Pane.TabID
+			}
+		}
+	} else {
+		target, dir := largestPane(r.holdLayout)
+		res, err = r.move(ctx, i, "--tab", r.hold, "--split", dir, "--target-pane", target)
+	}
+	if err != nil {
+		return err
+	}
+	r.out[i] = true
+	r.holdLayout = res.MoveResult.TargetLayout.tab()
+	if len(r.holdLayout.Panes) == 0 {
+		if r.holdLayout, err = r.b.tabLayout(ctx, r.ids[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// move runs one pane move of cell i's pane, with --no-focus, and follows the
+// pane if herdr gives it a new identity: the registry record and the agent
+// stamp are carried over, and the rename is reported to the caller.
+func (r *herdrRebuild) move(ctx context.Context, i int, args ...string) (herdrMoveResult, error) {
+	var res herdrMoveResult
+	full := append([]string{"pane", "move", r.ids[i]}, args...)
+	if err := r.b.runJSON(ctx, &res, append(full, "--no-focus")...); err != nil {
+		return res, err
+	}
+	if !res.MoveResult.Changed {
+		return res, fmt.Errorf("%s: a pane was not moved (%s)", multiplexerRefused,
+			scrubHerdrIDs(res.MoveResult.Reason))
+	}
+	if now := res.MoveResult.Pane.PaneID; now != "" && now != r.ids[i] {
+		term := res.MoveResult.Pane.TerminalID
+		_ = r.b.reg.rename(r.ids[i], now, term)
+		_ = r.b.layouts.renamePane(r.ids[i], now, term)
+		r.ids[i] = now
+		if r.renamed == nil {
+			r.renamed = map[paneRef]paneRef{}
+		}
+		r.renamed[newPaneRef(r.orig[i])] = newPaneRef(now)
+	}
+	return res, nil
+}
+
+// putBack returns every pane still in the holding tab to the agent's tab,
+// beside or below the largest pane there, so a rebuild that failed half way
+// leaves no slot out of sight. It runs on a context the caller's cancellation
+// does not reach, because stopping half way is what it repairs, and it is best
+// effort: there is nothing left to report a failure to.
+func (r *herdrRebuild) putBack(ctx context.Context) {
+	ctx = context.WithoutCancel(ctx)
+	for i, out := range r.out {
+		if !out {
+			continue
+		}
+		tab, err := r.b.tabLayout(ctx, r.agent)
+		if err != nil {
+			return
+		}
+		target, dir := largestPane(tab)
+		if _, err := r.move(ctx, i, "--tab", r.tab, "--split", dir, "--target-pane", target); err == nil {
+			r.out[i] = false
+		}
+	}
+}
+
+// now is a pane's current id, given the id it had when the rebuild began.
+func (r *herdrRebuild) now(id string) string {
+	if i := slices.Index(r.orig, id); i >= 0 {
+		return r.ids[i]
+	}
+	return id
+}
+
+// largestPane is the pane with the most cells in a tab, and the direction that
+// halves it into the squarer pieces: a cell is about twice as tall as it is
+// wide, so a pane more than twice as wide as it is tall is split beside.
+func largestPane(tab herdrTabLayout) (id, dir string) {
+	best := -1
+	for pid, g := range tab.Panes {
+		area := g.Width * g.Height
+		if area > best || (area == best && pid < id) {
+			best, id = area, pid
+			dir = "down"
+			if g.Width > 2*g.Height {
+				dir = "right"
+			}
+		}
+	}
+	return id, dir
+}
+
+// refocus puts the tab's focus back on a pane, by stepping into it from a
+// neighbour. herdr moves focus only by direction, so a neighbour that shares
+// a whole edge with the pane is tried first: from there the step can land
+// nowhere else. Every candidate is tried until focus lands. It is best effort,
+// because the grid is already in place and nothing about it depends on focus.
+func (b *herdrBackend) refocus(ctx context.Context, anyPane, want string) {
+	tab, err := b.tabLayout(ctx, anyPane)
+	if err != nil || tab.Focused == want {
+		return
+	}
+	for _, step := range focusSteps(tab, want) {
+		var res struct {
+			Focus struct {
+				FocusedPaneID string `json:"focused_pane_id"`
+			} `json:"focus"`
+		}
+		if b.runJSON(ctx, &res, "pane", "focus", "--pane", step.from, "--direction", step.dir) == nil &&
+			res.Focus.FocusedPaneID == want {
+			return
+		}
+	}
+}
+
+// focusStep is one directional focus move: from a pane, in a direction.
+type focusStep struct{ from, dir string }
+
+// focusSteps lists the steps into a pane from its neighbours: first those
+// whose edge against it is exactly as long as its own, then any that touch it.
+func focusSteps(tab herdrTabLayout, want string) []focusStep {
+	t, ok := tab.Panes[want]
+	if !ok {
+		return nil
+	}
+	var whole, partial []focusStep
+	ids := make([]string, 0, len(tab.Panes))
+	for id := range tab.Panes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if id == want {
+			continue
+		}
+		p := tab.Panes[id]
+		sameRow := p.Y == t.Y && p.Height == t.Height
+		sameCol := p.X == t.X && p.Width == t.Width
+		overlapY := p.Y < t.Y+t.Height && t.Y < p.Y+p.Height
+		overlapX := p.X < t.X+t.Width && t.X < p.X+p.Width
+		var dir string
+		var exact bool
+		switch {
+		case p.X+p.Width == t.X && overlapY:
+			dir, exact = "right", sameRow
+		case t.X+t.Width == p.X && overlapY:
+			dir, exact = "left", sameRow
+		case p.Y+p.Height == t.Y && overlapX:
+			dir, exact = "down", sameCol
+		case t.Y+t.Height == p.Y && overlapX:
+			dir, exact = "up", sameCol
+		default:
+			continue
+		}
+		if exact {
+			whole = append(whole, focusStep{id, dir})
+		} else {
+			partial = append(partial, focusStep{id, dir})
+		}
+	}
+	return append(whole, partial...)
 }
 
 // herdrPaneShellPID returns the pid of the shell herdr started in a pane. It

@@ -40,7 +40,7 @@ Get a terminal and run something in it — no setup call, no handle to carry:
 
 // The same slot is the same pane next time.
 {"tool": "capture-pane", "params": {}}
-// → the pane's text, with structuredContent {"slot": 1}
+// → the pane's text, with structuredContent {"slot": 1, "content": "<the same text>"}
 ```
 
 ## Why this exists
@@ -181,6 +181,50 @@ already exist:
 
 A pane the user opened is never split to make room.
 
+### Grid layout: every slot in view
+
+With several helpers open, the placement rule above leaves some of them narrow. Pass
+`layout: "agent-grid"` to `open-pane` and the agent's own pane stays full height on the
+left while its visible slots fill the right side in slot order, row by row:
+
+```json
+{"tool": "open-pane", "params": {"slot": 1, "layout": "agent-grid"}}
+// → {"slot": 1, "created": true, "isolated": false, "layout": "agent-grid", "layoutApplied": true}
+```
+
+| Slots | Agent width | Right side |
+|---|---|---|
+| 0 | 100% | — |
+| 1 | 50% | one pane |
+| 2–3 | 40% | one column, one row per slot |
+| 4–6 | 30% | 2 rows, ⌈n/2⌉ columns |
+| 7–10 | 25% | 2 rows, ⌈n/2⌉ columns |
+| 11 and up | 25% | 3 rows, ⌈n/3⌉ columns |
+
+Rows are equal height, and a short last row's panes widen to fill it. The grid is
+re-applied after every visible open, by any tool, and after every `close-pane`; closing
+`"all"` gives the agent the full width back and ends grid mode.
+
+The mode belongs to the window and to the agent that set it, and outlives a server
+restart. Passing `layout: "default"` turns it off and leaves the panes where they are,
+while omitting `layout` keeps the current mode. Focus never moves.
+
+**The grid never moves a pane the server does not own.** When the window holds a user
+pane, another agent's helper, or a helper that does not record which agent opened it, no
+pane is moved or resized. The slot still opens, and the response says why:
+
+```json
+// → {"slot": 2, "created": true, "isolated": false, "layout": "agent-grid",
+//    "layoutApplied": false,
+//    "layoutDetail": "the window holds a pane the user opened, so no pane was moved or resized"}
+```
+
+A zoomed window is left alone the same way. A window with no room for the grid keeps its
+panes where they are, and a cramped one gets the grid as far as it fits; both report
+`layoutApplied: false`. A `layout` sent with `isolated: true` is refused, since an
+isolated slot has no window. A server older than 2.2.0 sends no `layout` field, which is how a caller
+tells whether the grid is available.
+
 ### Isolated slots: a pane nobody can see
 
 The six tools that can open a pane also take `isolated: true`. The pane is then created on
@@ -224,7 +268,7 @@ slot that must already exist; `list-slots` and `notify` take no pane at all.
 
 | Tool | Purpose | Arguments | Returns |
 |---|---|---|---|
-| `open-pane` | Get a pane to work in. With no arguments returns slot 1, opening it if needed. Repeated calls for the same slot return the same pane (`created: false`) | `slot`, `isolated` | `{slot, created, isolated}` |
+| `open-pane` | Get a pane to work in. With no arguments returns slot 1, opening it if needed. Repeated calls for the same slot return the same pane (`created: false`) | `slot`, `isolated`, `layout` | `{slot, created, isolated, layout, layoutApplied}`, plus `layoutDetail` when `layoutApplied` is `false` |
 | `execute-command` | Run a shell command and wait for it to finish | `command` *(required)*, `slot`, `isolated`, `timeoutSeconds` | `{slot, created, output, exitCode, timedOut}` — or `{output, exitCode, timedOut}` for the ephemeral `isolated`-with-no-`slot` form |
 | `send-keys` | Send keystrokes or literal text | `keys` *(required)*, `slot`, `isolated`, `literal`, `enter` | `{slot, created}` |
 | `run-in-repl` | Send input to a running REPL and wait for its prompt to reappear | `input` *(required)*, `promptPattern` *(required)*, `slot`, `isolated`, `timeout` | `{slot, created, output, exited}` |
@@ -238,8 +282,8 @@ read whichever kind the slot already is.
 
 | Tool | Purpose | Arguments | Returns |
 |---|---|---|---|
-| `capture-pane` | Read terminal text. The preferred tool for output, logs and anything textual | `slot`, `lines`, `colors` | raw text, plus `structuredContent` `{slot}` |
-| `screenshot-pane` | Render a PNG with full ANSI colors and layout via xterm.js. Use only when visual appearance matters | `slot`, `theme`, `output` | image, file path or HTML, plus `structuredContent` `{slot}` |
+| `capture-pane` | Read terminal text. The preferred tool for output, logs and anything textual | `slot`, `lines`, `colors` | raw text, plus `structuredContent` `{slot, content}` with the same text |
+| `screenshot-pane` | Render a PNG with full ANSI colors and layout via xterm.js. Use only when visual appearance matters | `slot`, `theme`, `output` | image, file path or HTML, plus `structuredContent`: `{slot}` for an image, `{slot, content}` for a text result, none on an error |
 | `pane-state` | OS-level process state — alive, waiting for input, exit code | `slot` | `{slot, panePid, foregroundPid, foregroundCmd, isAlive, waitingForInput, exitCode}` |
 | `watch-pane` | Monitor an already-open pane until a trigger fires | `slot`, `mode`, `triggers`, `timeout` | `WatchResult` (no `created`) |
 
@@ -600,6 +644,13 @@ next read. Writes take a file lock and replace the file atomically, so several s
 share one herdr. A file that does not parse is moved aside to `<name>.json.corrupt-<unix
 time>` and the server starts with no records; the panes those records named are then left
 alone, like any pane the user opened.
+
+The [grid layout](#grid-layout-every-slot-in-view) needs two facts herdr has no place for:
+which agent opened each helper, and which agents have grid mode on in which tab. They live
+beside the records, in `<sha256 of the herdr socket path>.layout.json`. To lay a tab out,
+the server moves its slot panes to a holding tab and back in grid order, then restores
+focus. When the cursor is in a slot pane of a tab that is not in view, the tab is left
+as it is and the response says so.
 
 **Restored sessions.** When herdr restores a saved session, it recreates panes with new
 terminal ids. The records for the old ones no longer match, so restored helper panes are

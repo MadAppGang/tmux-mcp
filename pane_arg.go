@@ -257,6 +257,35 @@ type slotRef struct {
 	Slot int `json:"slot"`
 }
 
+// slotContent is the structuredContent of a reading tool whose answer is text:
+// the slot, and the text body again, byte for byte.
+//
+// The text is repeated because some clients show structuredContent INSTEAD of
+// the content blocks when both are present, and such a client would otherwise
+// see a slot number and nothing that was read. Content has no omitempty: an
+// empty pane is an answer, and a missing key would read as an old server.
+type slotContent struct {
+	Slot    int    `json:"slot"`
+	Content string `json:"content"`
+}
+
+// textStructured is the structuredContent for a successful reading result: the
+// slot and the result's text when the result is one text block, and the slot
+// alone otherwise (an image carries nothing that could be put in JSON as text).
+// An error result gets none, so a client that shows only structuredContent
+// still shows the error.
+func textStructured(res *mcp.CallToolResult, slot int) any {
+	if res == nil || res.IsError {
+		return nil
+	}
+	if len(res.Content) == 1 {
+		if text, ok := mcp.AsTextContent(res.Content[0]); ok {
+			return slotContent{Slot: slot, Content: text.Text}
+		}
+	}
+	return slotRef{Slot: slot}
+}
+
 // paneStateResult is pane-state's response: the process state it has always
 // returned, plus the slot it was read from. PaneState carries no slot of its
 // own, so the two embeddings cannot collide, and Go promotes the exported fields
@@ -309,9 +338,19 @@ type oneShotResult struct {
 // and an agent that omitted the argument learns which kind the slot already was.
 // It carries no omitempty for the same reason created does not: a field that
 // disappears when false teaches the model that false cannot happen.
+//
+// layout and layoutApplied are always present, and their presence is how a
+// caller tells a server that knows the grid from one that does not. layout is
+// the window's mode after the call; layoutApplied is true in default mode and
+// for an isolated slot, and in grid mode says whether the panes are now where
+// the grid puts them. layoutDetail is the reason, and only appears beside a
+// false.
 type openedPane struct {
 	slotResolution
-	Isolated bool `json:"isolated"`
+	Isolated      bool   `json:"isolated"`
+	Layout        string `json:"layout"`
+	LayoutApplied bool   `json:"layoutApplied"`
+	LayoutDetail  string `json:"layoutDetail,omitempty"`
 }
 
 // paneArgSpec declares what the calling tool implements, so that resolveSlot can
@@ -550,6 +589,80 @@ func (s *slots) resolveSlotOrEphemeral(
 		return paneTarget{}, false, visibleError(err)
 	}
 	return tgt, false, nil
+}
+
+// layoutProperty is open-pane's layout argument. It is declared on open-pane
+// only: the mode is a property of the window, set once, and every tool that
+// opens a slot afterwards keeps the grid without being told.
+func layoutProperty() mcp.ToolOption {
+	return mcp.WithString("layout",
+		mcp.Enum(string(layoutGrid), string(layoutDefault)),
+		mcp.Description(`"agent-grid" lays this agent's visible slots out as a grid beside it — `+
+			`the agent full height on the left, the slots on the right in slot order — and keeps `+
+			`them that way after every open and close, whichever tool opens the slot. "default" `+
+			`turns that off and leaves the panes where they are. Omit it to keep the window's `+
+			`current mode. A window holding any pane that is not one of this agent's slots is `+
+			`never rearranged.`),
+	)
+}
+
+// parseLayoutArg reads open-pane's layout argument. Absent means "leave the
+// mode as it is". Any value other than the two modes is refused rather than
+// read as one of them, for the reason parseKindArg refuses a stray isolated: a
+// caller that sent "grid" believes something about the window that would then
+// silently not be true.
+func parseLayoutArg(req mcp.CallToolRequest) (layoutRequest, error) {
+	raw, present := req.GetArguments()["layout"]
+	if !present || raw == nil {
+		return layoutUnstated, nil
+	}
+	v, ok := raw.(string)
+	if !ok {
+		return layoutUnstated, fmt.Errorf(`layout must be "agent-grid" or "default", got %v`, raw)
+	}
+	switch layoutMode(strings.TrimSpace(v)) {
+	case layoutGrid:
+		return layoutToGrid, nil
+	case layoutDefault:
+		return layoutToDefault, nil
+	}
+	return layoutUnstated, fmt.Errorf(`layout must be "agent-grid" or "default", got %q`, v)
+}
+
+// resolveSlotWithLayout is resolveSlot for open-pane: the same slot and kind
+// rules, plus the layout argument, and the layout outcome comes back with the
+// pane.
+//
+// Every argument is checked before anything is resolved, so a refused call
+// creates nothing. isolated:true with a layout is refused here for that reason:
+// resolving first would open the invisible pane and then report an error about
+// it.
+func (s *slots) resolveSlotWithLayout(
+	ctx context.Context, req mcp.CallToolRequest,
+) (paneTarget, layoutOutcome, error) {
+	layout, err := parseLayoutArg(req)
+	if err != nil {
+		return paneTarget{}, layoutOutcome{}, err
+	}
+	slot, hasSlot, err := parseSlotArg(req)
+	if err != nil {
+		return paneTarget{}, layoutOutcome{}, err
+	}
+	kind, _, err := parseKindArg(req, paneArgSpec{}, hasSlot)
+	if err != nil {
+		return paneTarget{}, layoutOutcome{}, err
+	}
+	if kind == kindIsolated && layout != layoutUnstated {
+		return paneTarget{}, layoutOutcome{}, errors.New(layoutVisibleOnlyText)
+	}
+	if !hasSlot {
+		slot = slotDefault
+	}
+	tgt, outcome, err := s.openSlot(ctx, slot, kind, layout, true)
+	if err != nil {
+		return paneTarget{}, layoutOutcome{}, visibleError(err)
+	}
+	return tgt, outcome, nil
 }
 
 // lookupOnly answers a READING tool: it finds the pane occupying a slot and
