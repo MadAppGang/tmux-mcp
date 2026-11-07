@@ -139,6 +139,22 @@ func (r *herdrRegistry) setSlot(paneID string, slot int) error {
 	})
 }
 
+// rename carries a pane's record over to the identity herdr gave the pane when
+// it moved it, with the terminal id herdr now reports as its witness. Owner and
+// slot are kept. A pane with no record has nothing to carry over.
+func (r *herdrRegistry) rename(oldID, newID, terminalID string) error {
+	return r.updateIf(func(entries []herdrEntry) ([]herdrEntry, bool, error) {
+		changed := false
+		for i := range entries {
+			if entries[i].PaneID == oldID {
+				entries[i].PaneID, entries[i].TerminalID = newID, terminalID
+				changed = true
+			}
+		}
+		return entries, changed, nil
+	})
+}
+
 // remove drops a pane's record, if it has one.
 func (r *herdrRegistry) remove(paneID string) error {
 	return r.update(func(entries []herdrEntry) ([]herdrEntry, error) {

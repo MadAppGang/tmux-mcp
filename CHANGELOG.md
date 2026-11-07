@@ -5,6 +5,62 @@ All notable changes to tmux-mcp are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-11-07
+
+Same thirteen tools. `open-pane` gains one optional argument, and its response gains
+fields.
+
+### Added
+
+- **`open-pane` takes `layout: "agent-grid" | "default"`.** Grid mode keeps the agent's
+  own pane full height on the left and lays its visible slots out on the right in slot
+  order, row by row:
+
+  | Slots | Agent width | Right side |
+  |---|---|---|
+  | 0 | 100% | — |
+  | 1 | 50% | one pane |
+  | 2–3 | 40% | one column |
+  | 4–6 | 30% | 2 rows |
+  | 7–10 | 25% | 2 rows |
+  | 11 and up | 25% | 3 rows |
+
+  Rows are equal height, and a short last row's panes widen to fill it. The mode belongs
+  to the window and to the agent that set it, so one agent setting its mode never erases
+  another's, and it survives a server restart.
+
+  In grid mode the grid is re-applied after every visible open, by any of the six tools
+  that can open a pane, and after every `close-pane`; closing `"all"` gives the agent the
+  full width back and clears the mode. Passing `"default"` turns grid mode off and leaves
+  the panes where they are, while omitting `layout` or sending `null` keeps the window's
+  mode. A window that never had `layout` keeps today's placement. Focus never moves.
+- **The grid never moves a pane the server does not own.** A window holding a user pane,
+  a pane an earlier version took over, another agent's helper, or a helper that does not
+  record which agent opened it is left as it is: the slot still opens, and the response
+  says `layoutApplied: false` with a `layoutDetail` sentence naming the reason. A zoomed
+  window is left alone the same way. A window too small for the grid is left as it is
+  when no grid fits at all, and gets the grid as far as it fits when the cells come out
+  cramped; both report `layoutApplied: false`. `layout` with `isolated: true` is refused
+  with "layout applies to visible slots" before anything is created. Any other value is
+  refused with `layout must be "agent-grid" or "default", got "<value>"`.
+- **`open-pane`'s response carries `layout`, `layoutApplied` and `layoutDetail`.**
+  `layout` is the window's mode after the call, `layoutApplied` is `true` in default
+  mode and for isolated slots, and `layoutDetail` appears only when `layoutApplied` is
+  `false`. Older servers send none of the three, which is how a caller tells whether the
+  server supports the grid.
+- **The grid works under herdr as well as tmux.** herdr rebuilds the tab through a
+  holding tab and puts focus back afterwards. When the cursor is in a slot pane of a tab
+  that is not in view, the tab is not rebuilt and the response says so.
+
+### Fixed
+
+- **`capture-pane`'s `structuredContent` is `{slot, content}`.** It used to be `{slot}`
+  alone, so a client that shows only `structuredContent` dropped the captured text.
+  `content` is the text body byte for byte; the text body itself is unchanged.
+- **`screenshot-pane` carries what it returns.** HTML, browser and PNG-fallback results
+  carry `{slot, content}`, image results carry `{slot}`, and an error carries no
+  `structuredContent`.
+
 ## [2.1.1] — 2026-11-06
 
 Same tools, same arguments, same result shapes.

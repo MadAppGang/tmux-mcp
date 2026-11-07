@@ -134,6 +134,46 @@ func TestSchemaHasNoIdProperties(t *testing.T) {
 			t.Errorf("%s declares %v; a schema is what teaches the model which arguments exist, so "+
 				"a retired one here is worse than a handler that accepts it", name, found)
 		}
+
+		// layout is an optional enum on open-pane, not a fourteenth tool
+		// or an argument advertised by the twelve other tools.
+		props, _ := schema["properties"].(map[string]any)
+		value, declared := props["layout"]
+		if name != "open-pane" {
+			if declared {
+				t.Errorf("%s advertises layout; only open-pane may declare it", name)
+			}
+			continue
+		}
+		layout, ok := value.(map[string]any)
+		if !declared || !ok {
+			t.Errorf("open-pane lacks the layout property: %#v", props)
+			continue
+		}
+		if layout["type"] != "string" {
+			t.Errorf("layout type=%#v, want string", layout["type"])
+		}
+		values, ok := layout["enum"].([]any)
+		if !ok || len(values) != 2 {
+			t.Errorf("layout enum=%#v, want agent-grid/default", layout["enum"])
+		} else {
+			seen := map[any]bool{}
+			for _, v := range values {
+				if text, ok := v.(string); ok {
+					seen[text] = true
+				}
+			}
+			if !seen["agent-grid"] || !seen["default"] {
+				t.Errorf("layout enum=%#v, want exactly agent-grid/default", values)
+			}
+		}
+		if required, ok := schema["required"].([]any); ok {
+			for _, key := range required {
+				if key == "layout" {
+					t.Error("layout must be optional")
+				}
+			}
+		}
 	}
 
 	// The control: the same walker, over a tool declared here that hides a paneId
@@ -160,6 +200,54 @@ func TestSchemaHasNoIdProperties(t *testing.T) {
 }
 
 // ---- Responses ----
+
+// false and default values are wire data, not omitted capabilities.
+func TestOpenedPaneLayoutFields(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response openedPane
+	}{
+		{"default", openedPane{Layout: "default", LayoutApplied: true}},
+		{"isolated", openedPane{Isolated: true, Layout: "default", LayoutApplied: true}},
+		{"grid applied", openedPane{Layout: "agent-grid", LayoutApplied: true}},
+		{"grid refused", openedPane{Layout: "agent-grid", LayoutApplied: false,
+			LayoutDetail: "the window holds a pane the user opened, so no pane was moved or resized"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(data, &fields); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"layout", "layoutApplied"} {
+				if _, present := fields[key]; !present {
+					t.Errorf("openedPane omits required %q: %s", key, data)
+				}
+			}
+			var mode string
+			if err := json.Unmarshal(fields["layout"], &mode); err != nil || mode != tc.response.Layout {
+				t.Errorf("layout=%s, want %q (%v)", fields["layout"], tc.response.Layout, err)
+			}
+			var applied bool
+			if err := json.Unmarshal(fields["layoutApplied"], &applied); err != nil || applied != tc.response.LayoutApplied {
+				t.Errorf("layoutApplied=%s, want %v (%v)", fields["layoutApplied"], tc.response.LayoutApplied, err)
+			}
+			detail, present := fields["layoutDetail"]
+			if tc.response.LayoutApplied && present {
+				t.Errorf("successful openedPane carries layoutDetail: %s", data)
+			}
+			if !tc.response.LayoutApplied {
+				var text string
+				if !present || json.Unmarshal(detail, &text) != nil || text != tc.response.LayoutDetail {
+					t.Errorf("refused openedPane has no exact layoutDetail: %s", data)
+				}
+			}
+		})
+	}
+}
 
 // TestNoResponseCarriesAnId marshals every response type this server can produce
 // and asserts that no key names an id and no VALUE looks like one.

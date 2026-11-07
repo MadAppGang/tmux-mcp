@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -37,6 +38,7 @@ type Pane struct {
 	Active         bool
 	Width          int
 	Height         int
+	Left, Top      int
 	CurrentCommand string
 	CurrentPath    string
 }
@@ -116,6 +118,31 @@ const (
 	paneOptSlot    = "@mcp_slot" // "1", "2", … — the default helper is slot 1
 	ownerAgent     = "agent"
 	ownerAcquired  = "acquired" // the user opened the pane; an older server took it as a slot
+)
+
+// paneOptAgent names the agent a helper belongs to: the pane id of the agent
+// whose server created or reclaimed it. It is how the agent grid tells its own
+// helpers from the helpers of another agent in the same window, which slot
+// numbers cannot do, because every agent in a window counts its slots from 1.
+//
+// It is NOT one of the marks in markOrder, and it does not decide ownership.
+// Resolution, reuse, reclaim and teardown never read it; only the grid does,
+// and the grid reads a missing stamp as "not this agent's". So a pane can lose
+// it, or never get it, and the worst outcome is a grid that is not applied.
+// It is read in the same list-panes as the witness, so it is believed only on a
+// pane whose record is valid.
+//
+// windowOptLayout is the window option holding the grid mode. Its value is a
+// space-separated list of "agent-grid:<agent pane id>" tokens, one per agent in
+// the window that asked for the grid, so the mode belongs to the window AND the
+// agent: a second agent in the same window turning the grid on or off does not
+// change the first agent's mode. The pane id in each token is a witness too: a
+// value that leaked to a wider scope can still only switch on the grid for the
+// agent it names.
+const (
+	paneOptAgent    = "@mcp_agent"
+	windowOptLayout = "@mcp_layout"
+	gridModeToken   = "agent-grid:"
 )
 
 // markOrder is the write order, expressed as DATA rather than as statement
@@ -390,7 +417,7 @@ func (t *tmuxClient) ListPanes(ctx context.Context, windowID string) ([]Pane, er
 	socket, bareID := parseTarget(windowID)
 	out, err := t.runWithSocket(ctx, socket, "list-panes",
 		"-t", bareID,
-		"-F", "#{pane_id}\t#{pane_title}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}")
+		"-F", "#{pane_id}\t#{pane_title}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_left}\t#{pane_top}")
 	if err != nil {
 		return nil, err
 	}
@@ -405,17 +432,21 @@ func (t *tmuxClient) ListPanes(ctx context.Context, windowID string) ([]Pane, er
 	var panes []Pane
 	for _, line := range strings.Split(out, "\n") {
 		parts := strings.Split(line, "\t")
-		if len(parts) != 7 {
+		if len(parts) != 9 {
 			continue
 		}
 		width, _ := strconv.Atoi(parts[3])
 		height, _ := strconv.Atoi(parts[4])
+		left, _ := strconv.Atoi(parts[7])
+		top, _ := strconv.Atoi(parts[8])
 		panes = append(panes, Pane{
 			ID:             prefix + parts[0],
 			Title:          parts[1],
 			Active:         parts[2] == "1",
 			Width:          width,
 			Height:         height,
+			Left:           left,
+			Top:            top,
 			CurrentCommand: parts[5],
 			CurrentPath:    parts[6],
 		})
@@ -777,16 +808,26 @@ type paneRecord struct {
 	Slot  int     // 0 when the pane carries no slot marker
 	Dead  bool    // #{pane_dead}: the pane exists but its process has exited
 	Seq   int     // creation ordinal — see paneSeq. Policy compares, never parses.
+
+	// Agent is the agent pane this helper was opened for, or empty when the pane
+	// carries no stamp. Only the agent grid reads it. See paneOptAgent.
+	Agent paneRef
 }
 
 // registryFormat is the tmux format string both registry readers use. Keeping
 // it in one place is what makes the witness impossible to drop from one of
 // them: there is a single expression naming all three option variables, and it
 // always names paneOptWitness alongside the other two.
+//
+// The agent stamp is the last field, so every field before it keeps the place
+// it has always had.
 func registryFormat() string {
-	return fmt.Sprintf("#{pane_id}\t#{%s}\t#{%s}\t#{%s}\t#{pane_dead}",
-		paneOptWitness, paneOptOwner, paneOptSlot)
+	return fmt.Sprintf("#{pane_id}\t#{%s}\t#{%s}\t#{%s}\t#{pane_dead}\t#{%s}",
+		paneOptWitness, paneOptOwner, paneOptSlot, paneOptAgent)
 }
+
+// registryFields is how many tab-separated fields registryFormat produces.
+const registryFields = 6
 
 // parseRegistryLine turns one line of registryFormat output into a record.
 // ok is false when the line is malformed or when the pane carries no valid
@@ -805,11 +846,11 @@ func parseRegistryLine(line, prefix string) (paneRecord, bool) {
 	// renders as an empty field, so a valid line can have empty middles and
 	// must still parse. runWithSocket trims only "\n", never tabs, so the
 	// field count is stable.
-	parts := strings.SplitN(line, "\t", 5)
-	if len(parts) != 5 {
+	parts := strings.SplitN(line, "\t", registryFields)
+	if len(parts) != registryFields {
 		return paneRecord{}, false
 	}
-	paneID, witness, owner, slotField, dead := parts[0], parts[1], parts[2], parts[3], parts[4]
+	paneID, witness, owner, slotField, dead, agent := parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
 	if paneID == "" || witness != paneID {
 		return paneRecord{}, false
 	}
@@ -825,17 +866,23 @@ func parseRegistryLine(line, prefix string) (paneRecord, bool) {
 	if slot < 0 {
 		slot = 0
 	}
-	return paneRecord{
+	rec := paneRecord{
 		Ref:   newPaneRef(prefix + paneID),
 		Owner: owner,
 		Slot:  slot,
 		Dead:  dead == "1",
 		Seq:   paneSeq(paneID),
-	}, true
+	}
+	// The stamp names a pane on the same server as the pane carrying it, and a
+	// value that is not a pane id is no stamp at all.
+	if agent = strings.TrimSpace(agent); strings.HasPrefix(agent, "%") {
+		rec.Agent = newPaneRef(prefix + agent)
+	}
+	return rec, true
 }
 
 // paneRegistryAround returns every pane in the window CONTAINING the given
-// target that carries a valid registry record. One tmux call, five format
+// target that carries a valid registry record. One tmux call, six format
 // variables.
 //
 // The target is a pane, not a window, and that is what lets a window id stay out
@@ -1319,13 +1366,14 @@ type placement struct {
 	SizePercent int // 0 means the backend's default
 }
 
-// paneInfo is geometry and label, for the two decisions that need them: which
-// pane has the most room to give up, and what order to consider reclaim
-// candidates in. Seq is the same creation ordinal paneRecord carries, so both
+// paneInfo is geometry and label, for the decisions that need them: which
+// pane has the most room to give up, what order to consider reclaim candidates
+// in, and whether the agent grid's panes are where it put them. Seq is the same creation ordinal paneRecord carries, so both
 // discovery views rank panes the same way.
 type paneInfo struct {
 	Ref           paneRef
 	Title         string
+	X, Y          int
 	Width, Height int
 	Seq           int
 }
@@ -1431,6 +1479,50 @@ type Backend interface {
 
 	SetTitle(ctx context.Context, p paneRef, title string) error
 	Notify(ctx context.Context, message string, d time.Duration) error
+
+	// ---- The agent grid ----
+
+	// Window describes the window (herdr: the tab) the given pane is in, and
+	// whether that pane's agent has the grid switched on there.
+	Window(ctx context.Context, of paneRef) (windowInfo, error)
+
+	// SetGridMode switches the grid on or off for the agent in the given pane,
+	// in that pane's window. It is stored with the window, so it survives a
+	// restart of this server, and it moves nothing.
+	SetGridMode(ctx context.Context, of paneRef, on bool) error
+
+	// SetAgentPane stamps a helper with the agent it was opened for, or clears
+	// the stamp when agent is empty. The stamp is not an ownership mark: no
+	// resolution or teardown reads it, and a pane without one is simply left
+	// out of every grid.
+	SetAgentPane(ctx context.Context, p, agent paneRef) error
+
+	// Arrange lays the agent's window out as plan says: the agent in
+	// plan.Agent and slots[i] in plan.Cells[i]. The caller has established that
+	// the window holds those panes and no others.
+	//
+	// The agent's own pane is never given a new identity: it is the anchor the
+	// slots are arranged around. A slot pane that comes out under a new identity
+	// is returned in renamed, old ref to new, with its registry record and agent
+	// stamp already carried over, so the caller can carry on with the pane that
+	// is there now. Focus must not move. A gridRefusal error means nothing was
+	// moved, and says why.
+	Arrange(ctx context.Context, agent paneRef, slots []paneRef, plan gridPlan) (renamed map[paneRef]paneRef, err error)
+}
+
+// windowInfo is what the agent grid needs to know about a window.
+//
+// Gap is the cells between two neighbouring panes (tmux's border). Tolerance is
+// how far a pane may land from its planned edge and still count as placed.
+// Border is where tmux draws the pane status line, which takes a row from some
+// panes. Grid is the stored mode for the agent the window was asked about.
+type windowInfo struct {
+	Width, Height int
+	Gap           int
+	Tolerance     int
+	Zoomed        bool
+	Border        borderStatus
+	Grid          bool
 }
 
 // tmuxBackend is the tmux implementation of Backend.
@@ -1561,6 +1653,8 @@ func (b *tmuxBackend) Siblings(ctx context.Context, of paneRef) ([]paneInfo, err
 		infos = append(infos, paneInfo{
 			Ref:    newPaneRef(p.ID),
 			Title:  p.Title,
+			X:      p.Left,
+			Y:      p.Top,
 			Width:  p.Width,
 			Height: p.Height,
 			Seq:    paneSeq(p.ID),
@@ -1649,3 +1743,160 @@ func (b *tmuxBackend) SetTitle(ctx context.Context, p paneRef, title string) err
 func (b *tmuxBackend) Notify(ctx context.Context, message string, d time.Duration) error {
 	return b.c.DisplayMessage(ctx, message, int(d.Milliseconds()))
 }
+
+// ---- The agent grid ----
+
+// Window is one display-message about the pane's window. The grid mode is
+// resolved through the pane's own scope chain, so it is the value the window
+// holds, and the token naming this pane is what makes it this agent's.
+func (b *tmuxBackend) Window(ctx context.Context, of paneRef) (windowInfo, error) {
+	socket, bareID := parseTarget(of.target())
+	out, err := b.c.runWithSocket(ctx, socket, "display-message", "-p", "-t", bareID,
+		"#{window_width}\t#{window_height}\t#{window_zoomed_flag}\t#{pane-border-status}\t#{"+
+			windowOptLayout+"}")
+	if err != nil {
+		return windowInfo{}, err
+	}
+	parts := strings.SplitN(out, "\t", 5)
+	if len(parts) != 5 {
+		return windowInfo{}, fmt.Errorf("%s: unexpected window description", multiplexerRefused)
+	}
+	w, errW := strconv.Atoi(strings.TrimSpace(parts[0]))
+	h, errH := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errW != nil || errH != nil {
+		return windowInfo{}, fmt.Errorf("%s: unexpected window size", multiplexerRefused)
+	}
+	info := windowInfo{
+		Width: w, Height: h, Gap: 1, Tolerance: 1,
+		Zoomed: strings.TrimSpace(parts[2]) == "1",
+		Grid:   hasGridToken(parts[4], bareID),
+	}
+	switch strings.TrimSpace(parts[3]) {
+	case "top":
+		info.Border = borderTop
+	case "bottom":
+		info.Border = borderBottom
+	}
+	return info, nil
+}
+
+// hasGridToken reports whether a layout option value switches the grid on for
+// the agent in the given pane.
+func hasGridToken(value, paneID string) bool {
+	for _, tok := range strings.Fields(value) {
+		if tok == gridModeToken+paneID {
+			return true
+		}
+	}
+	return false
+}
+
+// SetGridMode rewrites the window's layout option with this agent's token added
+// or removed. Tokens naming a pane that is no longer in the window are dropped
+// on the way past, so an agent that went away does not leave its mode behind
+// for good. The option is unset once no token is left.
+//
+// It reads the WINDOW's own value (show-options -w, without inheritance), so a
+// value somebody set at a wider scope is never copied down into this window.
+// Two servers writing at once can lose one of the two changes; the mode is
+// cosmetic, and the next open-pane with a layout sets it again.
+func (b *tmuxBackend) SetGridMode(ctx context.Context, of paneRef, on bool) error {
+	socket, bareID := parseTarget(of.target())
+	cur, err := b.c.runWithSocket(ctx, socket, "show-options", "-w", "-q", "-v", "-t", bareID, windowOptLayout)
+	if err != nil {
+		return err
+	}
+	present := map[string]bool{}
+	if panes, err := b.c.ListPanes(ctx, of.target()); err == nil {
+		for _, p := range panes {
+			_, id := parseTarget(p.ID)
+			present[id] = true
+		}
+	}
+	var keep []string
+	for _, tok := range strings.Fields(cur) {
+		id, ok := strings.CutPrefix(tok, gridModeToken)
+		if !ok || id == bareID || (len(present) > 0 && !present[id]) {
+			continue
+		}
+		keep = append(keep, tok)
+	}
+	if on {
+		keep = append(keep, gridModeToken+bareID)
+	}
+	if len(keep) == 0 {
+		_, err = b.c.runWithSocket(ctx, socket, "set-option", "-w", "-u", "-t", bareID, windowOptLayout)
+		return err
+	}
+	_, err = b.c.runWithSocket(ctx, socket, "set-option", "-w", "-t", bareID, windowOptLayout,
+		strings.Join(keep, " "))
+	return err
+}
+
+// SetAgentPane writes the stamp as a pane option, scoped with -p like every
+// mark, and read back only beside the witness.
+func (b *tmuxBackend) SetAgentPane(ctx context.Context, p, agent paneRef) error {
+	socket, bareID := parseTarget(p.target())
+	if agent.empty() {
+		_, err := b.c.runWithSocket(ctx, socket, "set-option", "-p", "-u", "-t", bareID, paneOptAgent)
+		return err
+	}
+	_, agentID := parseTarget(agent.target())
+	_, err := b.c.runWithSocket(ctx, socket, "set-option", "-p", "-t", bareID, paneOptAgent, agentID)
+	return err
+}
+
+// Arrange puts the panes into the order the layout string fills its cells in,
+// then sets the whole tree with one select-layout.
+//
+// select-layout gives its leaves to the window's panes in index order, which
+// is a depth-first walk of the tree: the agent first, then the cells row by
+// row. So the panes are first sorted into that order with swap-pane, one swap
+// per pane that is out of place. -d keeps focus where it is: the pane the user
+// was in stays the active pane, wherever it moves to. A pane id never changes
+// under tmux, so nothing is ever renamed.
+//
+// The window must hold exactly the panes named, which the caller has checked
+// already; a count that disagrees here means the window changed in between,
+// and nothing is moved.
+func (b *tmuxBackend) Arrange(ctx context.Context, agent paneRef, slots []paneRef, plan gridPlan) (map[paneRef]paneRef, error) {
+	return nil, b.arrange(ctx, agent, slots, plan)
+}
+
+func (b *tmuxBackend) arrange(ctx context.Context, agent paneRef, slots []paneRef, plan gridPlan) error {
+	socket, agentID := parseTarget(agent.target())
+	want := make([]string, 0, len(slots)+1)
+	want = append(want, agentID)
+	for _, s := range slots {
+		_, id := parseTarget(s.target())
+		want = append(want, id)
+	}
+	out, err := b.c.runWithSocket(ctx, socket, "list-panes", "-t", agentID, "-F", "#{pane_id}")
+	if err != nil {
+		return err
+	}
+	cur := strings.Split(out, "\n")
+	if len(cur) != len(want) || len(plan.Cells) != len(slots) {
+		return errWindowChanged
+	}
+	for i, id := range want {
+		if cur[i] == id {
+			continue
+		}
+		j := slices.Index(cur, id)
+		if j < 0 {
+			return errWindowChanged
+		}
+		if _, err := b.c.runWithSocket(ctx, socket, "swap-pane", "-d", "-s", cur[j], "-t", cur[i]); err != nil {
+			return err
+		}
+		cur[i], cur[j] = cur[j], cur[i]
+	}
+	layout := tmuxLayoutString(plan)
+	_, err = b.c.runWithSocket(ctx, socket, "select-layout", "-t", agentID, layoutChecksum(layout)+","+layout)
+	return err
+}
+
+// errWindowChanged is Arrange finding a different set of panes from the one
+// it was handed: something opened or closed a pane in between.
+var errWindowChanged = errors.New("the window changed while the grid was being applied")

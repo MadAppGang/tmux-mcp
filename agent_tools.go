@@ -730,17 +730,25 @@ func registerOpenPane(s *server.MCPServer, sl *slots) {
 			"already looking at. With no arguments it returns helper slot 1, creating it if "+
 			"needed; slot:2, slot:3 … give further panes. Repeated calls for the same slot return "+
 			"the SAME pane (created:false), so a process started there is still there next time. "+
-			"With isolated:true the pane is opened where nobody can see it instead."),
+			"With isolated:true the pane is opened where nobody can see it instead. "+
+			"layout:\"agent-grid\" lays the agent's visible slots out as a grid beside it and keeps "+
+			"it that way after every open and close; the response's layout is the window's mode, "+
+			"and layoutApplied:false comes with layoutDetail saying why the grid was not applied. "+
+			"The slot still opens either way."),
 		slotProperty(),
 		isolatedProperty(),
+		layoutProperty(),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		tgt, err := sl.resolveSlot(ctx, req, paneArgSpec{})
+		tgt, outcome, err := sl.resolveSlotWithLayout(ctx, req)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return jsonResult(openedPane{
 			slotResolution: slotResolution{Slot: tgt.Slot, Created: creating(tgt.Created)},
 			Isolated:       tgt.Isolated,
+			Layout:         string(outcome.Mode),
+			LayoutApplied:  outcome.Applied,
+			LayoutDetail:   outcome.Detail,
 		})
 	})
 }
@@ -791,14 +799,11 @@ func registerCapturePane(s *server.MCPServer, sl *slots) {
 		// contract is "the pane's exact content", so prepending a header would
 		// corrupt the answer and break every assertion anyone has written against
 		// it. The slot rides alongside in structuredContent, which costs the text
-		// nothing.
-		//
-		// It rides there unconditionally now. It used to be attached only when a
-		// slot had been resolved, because the explicit-paneId path had to answer
-		// exactly as it did before slots existed — a wire promise that is gone
-		// with the argument that made it.
+		// nothing, and so does the text itself: a client that shows only
+		// structuredContent would otherwise drop the one thing this tool returns.
+		// See slotContent.
 		res := mcp.NewToolResultText(content)
-		res.StructuredContent = slotRef{Slot: tgt.Slot}
+		res.StructuredContent = slotContent{Slot: tgt.Slot, Content: content}
 		return res, nil
 	})
 }
@@ -837,8 +842,11 @@ func registerScreenshotPane(s *server.MCPServer, sl *slots) {
 		if err != nil {
 			return res, err
 		}
-		if res != nil {
-			res.StructuredContent = slotRef{Slot: tgt.Slot}
+		// html, browser and the PNG fallback answer in text, which goes into
+		// structuredContent with the slot; an image goes there as the slot alone,
+		// and an error not at all. See textStructured.
+		if sc := textStructured(res, tgt.Slot); sc != nil {
+			res.StructuredContent = sc
 		}
 		return res, nil
 	})

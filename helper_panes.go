@@ -213,10 +213,13 @@ const (
 // it back to the user, leaving no record at all, and a second read cannot tell
 // "released a millisecond ago" from "never claimed". See clearForDisplay, where
 // that difference is the user's half-typed command line.
+//
+// It goes through openSlot, which takes the lock and keeps the agent grid in
+// step with what resolution opened. A caller that names no layout changes no
+// mode, and in default mode nothing about placement changes at all.
 func (s *slots) resolveHelper(ctx context.Context, slot int, kind kindRequest) (paneTarget, error) {
-	s.slotMu.Lock()
-	defer s.slotMu.Unlock()
-	return s.resolveHelperLocked(ctx, slot, kind)
+	tgt, _, err := s.openSlot(ctx, slot, kind, layoutUnstated, false)
+	return tgt, err
 }
 
 // slotHolder is what a lookup found: the record, and which registry it came
@@ -371,7 +374,17 @@ func (s *slots) lookupSlotLocked(
 // request that has to end in a visible pane turns it into a message. Any other
 // failure of Self refuses everything: we could not establish which pane is ours,
 // and every self-exclusion below is then unevaluable.
-func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequest) (paneTarget, error) {
+//
+// # The hook
+//
+// onOpen is told about the pane before it is handed out — see openHook. For a
+// pane this call created or reclaimed it runs before the shell is waited for
+// or typed into, so a resize it causes is over before anything is typed. A
+// reclaimed pane whose neighbours were resized is waited for again, because its
+// shell is about to be typed into and is redrawing its prompt.
+func (s *slots) resolveHelperLocked(
+	ctx context.Context, slot int, kind kindRequest, onOpen openHook,
+) (paneTarget, error) {
 	self, err := s.b.Self(ctx)
 	noWindow := errors.Is(err, errNoWindow)
 	if err != nil && !noWindow {
@@ -399,7 +412,7 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequ
 	if kind != kindIsolated {
 		if rec, ok := s.slotCandidateLocked(ctx, slot, self, reg, false); ok {
 			if rec.Owner != ownerAcquired {
-				return s.helperResult(rec.Ref, self, slot, false, rec.Owner, false)
+				return s.handOut(ctx, onOpen, self, rec.Ref, slot, rec.Owner, false)
 			}
 			s.disownLocked(ctx, rec)
 			delete(reg, rec.Ref)
@@ -417,7 +430,7 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequ
 			return paneTarget{}, fmt.Errorf("could not read the pane registry for slot %d: %w", slot, err)
 		}
 		if rec, ok := s.slotCandidateLocked(ctx, slot, paneRef{}, iso, true); ok {
-			return s.helperResult(rec.Ref, self, slot, false, rec.Owner, true)
+			return s.handOut(ctx, onOpen, self, rec.Ref, slot, rec.Owner, true)
 		}
 	}
 
@@ -444,7 +457,11 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequ
 	}
 
 	if kind == kindIsolated {
-		return s.createIsolatedLocked(ctx, slot, self)
+		tgt, err := s.createIsolatedLocked(ctx, slot, self)
+		if err == nil {
+			onOpen.call(ctx, self, tgt)
+		}
+		return tgt, err
 	}
 	if noWindow {
 		return paneTarget{}, errNoWindow
@@ -455,6 +472,12 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequ
 	// opened. Nothing unmarked is ever a candidate: a pane without our marks is
 	// the user's, however idle it looks. See reclaimPaneLocked.
 	if pane, ok := s.reclaimPaneLocked(ctx, reg, slot, self); ok {
+		opened := paneTarget{Ref: pane, Slot: slot, Created: true, Owner: ownerAgent}
+		now, moved := onOpen.call(ctx, self, opened)
+		pane = now
+		if moved {
+			_ = s.waitForShellReady(ctx, pane, shellReadyTimeout)
+		}
 		if err := s.resetReclaimed(ctx, pane); err != nil {
 			s.unslotReclaimed(ctx, pane)
 			return paneTarget{}, fmt.Errorf("slot %d: %w", slot, err)
@@ -470,21 +493,41 @@ func (s *slots) resolveHelperLocked(ctx context.Context, slot int, kind kindRequ
 	// no reclaim takes it and no close reaches it — so it is closed, on a
 	// detached context for the reason createIsolatedLocked gives, and the
 	// failure is reported.
+	//
+	// The agent stamp goes on before the slot marker, so there is no moment at
+	// which the pane answers to a slot with no agent recorded. Its failure is
+	// ignored: the stamp only lets the pane into this agent's grid, and a pane
+	// without one is kept out of every grid, which is the safe direction.
 	place := s.placementForSlot(ctx, reg, slot, self)
 	pane, err := s.b.OpenBeside(ctx, place)
 	if err != nil {
 		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
+	_ = s.b.SetAgentPane(ctx, pane, self)
 	if err := s.b.Claim(ctx, pane, ownerAgent, slot); err != nil && !s.carriesRecord(ctx, self, pane) {
 		s.closeUnused(ctx, pane)
 		return paneTarget{}, fmt.Errorf("could not open a pane for slot %d: %w", slot, err)
 	}
 	_ = s.b.SetTitle(ctx, pane, helperTitle(slot))
+	pane, _ = onOpen.call(ctx, self, paneTarget{Ref: pane, Slot: slot, Created: true, Owner: ownerAgent})
 	if err := s.waitForShellReady(ctx, pane, newPaneReadyTimeout); err != nil {
 		s.closeUnused(ctx, pane)
 		return paneTarget{}, fmt.Errorf("slot %d: %w", slot, err)
 	}
 	return s.helperResult(pane, self, slot, true, ownerAgent, false)
+}
+
+// handOut returns a slot that already had a pane, telling onOpen about it
+// first. It is helperResult for the reuse branches, which are the exits that
+// do not run through creation.
+func (s *slots) handOut(
+	ctx context.Context, onOpen openHook, self, pane paneRef, slot int, owner string, isolated bool,
+) (paneTarget, error) {
+	tgt, err := s.helperResult(pane, self, slot, false, owner, isolated)
+	if err == nil {
+		tgt.Ref, _ = onOpen.call(ctx, self, tgt)
+	}
+	return tgt, err
 }
 
 // closeUnused closes a pane this call opened and is not handing out: one that
@@ -802,6 +845,10 @@ func (s *slots) reclaimPaneLocked(
 		if err != nil || !paneIsReclaimable(state) || !sameUIDAsAgent(state) {
 			continue
 		}
+		// The pane becomes this agent's, so it is stamped as this agent's
+		// before it answers to the slot. See the create path for why the
+		// stamp's failure is ignored.
+		_ = s.b.SetAgentPane(ctx, rec.Ref, self)
 		if err := s.b.SetSlot(ctx, rec.Ref, slot); err != nil {
 			continue
 		}
@@ -1229,6 +1276,20 @@ func (s *slots) closePanes(ctx context.Context, sel closeSelector) ([]closedPane
 		return nil, visibleError(err)
 	}
 
+	// Every close ends by fitting the agent grid to the slots that are left,
+	// whatever was closed and whether anything was. That is also where a pane
+	// that died or vanished on its own is accounted for. In default mode it
+	// reads the window's mode and moves nothing.
+	closed, err := s.closePanesLocked(ctx, sel, self)
+	if err == nil && !self.empty() {
+		s.regridAfterCloseLocked(ctx, self)
+	}
+	return closed, err
+}
+
+// closePanesLocked is the teardown itself. The caller must hold slotMu and
+// pass the self it read inside that hold.
+func (s *slots) closePanesLocked(ctx context.Context, sel closeSelector, self paneRef) ([]closedPane, error) {
 	switch {
 	case sel.All:
 		var closed []closedPane
